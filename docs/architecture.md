@@ -45,7 +45,9 @@ bypass the core.
 `OfflineLocalAuthorizer` allows session creation only for a local caller. The
 `SessionAuthorizer` interface is the future identity/authentication seam. A
 transport that accepts remote callers must inject a real authorizer; the core
-does not implement an account database.
+does not implement an account database. Omitted caller context is treated as
+untrusted remote, so forgetting to propagate context cannot silently gain local
+session-opening authority.
 
 ## Why adapters stay separate
 
@@ -64,13 +66,17 @@ without mutation, and applies authorized commits in memory only.
 
 1. Strictly validate the versioned envelope; reject additional envelope fields.
 2. Reject unknown bridge actions.
-3. For session-scoped requests, resolve the bound session and consult its
-   idempotency cache before any side effect.
+3. For session-scoped requests, resolve the bound session and reserve the
+   request ID with an in-flight promise before awaiting adapter completion.
+   Concurrent identical requests await that same promise; conflicting content
+   is rejected.
 4. Reject closed/expired sessions, adapter mismatches, missing capabilities,
    unknown game actions, and invalid action inputs.
 5. Reject game writes while the safety latch is stopped.
 6. Execute the adapter in `dry-run` or `commit` mode.
-7. Cache the response by request ID and record a sanitized audit event.
+7. Replace the in-flight entry with the completed response and record a
+   sanitized audit event. Unknown action and unregistered adapter values are
+   represented only by fixed categories and hashed tags.
 
 `session.open` is necessarily the one pre-session lifecycle operation. In
 `dry-run` mode it only describes the session that would be opened. A committed

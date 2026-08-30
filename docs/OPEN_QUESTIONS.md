@@ -13,3 +13,8 @@ foundation:
    collecting game chat, credentials, or unnecessary personal data?
 5. Which per-action rate and concurrency limits are appropriate for the first
    Minecraft adapter?
+6. What per-session and global request-cache limits, cleanup cadence, and closed
+   session retention window should a long-lived host use?
+7. Must the first real adapter support cooperative cancellation for in-flight
+   actions, or should safety stop instead guarantee only that no new action can
+   begin and surface the current in-flight count to the local user?

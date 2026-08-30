@@ -24,14 +24,17 @@ filesystem, network, keyboard, or mouse primitive to invoke.
 ### Token disclosure and replay
 
 Sessions are memory-only. Audit events store truncated SHA-256 tags instead of
-raw request/session identifiers and recursively redact keys such as token,
-password, secret, authorization, cookie, credential, and API key. Future
+raw request/session identifiers. Attacker-controlled unknown actions and
+unregistered adapter IDs are also reduced to fixed categories plus hashed tags.
+Structured metadata recursively redacts keys such as token, password, secret,
+authorization, cookie, credential, and API key. Future
 transports must keep bearer credentials outside request params, authenticate
 before opening a session, encrypt transport traffic, and bound token lifetime.
 
-Replay within a session is handled by a request-ID cache. An identical replay
-returns the first response without executing again. Reusing the ID for different
-content returns `REQUEST_ID_REUSED`.
+Replay within a session is handled by a request-ID cache. The first request
+installs an in-flight promise before adapter completion; concurrent or later
+identical replays await or return the same response without executing again.
+Reusing the ID for different content returns `REQUEST_ID_REUSED`.
 
 ### Duplicate or ambiguous actions
 
@@ -45,7 +48,9 @@ automatically retrying a write.
 The current process has session expiry and a global safety latch, but it does
 not yet implement quotas or rate limits. A future transport must add bounded
 concurrency and per-session/per-action rate limits before any real adapter is
-enabled. The safety stop remains below that transport layer.
+enabled. Closed/expired sessions and request-cache entries also lack pruning and
+capacity limits, so a long-lived process can accumulate memory. The safety stop
+remains below the future transport layer.
 
 ### Adapter exceeds its authority
 
@@ -70,10 +75,15 @@ bridge. Once latched, game writes are denied while describe, observation, and
 session close remain available. `safety.resume` is not a request action. Resume
 exists only on an explicit in-process local control-plane object and is audited.
 A production host should attach this to a user-controlled local interface.
+The current latch prevents new writes from entering an adapter; it does not
+cancel an asynchronous action already in flight. The local control-plane object
+also exposes resume only. Both limitations must be resolved or explicitly
+bounded before a transport or real adapter is enabled.
 
 ## Residual risks before a real adapter
 
 - Sessions and the idempotency cache are process-local; a restart loses them.
+- Session and request-cache entries have no cleanup or capacity policy yet.
 - No transport authentication, encryption, origin binding, rate limiting, or
   distributed replay store exists yet.
 - The in-memory audit sink is demonstrative, not durable or tamper-evident.
