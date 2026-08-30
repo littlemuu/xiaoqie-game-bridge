@@ -7,3 +7,4 @@ export * from "./core/policy.js";
 export * from "./core/protocol.js";
 export * from "./core/safety-latch.js";
 export * from "./core/session.js";
+export * from "./mcp/server.js";

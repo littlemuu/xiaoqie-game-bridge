@@ -8,8 +8,9 @@ bridge. Cloud reasoning and future transports are not implicitly trusted to
 perform arbitrary local work. The local bridge core remains the enforcement
 boundary, and adapters are treated as separately reviewable capability modules.
 
-Phase 1 touches none of those real assets. Its only mutable asset is an
-in-memory mock world.
+The current implementation touches none of those real assets. Its only mutable
+game asset is an in-memory mock world. The stdio child is a local protocol
+boundary, not proof of a remote caller's identity.
 
 ## Threats and current controls
 
@@ -20,6 +21,12 @@ run a command or call an undeclared action. The envelope is strict, bridge
 actions are enumerated, policy is default-deny, and every adapter action has a
 strict schema and explicit capability. There is no generic command, process,
 filesystem, network, keyboard, or mouse primitive to invoke.
+
+The MCP tool accepts the existing strict bridge envelope directly. Context,
+principal, and transport identity are not tool fields: trusted server code
+injects a frozen local context. A caller that adds undeclared envelope fields is
+rejected by the SDK schema before `GameBridge.handle`; action-specific schemas
+still reject undeclared fields inside `params`.
 
 ### Token disclosure and replay
 
@@ -43,13 +50,33 @@ request fingerprint uses deterministic key ordering. Future distributed
 transports must preserve the request ID and must not generate a fresh ID when
 automatically retrying a write.
 
+MCP's JSON-RPC request ID is transport bookkeeping and is unrelated to the
+bridge `requestId` inside tool arguments. The stdio wrapper does not synthesize,
+replace, or automatically retry bridge IDs. A logical-size or handler-capacity
+rejection happens before the core, so it creates no idempotency evidence; the
+same bridge ID may be tried later when transport capacity is available.
+
 ### Runaway loops and excessive call rate
 
 The core has finite session count, per-session request history, and concurrent
 commit-write limits. Session open sweeps eligible terminal state before a
 stable capacity refusal. Request capacity never evicts in-flight or completed
-commit evidence; new requests are refused before adapter execution. A future
-transport must still add message-size, per-principal, and per-action rate limits.
+commit evidence; new requests are refused before adapter execution.
+
+The stdio transport has an explicit 64 KiB read-buffer ceiling. The tool handler
+independently measures deterministic UTF-8 envelope bytes and refuses more than
+32 KiB. A synchronous gate admits at most eight concurrent handlers by default;
+full capacity rejects immediately before bridge/adapter execution and creates no
+unbounded queue. Permits release in `finally`. Future remote work still needs
+per-principal and per-action rate limits.
+
+### Protocol output or diagnostics leak attacker data
+
+Every core result is validated by `responseEnvelopeSchema`, sanitized, and
+serialized deterministically. Invalid output, thrown errors, and mismatched
+request identity become a fixed `INTERNAL_ERROR`; raw results, stack traces, and
+exceptions are not written to MCP. Stdout carries MCP only. Transport failures
+write a fixed message to stderr without embedding the received frame or error.
 
 ### Adapter exceeds its authority
 
@@ -61,11 +88,11 @@ malicious implementation code.
 
 ### Game save corruption
 
-Phase 1 does not read or write saves. A future real adapter should prefer the
-game's supported API, introduce an explicit save-write capability separate from
-ordinary actions, verify backup/restore procedures, and add adapter-level
-transaction or confirmation rules where supported. Dry-run output must never be
-treated as a backup.
+The current mock-only server does not read or write saves. A future real adapter
+should prefer the game's supported API, introduce an explicit save-write
+capability separate from ordinary actions, verify backup/restore procedures,
+and add adapter-level transaction or confirmation rules where supported.
+Dry-run output must never be treated as a backup.
 
 ### Safety stop cannot be trusted or is remotely reversed
 
@@ -82,6 +109,11 @@ passed `beginWrite()` may complete after stop, but it remains visible and the
 configured hard limit bounds how many can exist. A real adapter must decide
 whether cooperative cancellation is safe for its game API.
 
+MCP cancellation, EOF, or client disconnect also does not revoke a write permit
+that already entered an adapter. It can abandon protocol delivery while the
+adapter operation finishes and the handler gate releases afterward. Normal
+test/client shutdown closes the client first and server/transport second.
+
 ### Capacity pressure blocks safety or closure
 
 Local stop does not traverse a session cache. A full request cache permits
@@ -93,11 +125,13 @@ plane. No unbounded tombstone or eviction path is introduced.
 ## Residual risks before a real adapter
 
 - Sessions and the idempotency cache are process-local; a restart loses them.
-- No transport authentication, encryption, origin binding, rate limiting, or
-  distributed replay store exists yet.
+- Client-spawned stdio has no remote authentication, encryption, origin binding,
+  per-principal rate limiting, or distributed replay store and must not be
+  exposed as a network service.
 - The in-memory audit sink is demonstrative, not durable or tamper-evident.
 - A future adapter runs in-process unless an isolation boundary is added.
-- Capability grants are approved by a simple local-only authorizer in phase 1.
+- Capability grants are approved by a simple local-only authorizer; the stdio
+  boundary is the trusted component that asserts locality.
 - Already-started adapter writes are not forcibly cancelled; real adapters may
   require cooperative cancellation semantics.
 
