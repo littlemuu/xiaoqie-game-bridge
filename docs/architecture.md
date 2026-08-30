@@ -3,29 +3,27 @@
 ## Boundary map
 
 ```text
-Cloud chat / Cloud Work (reasoning, personality, long-term memory)
+local MCP client (owns and spawns one child process)
                     |
-                    | future authenticated, rate-limited transport
+                    | newline-delimited MCP over stdin/stdout
                     v
-        transport adapter (not implemented in phase 1)
+     stdio boundary: one tool, size/concurrency gates
                     |
-                    | versioned request envelope + caller context
+                    | existing request envelope + fixed local context
                     v
               local GameBridge core
        protocol | session | policy | safety | audit
                     |
                     | adapter-bound, schema-validated calls
                     v
-        GameAdapter interface -> mock-world adapter
-                              -> future Minecraft adapter
-                              -> future Stardew/SMAPI adapter
+        GameAdapter interface -> mock-world adapter only
 ```
 
-Phase 1 ends at an in-process TypeScript API. It creates no listener, tunnel,
-relay, firewall rule, background service, account, or persistent credential.
-A future stdio, loopback HTTP, MCP, or relay transport must translate its input
-to `GameBridge.handle` and supply an authenticated `RequestContext`; it must not
-bypass the core.
+The client-spawned stdio process is the first protocol boundary. It creates no
+listener, port, socket, tunnel, relay, firewall rule, background service,
+account, or persistent credential. Stdio locality is not remote authentication;
+any future network transport must supply a real authenticated context and must
+not bypass the core.
 
 ## Core responsibilities
 
@@ -42,6 +40,12 @@ bypass the core.
   credential-shaped keys before an event reaches an injected sink.
 - `bridge.ts` is the only orchestration path. It composes all checks before an
   adapter call and records both allowed and denied outcomes.
+- `mcp/server.ts` owns the pure, bridge-injected MCP server factory, its single
+  tool, deterministic response mapping, logical byte limit, and bounded handler
+  gate.
+- `mcp/stdio-server.ts` constructs only the mock registry and bridge, then uses
+  the SDK's public stdio transport with a 64 KiB buffer. Stdout is reserved for
+  MCP; its only diagnostics are fixed messages on stderr.
 
 `OfflineLocalAuthorizer` allows session creation only for a local caller. The
 `SessionAuthorizer` interface is the future identity/authentication seam. A
@@ -89,6 +93,35 @@ without mutation, and applies authorized commits in memory only.
 session is created only after the adapter, requested capabilities, and injected
 authorizer approve it.
 
+## MCP boundary lifecycle
+
+1. The SDK validates tool arguments directly with `requestEnvelopeSchema`.
+   Undeclared envelope fields, including caller-supplied context or identity,
+   are rejected before the handler and bridge.
+2. The handler deterministically serializes the validated envelope and measures
+   UTF-8 bytes. More than 32 KiB returns a fixed `RESOURCE_CAPACITY` result
+   without entering the bridge.
+3. A synchronous gate checks and increments the handler count. At the default
+   limit of eight, a new call is rejected without a wait queue or bridge call.
+4. The original envelope is passed unchanged to `GameBridge.handle` with the
+   frozen server-owned `{ transport: "local" }` context. The wrapper creates no
+   request ID and never retries.
+5. The bridge result is checked with `responseEnvelopeSchema` and against the
+   original request ID/action/mode/session. Invalid output or any exception is
+   replaced by one fixed `INTERNAL_ERROR`; raw values and stacks never reach the
+   protocol stream.
+6. The sanitized response becomes complete `structuredContent`; deterministic
+   JSON of that same response is the only text content. Bridge failures set MCP
+   `isError: true` while preserving the stable bridge envelope and error code.
+7. Handler capacity is released in `finally`, including errors, invalid output,
+   and client-disconnect completion paths.
+
+The MCP JSON-RPC ID belongs to the SDK transport. The bridge `requestId` lives
+inside tool arguments and is the core idempotency key; the two are deliberately
+not mapped to each other. A transport-level size/concurrency refusal never
+enters the session request cache, so a later retry with the same bridge ID may
+enter the core once capacity is available.
+
 ## Bounded lifetime and control-plane behavior
 
 Defaults are 64 sessions, five minutes of terminal retention, 256 request
@@ -111,12 +144,17 @@ The local control plane exposes `stopSafety()`, `getSafetyStatus()`, and
 maximum. Stop immediately blocks new commits but does not cancel work already
 inside an adapter. Resume is denied until the count reaches zero. Stop and
 resume attempts are audited; status is a read-only snapshot and is not audited.
+That control-plane object is not returned to or callable from MCP. Cancellation,
+EOF, or client disconnect closes protocol work but is not evidence that an
+adapter write already past `beginWrite()` was forcibly cancelled.
 
 ## Deliberately absent
 
-- Network servers, public endpoints, tunnels, relay clients, and MCP transport
+- Network servers, HTTP/WebSocket/SSE endpoints, tunnels, relays, ports, and
+  remote authentication
 - Shell/PowerShell, arbitrary process execution, filesystem access, input
   simulation, or generic desktop automation
-- Real games, launchers, accounts, saves, purchased content, or secrets
+- Real games, launchers, accounts, saves, purchased content, host MCP
+  configuration, or secrets
 - Persistent sessions or bearer-token storage
 - Cloud-side personality or long-term memory
