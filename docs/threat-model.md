@@ -9,8 +9,9 @@ perform arbitrary local work. The local bridge core remains the enforcement
 boundary, and adapters are treated as separately reviewable capability modules.
 
 The current implementation touches none of those real assets. Its only mutable
-game asset is an in-memory mock world. The stdio child is a local protocol
-boundary, not proof of a remote caller's identity.
+game asset is an in-memory mock world held by a fixed adapter worker. The MCP
+stdio child and nested adapter child are local process boundaries, not proof of
+remote identity or OS sandboxing.
 
 ## Threats and current controls
 
@@ -107,6 +108,27 @@ and when the action executes. A real adapter still requires code review and
 adapter-specific sandboxing because TypeScript interfaces alone cannot contain
 malicious implementation code.
 
+The parent still owns identity, session binding, capabilities, action schemas,
+policy, idempotency, safety, and audit. Static metadata must exactly match the
+worker handshake. Caller/session/request identity and secrets never enter IPC.
+Fixed executable/argv/cwd plus a minimal supplied environment prevent requests
+from turning this into a generic launcher; a credential-shaped parent sentinel
+is regression-tested as absent from a real built child.
+
+### Worker protocol or lifecycle failure
+
+IPC has strict versioned messages and bounded frames, payloads, pending calls,
+and deadlines. Unknown fields/types, wrong or duplicate IDs, timeout, EOF,
+crash, non-zero exit, and hostile stdout fail closed. Stderr is discarded, and
+worker/path/stack/raw output never reaches bridge responses or audit. Pending
+promises settle once with timers/capacity released; normal close waits for
+acknowledged zero exit. There is no unbounded queue.
+
+Process separation contains ordinary faults but does not make the worker
+non-malicious. Parent and child share one OS user; there is no restricted token,
+container, VM, filesystem ACL boundary, or proven CPU/memory sandbox. A real
+adapter still requires separate OS-isolation and permission approval.
+
 ### Game save corruption
 
 The current mock-only server does not read or write saves. A future real adapter
@@ -126,7 +148,9 @@ resume is audited and denied while any write remains in flight; stop and denied
 resume are audited as well. Read-only status is intentionally not audited.
 
 The latch does not claim forced cancellation. An asynchronous action that
-passed `beginWrite()` may complete after stop, but it remains visible and the
+passed `beginWrite()` and entered the worker may complete after stop or client
+disconnect; process termination is not proof a real game action rolled back.
+The action remains visible and the
 configured hard limit bounds how many can exist. A real adapter must decide
 whether cooperative cancellation is safe for its game API.
 
@@ -150,7 +174,8 @@ plane. No unbounded tombstone or eviction path is introduced.
   per-principal rate limiting, or distributed replay store and must not be
   exposed as a network service.
 - The in-memory audit sink is demonstrative, not durable or tamper-evident.
-- A future adapter runs in-process unless an isolation boundary is added.
+- The mock worker is a same-user process boundary, not a proven OS sandbox for
+  hostile or real-game adapter code.
 - Capability grants are approved by a simple local-only authorizer; the stdio
   boundary is the trusted component that asserts locality. A test-only remote
   authorizer proves the core seam, but no production remote authentication or

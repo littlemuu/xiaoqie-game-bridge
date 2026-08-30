@@ -8,7 +8,7 @@ import type { BridgeMode } from "../../core/protocol.js";
 
 const coordinateSchema = z.number().int().min(-8).max(8);
 const heightSchema = z.number().int().min(0).max(4);
-const moveSchema = z
+export const mockMoveInputSchema = z
   .object({
     dx: z.number().int().min(-1).max(1),
     dy: z.number().int().min(-1).max(1),
@@ -16,7 +16,7 @@ const moveSchema = z
   })
   .strict()
   .refine(({ dx, dy, dz }) => dx !== 0 || dy !== 0 || dz !== 0);
-const placeBlockSchema = z
+export const mockPlaceBlockInputSchema = z
   .object({
     x: coordinateSchema,
     y: heightSchema,
@@ -30,6 +30,54 @@ interface Position {
   y: number;
   z: number;
 }
+
+const positionSchema = z
+  .object({
+    x: coordinateSchema,
+    y: heightSchema,
+    z: coordinateSchema,
+  })
+  .strict();
+
+export const mockObservationResultSchema = z
+  .object({
+    player: positionSchema,
+    nearbyBlocks: z.array(
+      z
+        .object({
+          coordinates: z.string().regex(/^-?[0-8],[0-4],-?[0-8]$/),
+          blockType: z.enum(["stone", "dirt", "torch"]),
+        })
+        .strict(),
+    ),
+  })
+  .strict();
+
+export const mockMoveResultSchema = z
+  .object({
+    applied: z.boolean(),
+    change: z
+      .object({
+        type: z.literal("move"),
+        from: positionSchema,
+        to: positionSchema,
+      })
+      .strict(),
+  })
+  .strict();
+
+export const mockPlaceBlockResultSchema = z
+  .object({
+    applied: z.boolean(),
+    change: z
+      .object({
+        type: z.literal("place_block"),
+        position: positionSchema,
+        blockType: z.enum(["stone", "dirt", "torch"]),
+      })
+      .strict(),
+  })
+  .strict();
 
 interface MockWorldState {
   player: Position;
@@ -52,12 +100,12 @@ export class MockGameAdapter implements GameAdapter {
     move: {
       description: "Move the mock player by at most one unit per axis.",
       capability: "game.act.move",
-      inputSchema: moveSchema,
+      inputSchema: mockMoveInputSchema,
     },
     place_block: {
       description: "Place one allowlisted block inside the mock-world bounds.",
       capability: "game.act.place_block",
-      inputSchema: placeBlockSchema,
+      inputSchema: mockPlaceBlockInputSchema,
     },
   };
 
@@ -82,15 +130,15 @@ export class MockGameAdapter implements GameAdapter {
   async execute(action: string, input: unknown, mode: BridgeMode): Promise<unknown> {
     switch (action) {
       case "move":
-        return this.#move(input as z.infer<typeof moveSchema>, mode);
+        return this.#move(input as z.infer<typeof mockMoveInputSchema>, mode);
       case "place_block":
-        return this.#placeBlock(input as z.infer<typeof placeBlockSchema>, mode);
+        return this.#placeBlock(input as z.infer<typeof mockPlaceBlockInputSchema>, mode);
       default:
         throw new Error("Policy allowed an unregistered mock action.");
     }
   }
 
-  #move(input: z.infer<typeof moveSchema>, mode: BridgeMode): unknown {
+  #move(input: z.infer<typeof mockMoveInputSchema>, mode: BridgeMode): unknown {
     const from = clonePosition(this.#state.player);
     const to = {
       x: from.x + input.dx,
@@ -109,7 +157,7 @@ export class MockGameAdapter implements GameAdapter {
     };
   }
 
-  #placeBlock(input: z.infer<typeof placeBlockSchema>, mode: BridgeMode): unknown {
+  #placeBlock(input: z.infer<typeof mockPlaceBlockInputSchema>, mode: BridgeMode): unknown {
     const position = { x: input.x, y: input.y, z: input.z };
     const key = blockKey(position);
     if (this.#state.blocks.has(key)) {

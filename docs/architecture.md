@@ -14,9 +14,9 @@ local MCP client (owns and spawns one child process)
               local GameBridge core
        protocol | session | policy | safety | audit
                     |
-                    | adapter-bound, schema-validated calls
+                    | bounded versioned adapter IPC
                     v
-        GameAdapter interface -> mock-world adapter only
+ ProcessMockAdapter -> fixed Node child -> mock-world only
 ```
 
 The client-spawned stdio process is the first protocol boundary. It creates no
@@ -50,6 +50,12 @@ not bypass the core.
 - `mcp/stdio-server.ts` constructs only the mock registry and bridge, then uses
   the SDK's public stdio transport with a 64 KiB buffer. Stdout is reserved for
   MCP; its only diagnostics are fixed messages on stderr.
+- `adapters/mock/adapter-ipc.ts` is the single strict IPC contract and owns
+  message/frame limits, fixed identity, internal call IDs, and lifecycle defaults.
+- `adapters/mock/process-mock-adapter.ts` owns fixed spawn configuration,
+  deadlines, bounded pending state, response correlation, and failure settlement.
+- `adapters/mock/mock-worker.ts` is the fixed built child. It owns only the
+  deterministic in-memory mock state and executes already-authorized calls.
 
 `OfflineLocalAuthorizer` allows session creation only for a local caller. The
 `SessionAuthorizer` interface is the future identity/authentication seam. A
@@ -81,6 +87,31 @@ capability cannot be redirected to another adapter.
 The mock adapter is a proof of this boundary, not a placeholder shell: it has a
 deterministic state, validates movement and block placement, previews changes
 without mutation, and applies authorized commits in memory only.
+
+## Adapter process lifecycle
+
+The parent statically declares mock identity, capabilities, actions, and input
+schemas. Worker `ready` must exactly match and cannot add authority. The parent
+generates internal `call-N` IDs only after bridge policy and safety checks; no
+bridge/MCP request ID, session ID, caller context, principal, owner digest, or
+audit HMAC key crosses IPC. Dry-run remains explicit and non-mutating.
+
+The executable is `process.execPath`; the sole argv and cwd are derived from the
+fixed built module path. `shell` is false, stdio is pipe/pipe/ignored, and the
+supplied environment contains only a fixed worker marker (plus isolated fixture
+mode in tests). Windows may materialize OS-required environment entries, but a
+credential-shaped parent sentinel is proven absent from the real child.
+
+At most eight calls are pending and there is no application wait queue. Strict
+64 KiB frame and 32 KiB message limits apply. Malformed JSON, unknown
+fields/types, oversized output, identity mismatch, wrong/duplicate/late call
+ID, backpressure, timeout, EOF, crash, or non-zero exit fail closed, settle every
+pending promise once, release timers/capacity, and terminate the child. Normal
+close waits for shutdown acknowledgement and zero exit; close with pending work
+settles that work before termination.
+
+This is a same-OS-user process boundary, not a proven OS sandbox. The worker is
+trusted and separately reviewable code.
 
 ## Request lifecycle
 
@@ -185,4 +216,5 @@ adapter write already past `beginWrite()` was forcibly cancelled.
 - Real games, launchers, accounts, saves, purchased content, host MCP
   configuration, or secrets
 - Persistent sessions or bearer-token storage
+- General process execution or caller-selectable worker paths/arguments
 - Cloud-side personality or long-term memory

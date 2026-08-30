@@ -24,6 +24,9 @@
 - Global safety latch plus non-routable local stop/status/resume control plane
 - Injectable audit sink, hashed identifiers, and recursive credential redaction
 - Deterministic in-memory mock adapter with movement and block placement
+- Fixed process-backed product mock with strict versioned pipe IPC, static
+  identity, 64/32 KiB frame/message limits, eight pending calls, bounded
+  handshake/call/close, minimal supplied environment, and fail-closed faults
 - Pure bridge-injected MCP server factory with exactly one
   `game_bridge_request` tool and no resource, prompt, or control-plane surface
 - Client-spawned stdio entrypoint with a 64 KiB frame limit, 32 KiB logical
@@ -36,6 +39,9 @@
 
 - The only transport is client-spawned local stdio. It opens no listener or
   network endpoint and is not remote authentication.
+- The nested worker uses fixed `process.execPath`, argv, built path/cwd,
+  `shell: false`, and pipe-only stdio. It is a same-user process boundary, not
+  a proven OS sandbox, and remains trusted separately reviewable code.
 - The default authorizer only opens sessions for explicit local request
   contexts; omitted or invalid caller context is untrusted for both opening and
   using sessions. The stdio tool cannot accept identity fields and injects its
@@ -85,9 +91,9 @@ Actual local results on 2026-08-30 with Node.js `v22.23.1` and npm `10.9.8`:
 - `npm ci` — passed; 73 packages installed, 74 audited, 0 vulnerabilities
 - `npm audit` — passed; 0 vulnerabilities
 - `npm run check` — passed
-- `npm test` — passed; 4 files and 38 tests, including 9 owner-binding,
+- `npm test` — passed; 5 files and 62 tests, including 9 owner-binding,
   cross-caller cache/in-flight, descriptor-snapshot Proxy, keyed caller-tag,
-  strict-context, and TOCTOU regressions
+  strict-context, TOCTOU, and 24 real built worker protocol/lifecycle regressions
 - Real stdio contract — passed inside `npm test`; official
   `Client@2.0.0`/`StdioClientTransport` started the built Node entrypoint,
   completed initialize/list/calls, and closed client first then transport
@@ -109,7 +115,8 @@ GitHub-hosted CI status is recorded in the Draft PR.
 
 ## Known limits
 
-- No real game, save, account, launcher, process, or file is accessed.
+- No real game, save, account, launcher, or file is accessed. The only added
+  process is the fixed built mock worker.
 - No network transport, tunnel, relay, listener, remote authentication, or host
   MCP configuration is implemented.
 - The remote authorizer used by owner-binding tests is test-only. Production
@@ -117,12 +124,12 @@ GitHub-hosted CI status is recorded in the Draft PR.
 - Stdio is local process plumbing, not an authorization boundary suitable for a
   remote endpoint.
 - Audit and session state disappear on process exit.
-- There is no rate limiter or adapter process isolation yet.
+- The mock process boundary is not an OS sandbox or authorization for a real adapter.
 - Safety stop blocks new writes but does not forcibly cancel an asynchronous
   adapter action already in flight; real adapters may need cooperative
   cancellation.
 - MCP cancellation/client disconnect may abandon delivery but does not prove an
-  already-entered core/adapter write was cancelled.
+  already-entered worker action was cancelled or rolled back.
 - `session.open` idempotency is not persisted because it precedes creation of a
   session; session-scoped operations are idempotent as required.
 
