@@ -27,7 +27,9 @@ latch, and proves that observation remains available while writes are denied.
 ## Safety properties
 
 - Unknown bridge actions and undeclared parameters are rejected.
-- Sessions are memory-only, adapter-bound, capability-limited, and expire.
+- Sessions are memory-only, adapter-bound, capability-limited, caller-bound,
+  and expire. A session opened by one trusted caller cannot be observed,
+  replayed, stopped, or closed by another caller.
 - Session count, per-session request history, and concurrent commit writes have
   hard limits. Capacity exhaustion returns `RESOURCE_CAPACITY` before adapter
   side effects.
@@ -37,7 +39,9 @@ latch, and proves that observation remains available while writes are denied.
   control plane provides stop, status, and conservative resume; resume is
   refused while a bounded write is still in flight.
 - Audit events contain hashed request/session tags and recursively redact common
-  credential fields.
+  credential fields. Session events may contain a short caller tag derived by
+  HMAC with a process-memory-only random key, never the caller principal, full
+  owner digest, or HMAC key.
 - The product server exposes no shell, generic process, filesystem, network,
   keyboard, mouse, tunnel, or real-game capability. The dev-only official MCP
   client starts exactly the built stdio server in contract tests.
@@ -85,6 +89,16 @@ trusted server code. Tool arguments cannot self-declare context, principal, or
 transport identity. MCP's JSON-RPC request ID and the envelope's bridge
 `requestId` are separate: the wrapper preserves the latter byte-for-byte,
 generates no replacement ID, and performs no automatic retry.
+
+At the core boundary, caller context is captured once from own data-property
+descriptors, strict-validated from those captured values, copied, and deeply
+frozen before the first asynchronous authorization step. Local
+context has exactly one field. A future remote transport must provide exactly
+`transport`, `principal.subject`, and `principal.method`; both principal fields
+are non-empty and bounded. Omitted, malformed, or extended context is
+untrusted. Remote transport and authentication are still deliberately absent.
+The local owner domain is process-local in effect because sessions are neither
+persisted nor shared between processes.
 
 Stdio has a 64 KiB frame-buffer limit. Valid tool arguments face a second,
 deterministically measured 32 KiB UTF-8 envelope limit, and at most eight tool

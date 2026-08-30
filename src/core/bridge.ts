@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { randomBytes } from "node:crypto";
 import { AdapterExecutionError, describeAdapter } from "./adapter.js";
 import { AdapterRegistry } from "./adapter-registry.js";
 import {
@@ -26,11 +27,21 @@ import {
   SafetyLatch,
 } from "./safety-latch.js";
 import {
+  CALLER_TAG_KEY_BYTES,
+  deriveSessionOwnerKey,
+  sessionCallerTag,
+  snapshotRequestContext,
+  type RequestContext,
+  type SessionOwnerKey,
+} from "./request-context.js";
+import {
   MAX_SESSION_TTL_MS,
   type Session,
   SessionCapacityError,
   SessionManager,
 } from "./session.js";
+
+export type { RequestContext } from "./request-context.js";
 
 const emptyParamsSchema = z.object({}).strict();
 const sessionOpenParamsSchema = z
@@ -50,15 +61,6 @@ const gameActParamsSchema = z
     input: z.unknown(),
   })
   .strict();
-
-export interface RequestContext {
-  transport: "local" | "remote";
-  principal?: { subject: string; method: string };
-}
-
-const UNTRUSTED_REQUEST_CONTEXT: RequestContext = Object.freeze({
-  transport: "remote",
-});
 
 export interface SessionAuthorizationRequest {
   adapterId: string;
@@ -84,6 +86,7 @@ export interface BridgeOptions {
   auditSink?: AuditSink;
   authorizer?: SessionAuthorizer;
   clock?: () => number;
+  callerTagKey?: Uint8Array;
 }
 
 export interface BridgeLocalControlPlane {
@@ -132,6 +135,8 @@ function safeInvalidRequest(raw: unknown): RequestEnvelope {
   };
 }
 
+const PROCESS_CALLER_TAG_KEY = randomBytes(CALLER_TAG_KEY_BYTES);
+
 export class GameBridge {
   readonly #registry: AdapterRegistry;
   readonly #sessions: SessionManager;
@@ -140,6 +145,7 @@ export class GameBridge {
   readonly #audit: AuditSink;
   readonly #authorizer: SessionAuthorizer;
   readonly #clock: () => number;
+  readonly #callerTagKey: Buffer;
 
   constructor(options: BridgeOptions) {
     this.#registry = options.registry;
@@ -149,6 +155,11 @@ export class GameBridge {
     this.#audit = options.auditSink ?? new MemoryAuditSink();
     this.#authorizer = options.authorizer ?? new OfflineLocalAuthorizer();
     this.#clock = options.clock ?? Date.now;
+    const callerTagKey = options.callerTagKey ?? PROCESS_CALLER_TAG_KEY;
+    if (!(callerTagKey instanceof Uint8Array) || callerTagKey.byteLength !== CALLER_TAG_KEY_BYTES) {
+      throw new RangeError("callerTagKey must contain exactly 32 bytes.");
+    }
+    this.#callerTagKey = Buffer.from(callerTagKey);
   }
 
   createLocalControlPlane(): BridgeLocalControlPlane {
@@ -204,8 +215,11 @@ export class GameBridge {
 
   async handle(
     raw: unknown,
-    context: RequestContext = UNTRUSTED_REQUEST_CONTEXT,
+    context?: unknown,
   ): Promise<BridgeResponse> {
+    const trustedContext = snapshotRequestContext(context);
+    const callerOwnerKey =
+      trustedContext === undefined ? undefined : deriveSessionOwnerKey(trustedContext);
     const parsed = requestEnvelopeSchema.safeParse(raw);
     if (!parsed.success) {
       const request = safeInvalidRequest(raw);
@@ -244,10 +258,10 @@ export class GameBridge {
     }
 
     if (request.action === "session.open") {
-      return this.#openSession(request, context);
+      return this.#openSession(request, trustedContext, callerOwnerKey);
     }
 
-    return this.#withSession(request, async (session) => {
+    return this.#withSession(request, callerOwnerKey, async (session) => {
       switch (request.action) {
         case "session.close":
           return this.#closeSession(request, session);
@@ -265,8 +279,18 @@ export class GameBridge {
 
   async #openSession(
     request: RequestEnvelope,
-    context: RequestContext,
+    context: RequestContext | undefined,
+    callerOwnerKey: SessionOwnerKey | undefined,
   ): Promise<BridgeResponse> {
+    if (context === undefined || callerOwnerKey === undefined) {
+      const response = errorResponse(
+        request,
+        "AUTHORIZATION_DENIED",
+        "A trusted request context is required for session access.",
+      );
+      await this.#record(request, response, false);
+      return response;
+    }
     const parsed = sessionOpenParamsSchema.safeParse(request.params);
     if (!parsed.success) {
       const response = errorResponse(
@@ -274,13 +298,13 @@ export class GameBridge {
         "INVALID_PARAMS",
         "Session parameters are invalid or contain undeclared fields.",
       );
-      await this.#record(request, response, false);
+      await this.#record(request, response, false, undefined, undefined, callerOwnerKey);
       return response;
     }
     const adapter = this.#registry.get(parsed.data.adapterId);
     if (adapter === undefined) {
       const response = errorResponse(request, "ADAPTER_NOT_FOUND", "The adapter is not registered.");
-      await this.#record(request, response, false, parsed.data.adapterId);
+      await this.#record(request, response, false, parsed.data.adapterId, undefined, callerOwnerKey);
       return response;
     }
     const available = this.#registry.capabilitiesFor(adapter.id)!;
@@ -290,7 +314,7 @@ export class GameBridge {
         "CAPABILITY_DENIED",
         "One or more requested capabilities are not declared by the adapter.",
       );
-      await this.#record(request, response, false, adapter.id);
+      await this.#record(request, response, false, adapter.id, undefined, callerOwnerKey);
       return response;
     }
     const authorized = await this.#authorizer.authorize({
@@ -304,7 +328,7 @@ export class GameBridge {
         "AUTHORIZATION_DENIED",
         "The configured session authorizer denied this request.",
       );
-      await this.#record(request, response, false, adapter.id);
+      await this.#record(request, response, false, adapter.id, undefined, callerOwnerKey);
       return response;
     }
     if (request.mode === "dry-run") {
@@ -314,12 +338,13 @@ export class GameBridge {
         capabilities: [...new Set(parsed.data.capabilities)].sort(),
         ttlMs: parsed.data.ttlMs ?? 15 * 60 * 1_000,
       });
-      await this.#record(request, response, false, adapter.id);
+      await this.#record(request, response, false, adapter.id, undefined, callerOwnerKey);
       return response;
     }
     let session: Session;
     try {
       session = this.#sessions.open(
+        callerOwnerKey,
         adapter.id,
         parsed.data.capabilities,
         parsed.data.ttlMs,
@@ -337,7 +362,7 @@ export class GameBridge {
               "INTERNAL_ERROR",
               "The bridge could not open a session.",
             );
-      await this.#record(request, response, false, adapter.id);
+      await this.#record(request, response, false, adapter.id, undefined, callerOwnerKey);
       return response;
     }
     const response = successResponse(request, {
@@ -348,23 +373,50 @@ export class GameBridge {
     });
     await this.#record(request, response, false, adapter.id, {
       openedSessionTag: safeIdentifierTag(session.id),
-    });
+    }, callerOwnerKey);
     return response;
   }
 
   async #withSession(
     request: RequestEnvelope,
+    callerOwnerKey: SessionOwnerKey | undefined,
     operation: (session: Session) => Promise<BridgeResponse>,
   ): Promise<BridgeResponse> {
+    if (callerOwnerKey === undefined) {
+      const response = errorResponse(
+        request,
+        "AUTHORIZATION_DENIED",
+        "A trusted request context is required for session access.",
+      );
+      await this.#record(request, response, false);
+      return response;
+    }
     if (request.sessionId === undefined) {
       const response = errorResponse(request, "SESSION_REQUIRED", "This action requires a session.");
-      await this.#record(request, response, false);
+      await this.#record(request, response, false, undefined, undefined, callerOwnerKey);
       return response;
     }
     const session = this.#sessions.find(request.sessionId);
     if (session === undefined) {
       const response = errorResponse(request, "SESSION_NOT_FOUND", "The session does not exist.");
-      await this.#record(request, response, false);
+      await this.#record(request, response, false, undefined, undefined, callerOwnerKey);
+      return response;
+    }
+
+    if (callerOwnerKey !== session.ownerKey) {
+      const response = errorResponse(
+        request,
+        "AUTHORIZATION_DENIED",
+        "The caller is not authorized to use this session.",
+      );
+      await this.#record(
+        request,
+        response,
+        false,
+        session.adapterId,
+        undefined,
+        callerOwnerKey,
+      );
       return response;
     }
 
@@ -376,7 +428,7 @@ export class GameBridge {
         SESSION_CLOSED: "The session is closed.",
       };
       const response = errorResponse(request, status.errorCode, messages[status.errorCode]);
-      await this.#record(request, response, false, session.adapterId);
+      await this.#record(request, response, false, session.adapterId, undefined, callerOwnerKey);
       return response;
     }
 
@@ -386,7 +438,7 @@ export class GameBridge {
       if (cached.fingerprint === fingerprint) {
         const cachedResponse =
           cached.state === "in-flight" ? await cached.responsePromise : cached.response;
-        await this.#record(request, cachedResponse, true, session.adapterId);
+        await this.#record(request, cachedResponse, true, session.adapterId, undefined, callerOwnerKey);
         return cachedResponse;
       }
       const response = errorResponse(
@@ -394,7 +446,7 @@ export class GameBridge {
         "REQUEST_ID_REUSED",
         "The request ID was already used for a different request in this session.",
       );
-      await this.#record(request, response, true, session.adapterId);
+      await this.#record(request, response, true, session.adapterId, undefined, callerOwnerKey);
       return response;
     }
 
@@ -408,7 +460,7 @@ export class GameBridge {
       );
       await this.#record(request, response, false, session.adapterId, {
         capacity: "request-cache",
-      });
+      }, callerOwnerKey);
       return response;
     }
 
@@ -416,7 +468,7 @@ export class GameBridge {
       const response = await this.#executeSessionOperation(request, session, operation);
       await this.#record(request, response, false, session.adapterId, {
         requestCapacityBypass: "session.close",
-      });
+      }, callerOwnerKey);
       return response;
     }
 
@@ -437,7 +489,7 @@ export class GameBridge {
       response,
     });
     resolveInFlight(response);
-    await this.#record(request, response, false, session.adapterId);
+    await this.#record(request, response, false, session.adapterId, undefined, callerOwnerKey);
     return response;
   }
 
@@ -598,12 +650,16 @@ export class GameBridge {
     idempotencyHit: boolean,
     adapterId?: string,
     metadata?: unknown,
+    callerOwnerKey?: SessionOwnerKey,
   ): Promise<void> {
     const actionIsRegistered = isKnownBridgeAction(request.action);
     const adapterIsRegistered =
       adapterId !== undefined && this.#registry.get(adapterId) !== undefined;
     const event: AuditEvent = {
       timestamp: new Date(this.#clock()).toISOString(),
+      ...(callerOwnerKey === undefined
+        ? {}
+        : { callerTag: sessionCallerTag(callerOwnerKey, this.#callerTagKey) }),
       requestIdTag: safeIdentifierTag(request.requestId)!,
       ...(request.sessionId === undefined
         ? {}

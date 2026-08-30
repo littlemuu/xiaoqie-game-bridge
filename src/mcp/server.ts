@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 import { McpServer, type CallToolResult } from "@modelcontextprotocol/server";
 import { redactSensitive } from "../core/audit.js";
-import type { RequestContext } from "../core/bridge.js";
+import type { RequestContext } from "../core/request-context.js";
 import {
   type BridgeResponse,
   type RequestEnvelope,

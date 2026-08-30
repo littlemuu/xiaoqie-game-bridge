@@ -7,6 +7,14 @@
 - Memory-only, adapter-bound sessions with configurable 15-minute default TTL
   and 60-minute maximum, a 64-session hard limit, and deterministic terminal
   retention/sweep; generated ID collisions fail closed without replacement
+- Strict out-of-band caller-context snapshots and immutable session ownership:
+  values are captured once from own data-property descriptors before
+  validation/copy, local uses a process-local owner domain, and the future
+  remote seam binds authentication method plus subject; omitted/malformed or
+  statefully changing context is denied without throwing
+- Domain-separated, length-prefixed full SHA-256 owner keys stored only inside
+  sessions, with 32-byte process-secret HMAC caller tags for
+  allowed/mismatched audit events; the secret is never persisted or serialized
 - Separate observation and per-action capabilities
 - Default-deny policy with strict adapter action schemas
 - Per-session request idempotency, in-flight duplicate coalescing, and
@@ -29,8 +37,12 @@
 - The only transport is client-spawned local stdio. It opens no listener or
   network endpoint and is not remote authentication.
 - The default authorizer only opens sessions for explicit local request
-  contexts; omitted caller context defaults to untrusted remote. The stdio tool
-  cannot accept identity fields and injects its frozen local context internally.
+  contexts; omitted or invalid caller context is untrusted for both opening and
+  using sessions. The stdio tool cannot accept identity fields and injects its
+  frozen local context internally.
+- Session ownership is checked before active state, idempotency cache,
+  capability, adapter, safety, or close-capacity bypass. A different caller
+  cannot read completed responses or wait on in-flight work.
 - Sessions and idempotency state are intentionally not persisted.
 - Terminal retention is five minutes by default. Sweep is explicit and
   deterministic; session open invokes it, but no background timer exists.
@@ -73,8 +85,9 @@ Actual local results on 2026-08-30 with Node.js `v22.23.1` and npm `10.9.8`:
 - `npm ci` — passed; 73 packages installed, 74 audited, 0 vulnerabilities
 - `npm audit` — passed; 0 vulnerabilities
 - `npm run check` — passed
-- `npm test` — passed; 3 files and 29 tests: the existing 21 core/hardening
-  tests plus 8 MCP tests
+- `npm test` — passed; 4 files and 38 tests, including 9 owner-binding,
+  cross-caller cache/in-flight, descriptor-snapshot Proxy, keyed caller-tag,
+  strict-context, and TOCTOU regressions
 - Real stdio contract — passed inside `npm test`; official
   `Client@2.0.0`/`StdioClientTransport` started the built Node entrypoint,
   completed initialize/list/calls, and closed client first then transport
@@ -99,6 +112,8 @@ GitHub-hosted CI status is recorded in the Draft PR.
 - No real game, save, account, launcher, process, or file is accessed.
 - No network transport, tunnel, relay, listener, remote authentication, or host
   MCP configuration is implemented.
+- The remote authorizer used by owner-binding tests is test-only. Production
+  still has no remote identity provider, credential validation, or persistence.
 - Stdio is local process plumbing, not an authorization boundary suitable for a
   remote endpoint.
 - Audit and session state disappear on process exit.

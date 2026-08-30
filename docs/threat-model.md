@@ -38,10 +38,31 @@ authorization, cookie, credential, and API key. Future
 transports must keep bearer credentials outside request params, authenticate
 before opening a session, encrypt transport traffic, and bound token lifetime.
 
+Caller context is an out-of-band trusted transport input, never an envelope or
+MCP field. Its own data-property descriptor values are captured once, then that
+captured graph is strict-validated, copied, and deeply frozen before any
+`await`. Validation never rereads the caller object, so stateful Proxy values
+cannot create a check/copy gap or escape as a raw exception. A session stores
+only a domain-separated, length-prefixed full
+SHA-256 owner key. Remote ownership binds transport, authentication method, and
+subject; local ownership uses a fixed process-local domain. Raw principal,
+owner key, and full digest are never serialized. Audit correlation uses a
+separately domain-separated 12-hex HMAC tag with a process-memory-only random
+32-byte key. The key is copied on bridge construction and never persisted or
+serialized, preventing offline enumeration of low-entropy principals from an
+observed tag.
+
 Replay within a session is handled by a request-ID cache. The first request
 installs an in-flight promise before adapter completion; concurrent or later
 identical replays await or return the same response without executing again.
 Reusing the ID for different content returns `REQUEST_ID_REUSED`.
+
+Owner comparison occurs before session state, cache lookup or wait, cache
+capacity bypass, capability, adapter, world, and safety checks. Therefore a
+different or untrusted caller cannot learn a completed response, join an
+in-flight promise, stop safety, or exploit the full-cache close bypass. All
+such existing-session attempts return fixed `AUTHORIZATION_DENIED` without
+revealing the original owner.
 
 ### Duplicate or ambiguous actions
 
@@ -131,7 +152,9 @@ plane. No unbounded tombstone or eviction path is introduced.
 - The in-memory audit sink is demonstrative, not durable or tamper-evident.
 - A future adapter runs in-process unless an isolation boundary is added.
 - Capability grants are approved by a simple local-only authorizer; the stdio
-  boundary is the trusted component that asserts locality.
+  boundary is the trusted component that asserts locality. A test-only remote
+  authorizer proves the core seam, but no production remote authentication or
+  transport exists.
 - Already-started adapter writes are not forcibly cancelled; real adapters may
   require cooperative cancellation semantics.
 

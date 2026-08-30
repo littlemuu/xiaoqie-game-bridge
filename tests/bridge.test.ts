@@ -88,7 +88,12 @@ async function observe(harness: Harness, sessionId: string, requestId: string) {
       { adapterId: "mock-world" },
       { sessionId },
     ),
+    { transport: "local" },
   );
+}
+
+function handleLocal(harness: Harness, request: RequestEnvelope): Promise<BridgeResponse> {
+  return harness.bridge.handle(request, { transport: "local" });
 }
 
 describe("GameBridge safety contract", () => {
@@ -125,7 +130,7 @@ describe("GameBridge safety contract", () => {
   it("separates observe and act capabilities", async () => {
     const harness = createHarness();
     const sessionId = await openSession(harness, ["game.observe"]);
-    const denied = await harness.bridge.handle(
+    const denied = await handleLocal(harness,
       envelope(
         "move-denied",
         "game.act",
@@ -145,13 +150,13 @@ describe("GameBridge safety contract", () => {
 
     const closedHarness = createHarness();
     const closedId = await openSession(closedHarness, ["game.observe"]);
-    const close = await closedHarness.bridge.handle(
+    const close = await handleLocal(closedHarness,
       envelope("close", "session.close", {}, { sessionId: closedId }),
     );
     expect(close.ok).toBe(true);
     expectError(await observe(closedHarness, closedId, "closed"), "SESSION_CLOSED");
     expectError(
-      await closedHarness.bridge.handle(
+      await handleLocal(closedHarness,
         envelope("close", "session.close", {}, { sessionId: closedId }),
       ),
       "SESSION_CLOSED",
@@ -168,15 +173,15 @@ describe("GameBridge safety contract", () => {
       { sessionId },
     );
 
-    const first = await harness.bridge.handle(move);
-    const duplicate = await harness.bridge.handle(move);
+    const first = await handleLocal(harness, move);
+    const duplicate = await handleLocal(harness, move);
     expect(duplicate).toEqual(first);
     const state = await observe(harness, sessionId, "after-duplicate");
     expect(state.ok && state.result).toMatchObject({ player: { x: 1, y: 1, z: 0 } });
     expect(harness.audit.events.at(-2)?.idempotencyHit).toBe(true);
 
     expectError(
-      await harness.bridge.handle({
+      await handleLocal(harness, {
         ...move,
         params: {
           adapterId: "mock-world",
@@ -199,8 +204,8 @@ describe("GameBridge safety contract", () => {
     );
 
     const [first, duplicate] = await Promise.all([
-      harness.bridge.handle(move),
-      harness.bridge.handle(move),
+      handleLocal(harness, move),
+      handleLocal(harness, move),
     ]);
 
     expect(duplicate).toEqual(first);
@@ -212,7 +217,7 @@ describe("GameBridge safety contract", () => {
   it("keeps dry-run side-effect free and applies authorized commit", async () => {
     const harness = createHarness();
     const sessionId = await openSession(harness, ["game.observe", "game.act.move"]);
-    const dryRun = await harness.bridge.handle(
+    const dryRun = await handleLocal(harness,
       envelope(
         "preview",
         "game.act",
@@ -225,7 +230,7 @@ describe("GameBridge safety contract", () => {
     const before = await observe(harness, sessionId, "before-commit-2");
     expect(before.ok && before.result).toMatchObject({ player: { x: 0, y: 1, z: 0 } });
 
-    const commit = await harness.bridge.handle(
+    const commit = await handleLocal(harness,
       envelope(
         "commit",
         "game.act",
@@ -247,13 +252,13 @@ describe("GameBridge safety contract", () => {
     ]);
     expect(
       (
-        await harness.bridge.handle(
+        await handleLocal(harness,
           envelope("stop", "safety.stop", {}, { sessionId }),
         )
       ).ok,
     ).toBe(true);
     expectError(
-      await harness.bridge.handle(
+      await handleLocal(harness,
         envelope(
           "blocked-move",
           "game.act",
@@ -266,7 +271,7 @@ describe("GameBridge safety contract", () => {
     expect((await observe(harness, sessionId, "observe-stopped")).ok).toBe(true);
     expect(
       (
-        await harness.bridge.handle(
+        await handleLocal(harness,
           envelope("close-stopped", "session.close", {}, { sessionId }),
         )
       ).ok,
@@ -354,6 +359,7 @@ describe("GameBridge safety contract", () => {
           adapterId: adapterSecret,
           capabilities: [],
         }),
+        { transport: "local" },
       ),
       "ADAPTER_NOT_FOUND",
     );
@@ -366,7 +372,7 @@ describe("GameBridge safety contract", () => {
   it("prevents capabilities from being used with another adapter", async () => {
     const harness = createHarness(true);
     const sessionId = await openSession(harness, ["game.observe", "game.act.move"]);
-    const response = await harness.bridge.handle(
+    const response = await handleLocal(harness,
       envelope(
         "cross-adapter",
         "game.act",
@@ -381,7 +387,7 @@ describe("GameBridge safety contract", () => {
     const harness = createHarness();
     const sessionId = await openSession(harness, ["game.act.move", "game.act.place_block"]);
     expectError(
-      await harness.bridge.handle(
+      await handleLocal(harness,
         envelope(
           "unknown-game-action",
           "game.act",
@@ -392,7 +398,7 @@ describe("GameBridge safety contract", () => {
       "ACTION_NOT_ALLOWED",
     );
     expectError(
-      await harness.bridge.handle(
+      await handleLocal(harness,
         envelope(
           "bad-block",
           "game.act",
