@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { BridgeMode, ErrorCode } from "./protocol.js";
 
 const sensitiveKeyPattern =
-  /(?:authorization|cookie|password|passwd|secret|token|credential|api[-_]?key)/i;
+  /(?:authorization|cookie|password|passwd|secret|token|credential|api[-_]?key|principal|subject|owner[-_]?(?:key|digest))/i;
 
 export function redactSensitive(value: unknown): unknown {
   if (Array.isArray(value)) {
@@ -28,6 +28,7 @@ export function safeIdentifierTag(value: string | undefined): string | undefined
 
 export interface AuditEvent {
   timestamp: string;
+  callerTag?: string;
   requestIdTag?: string;
   sessionIdTag?: string;
   adapterId?: string;

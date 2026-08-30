@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { BridgeResponse, ErrorCode } from "./protocol.js";
+import { isSessionOwnerKey, type SessionOwnerKey } from "./request-context.js";
 
 export const DEFAULT_SESSION_TTL_MS = 15 * 60 * 1_000;
 export const MAX_SESSION_TTL_MS = 60 * 60 * 1_000;
@@ -37,6 +38,7 @@ export type CachedRequest = InFlightRequest | CompletedRequest;
 
 export interface Session {
   id: string;
+  readonly ownerKey: SessionOwnerKey;
   adapterId: string;
   capabilities: Set<string>;
   createdAt: number;
@@ -99,7 +101,15 @@ export class SessionManager {
     return this.#clock();
   }
 
-  open(adapterId: string, capabilities: Iterable<string>, ttlMs?: number): Session {
+  open(
+    ownerKey: SessionOwnerKey,
+    adapterId: string,
+    capabilities: Iterable<string>,
+    ttlMs?: number,
+  ): Session {
+    if (!isSessionOwnerKey(ownerKey)) {
+      throw new TypeError("Session owner key must be a full SHA-256 digest.");
+    }
     const effectiveTtl = ttlMs ?? DEFAULT_SESSION_TTL_MS;
     if (effectiveTtl <= 0 || effectiveTtl > MAX_SESSION_TTL_MS) {
       throw new RangeError("Session TTL must be between 1 ms and 60 minutes.");
@@ -115,6 +125,7 @@ export class SessionManager {
     }
     const session: Session = {
       id: sessionId,
+      ownerKey,
       adapterId,
       capabilities: new Set(capabilities),
       createdAt: now,
@@ -122,6 +133,12 @@ export class SessionManager {
       requestCapacity: this.#maxRequestsPerSession,
       requests: new Map(),
     };
+    Object.defineProperty(session, "ownerKey", {
+      value: ownerKey,
+      enumerable: false,
+      writable: false,
+      configurable: false,
+    });
     this.#sessions.set(session.id, session);
     return session;
   }

@@ -12,8 +12,11 @@ import {
   SafetyLatch,
   SessionIdCollisionError,
   SessionManager,
+  deriveSessionOwnerKey,
   type RequestEnvelope,
 } from "../src/index.js";
+
+const TEST_OWNER = deriveSessionOwnerKey({ transport: "local" });
 
 interface Deferred<T> {
   promise: Promise<T>;
@@ -232,6 +235,13 @@ function expectError(response: BridgeResponse, code: string): void {
   }
 }
 
+function handleLocal(
+  harness: HardeningHarness,
+  request: RequestEnvelope,
+): Promise<BridgeResponse> {
+  return harness.bridge.handle(request, { transport: "local" });
+}
+
 describe("bounded cache and local safety hardening", () => {
   it("fails closed on generated session ID collisions without replacing the active session", async () => {
     const collidingId = "Bearer-review-secret-123";
@@ -241,10 +251,20 @@ describe("bounded cache and local safety hardening", () => {
       terminalRetentionMs: 10,
       maxRequestsPerSession: 1,
     });
-    const first = directSessions.open("first-adapter", ["first-capability"], 1_000);
+    const first = directSessions.open(
+      TEST_OWNER,
+      "first-adapter",
+      ["first-capability"],
+      1_000,
+    );
 
     expect(() =>
-      directSessions.open("second-adapter", ["second-capability"], 1_000),
+      directSessions.open(
+        TEST_OWNER,
+        "second-adapter",
+        ["second-capability"],
+        1_000,
+      ),
     ).toThrow(SessionIdCollisionError);
     expect(directSessions.size).toBe(1);
     expect(directSessions.find(collidingId)).toBe(first);
@@ -302,7 +322,7 @@ describe("bounded cache and local safety hardening", () => {
 
     expect(
       (
-        await harness.bridge.handle(
+        await handleLocal(harness,
           envelope("close-1", "session.close", {}, { sessionId: firstId }),
         )
       ).ok,
@@ -333,9 +353,9 @@ describe("bounded cache and local safety hardening", () => {
       terminalRetentionMs: 10,
       maxRequestsPerSession: 1,
     });
-    const closed = sessions.open("gated-world", [], 100);
+    const closed = sessions.open(TEST_OWNER, "gated-world", [], 100);
     sessions.close(closed);
-    const expired = sessions.open("gated-world", [], 5);
+    const expired = sessions.open(TEST_OWNER, "gated-world", [], 5);
 
     now.value = 5;
     expect(sessions.sweep()).toBe(0);
@@ -357,20 +377,20 @@ describe("bounded cache and local safety hardening", () => {
     const sessionId = await openSession(harness, "open-cache");
     const firstRequest = writeRequest("cached-write", sessionId, "success");
 
-    const first = await harness.bridge.handle(firstRequest);
-    const replay = await harness.bridge.handle(firstRequest);
+    const first = await handleLocal(harness, firstRequest);
+    const replay = await handleLocal(harness, firstRequest);
     expect(replay).toEqual(first);
     expect(harness.adapter.commitEntries).toBe(1);
     expect(harness.adapter.completedWrites).toBe(1);
     expect(harness.sessions.find(sessionId)?.requests.size).toBe(1);
 
     expectError(
-      await harness.bridge.handle(writeRequest("new-at-capacity", sessionId, "success")),
+      await handleLocal(harness, writeRequest("new-at-capacity", sessionId, "success")),
       "RESOURCE_CAPACITY",
     );
     expect(harness.adapter.commitEntries).toBe(1);
 
-    const close = await harness.bridge.handle(
+    const close = await handleLocal(harness,
       envelope("close-at-capacity", "session.close", {}, { sessionId }),
     );
     expect(close.ok).toBe(true);
@@ -384,16 +404,16 @@ describe("bounded cache and local safety hardening", () => {
     });
     const sessionId = await openSession(harness, "open-in-flight");
     const waitingRequest = writeRequest("waiting", sessionId, "wait");
-    const first = harness.bridge.handle(waitingRequest);
+    const first = handleLocal(harness, waitingRequest);
     await harness.adapter.waitForCommitEntries(1);
-    const duplicate = harness.bridge.handle(waitingRequest);
+    const duplicate = handleLocal(harness, waitingRequest);
 
     expectError(
-      await harness.bridge.handle(writeRequest("blocked-by-cache", sessionId, "success")),
+      await handleLocal(harness, writeRequest("blocked-by-cache", sessionId, "success")),
       "RESOURCE_CAPACITY",
     );
     expectError(
-      await harness.bridge.handle(writeRequest("waiting", sessionId, "success")),
+      await handleLocal(harness, writeRequest("waiting", sessionId, "success")),
       "REQUEST_ID_REUSED",
     );
     expect(harness.adapter.commitEntries).toBe(1);
@@ -406,7 +426,7 @@ describe("bounded cache and local safety hardening", () => {
       reason: "writes-in-flight",
       inFlightWrites: 1,
     });
-    const close = await harness.bridge.handle(
+    const close = await handleLocal(harness,
       envelope("close-while-full", "session.close", {}, { sessionId }),
     );
     expect(close.ok).toBe(true);
@@ -435,7 +455,7 @@ describe("bounded cache and local safety hardening", () => {
   it("rejects excess commit concurrency before the adapter but permits dry-run", async () => {
     const harness = createHarness({ maxInFlightWrites: 1 });
     const sessionId = await openSession(harness, "open-write-limit");
-    const waiting = harness.bridge.handle(writeRequest("write-1", sessionId, "wait"));
+    const waiting = handleLocal(harness, writeRequest("write-1", sessionId, "wait"));
     await harness.adapter.waitForCommitEntries(1);
 
     expect(harness.control.getSafetyStatus()).toMatchObject({
@@ -443,7 +463,7 @@ describe("bounded cache and local safety hardening", () => {
       maxInFlightWrites: 1,
     });
     expectError(
-      await harness.bridge.handle(writeRequest("write-2", sessionId, "success")),
+      await handleLocal(harness, writeRequest("write-2", sessionId, "success")),
       "RESOURCE_CAPACITY",
     );
     expect(harness.adapter.commitEntries).toBe(1);
@@ -451,7 +471,7 @@ describe("bounded cache and local safety hardening", () => {
     const stopped = await harness.control.stopSafety();
     expect(stopped).toMatchObject({ stopped: true, inFlightWrites: 1 });
     expectError(
-      await harness.bridge.handle(writeRequest("write-after-stop", sessionId, "success")),
+      await handleLocal(harness, writeRequest("write-after-stop", sessionId, "success")),
       "SAFETY_STOPPED",
     );
     expect(harness.adapter.commitEntries).toBe(1);
@@ -460,7 +480,7 @@ describe("bounded cache and local safety hardening", () => {
       reason: "writes-in-flight",
     });
 
-    const dryRun = await harness.bridge.handle(
+    const dryRun = await handleLocal(harness,
       writeRequest("write-preview", sessionId, "success", "dry-run"),
     );
     expect(dryRun.ok && dryRun.result).toMatchObject({ applied: false });
@@ -478,19 +498,19 @@ describe("bounded cache and local safety hardening", () => {
     const sessionId = await openSession(harness, "open-errors");
 
     expectError(
-      await harness.bridge.handle(writeRequest("known-error", sessionId, "known-error")),
+      await handleLocal(harness, writeRequest("known-error", sessionId, "known-error")),
       "OUT_OF_BOUNDS",
     );
     expect(harness.control.getSafetyStatus().inFlightWrites).toBe(0);
 
     expectError(
-      await harness.bridge.handle(writeRequest("unknown-error", sessionId, "unknown-error")),
+      await handleLocal(harness, writeRequest("unknown-error", sessionId, "unknown-error")),
       "INTERNAL_ERROR",
     );
     expect(harness.control.getSafetyStatus().inFlightWrites).toBe(0);
 
     expect(
-      (await harness.bridge.handle(writeRequest("after-errors", sessionId, "success"))).ok,
+      (await handleLocal(harness, writeRequest("after-errors", sessionId, "success"))).ok,
     ).toBe(true);
     expect(harness.control.getSafetyStatus().inFlightWrites).toBe(0);
   });
