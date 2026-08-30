@@ -20,10 +20,15 @@ import {
   requestEnvelopeSchema,
   successResponse,
 } from "./protocol.js";
-import { SafetyLatch } from "./safety-latch.js";
+import {
+  type SafetyResumeResult,
+  type SafetyStatus,
+  SafetyLatch,
+} from "./safety-latch.js";
 import {
   MAX_SESSION_TTL_MS,
   type Session,
+  SessionCapacityError,
   SessionManager,
 } from "./session.js";
 
@@ -82,7 +87,9 @@ export interface BridgeOptions {
 }
 
 export interface BridgeLocalControlPlane {
-  resumeSafety(): Promise<{ resumed: boolean }>;
+  stopSafety(): Promise<SafetyStatus & { stopped: true; alreadyStopped: boolean }>;
+  getSafetyStatus(): SafetyStatus;
+  resumeSafety(): Promise<SafetyResumeResult>;
 }
 
 function stableStringify(value: unknown): string {
@@ -145,21 +152,53 @@ export class GameBridge {
   }
 
   createLocalControlPlane(): BridgeLocalControlPlane {
-    const control = this.#safety.createLocalControlPlane();
     return Object.freeze({
-      resumeSafety: async () => {
-        const result = control.resume();
-        await writeAudit(this.#audit, {
-          timestamp: new Date(this.#clock()).toISOString(),
-          action: "safety.resume.local",
-          mode: "commit",
-          decision: "allow",
-          safetyStopped: this.#safety.isStopped(),
-          idempotencyHit: false,
-          metadata: { localControlPlane: true, resumed: result.resumed },
+      stopSafety: async () => {
+        const result = this.#safety.stop();
+        await this.#recordLocalSafety("safety.stop.local", "allow", {
+          alreadyStopped: result.alreadyStopped,
+          inFlightWrites: result.inFlightWrites,
         });
         return result;
       },
+      getSafetyStatus: () => this.#safety.status(),
+      resumeSafety: async () => {
+        const result = this.#safety.resume();
+        await this.#recordLocalSafety(
+          "safety.resume.local",
+          result.resumed ? "allow" : "deny",
+          {
+            resumed: result.resumed,
+            inFlightWrites: result.inFlightWrites,
+            ...(!result.resumed ? { reason: result.reason } : {}),
+          },
+          !result.resumed && result.reason === "writes-in-flight"
+            ? "RESOURCE_CAPACITY"
+            : undefined,
+        );
+        return result;
+      },
+    });
+  }
+
+  async #recordLocalSafety(
+    action: "safety.stop.local" | "safety.resume.local",
+    decision: "allow" | "deny",
+    metadata: Record<string, unknown>,
+    errorCode?: ErrorCode,
+  ): Promise<void> {
+    await writeAudit(this.#audit, {
+      timestamp: new Date(this.#clock()).toISOString(),
+      action,
+      mode: "commit",
+      decision,
+      ...(errorCode === undefined ? {} : { errorCode }),
+      safetyStopped: this.#safety.isStopped(),
+      idempotencyHit: false,
+      metadata: redactSensitive({
+        localControlPlane: true,
+        ...metadata,
+      }),
     });
   }
 
@@ -278,11 +317,29 @@ export class GameBridge {
       await this.#record(request, response, false, adapter.id);
       return response;
     }
-    const session = this.#sessions.open(
-      adapter.id,
-      parsed.data.capabilities,
-      parsed.data.ttlMs,
-    );
+    let session: Session;
+    try {
+      session = this.#sessions.open(
+        adapter.id,
+        parsed.data.capabilities,
+        parsed.data.ttlMs,
+      );
+    } catch (error) {
+      const response =
+        error instanceof SessionCapacityError
+          ? errorResponse(
+              request,
+              "RESOURCE_CAPACITY",
+              "Session capacity is exhausted.",
+            )
+          : errorResponse(
+              request,
+              "INTERNAL_ERROR",
+              "The bridge could not open a session.",
+            );
+      await this.#record(request, response, false, adapter.id);
+      return response;
+    }
     const response = successResponse(request, {
       sessionId: session.id,
       adapterId: session.adapterId,
@@ -341,6 +398,28 @@ export class GameBridge {
       return response;
     }
 
+    const requestCacheIsFull = session.requests.size >= session.requestCapacity;
+    const closeCapacityBypass = requestCacheIsFull && request.action === "session.close";
+    if (requestCacheIsFull && !closeCapacityBypass) {
+      const response = errorResponse(
+        request,
+        "RESOURCE_CAPACITY",
+        "The session request capacity is exhausted.",
+      );
+      await this.#record(request, response, false, session.adapterId, {
+        capacity: "request-cache",
+      });
+      return response;
+    }
+
+    if (closeCapacityBypass) {
+      const response = await this.#executeSessionOperation(request, session, operation);
+      await this.#record(request, response, false, session.adapterId, {
+        requestCapacityBypass: "session.close",
+      });
+      return response;
+    }
+
     let resolveInFlight!: (response: BridgeResponse) => void;
     const responsePromise = new Promise<BridgeResponse>((resolve) => {
       resolveInFlight = resolve;
@@ -351,19 +430,7 @@ export class GameBridge {
       responsePromise,
     });
 
-    const response = await (async (): Promise<BridgeResponse> => {
-      try {
-        return await operation(session);
-      } catch (error) {
-        return error instanceof AdapterExecutionError
-          ? errorResponse(request, error.code, error.message)
-          : errorResponse(
-              request,
-              "INTERNAL_ERROR",
-              "The bridge could not complete the request.",
-            );
-      }
-    })();
+    const response = await this.#executeSessionOperation(request, session, operation);
     session.requests.set(request.requestId, {
       fingerprint,
       state: "completed",
@@ -372,6 +439,24 @@ export class GameBridge {
     resolveInFlight(response);
     await this.#record(request, response, false, session.adapterId);
     return response;
+  }
+
+  async #executeSessionOperation(
+    request: RequestEnvelope,
+    session: Session,
+    operation: (session: Session) => Promise<BridgeResponse>,
+  ): Promise<BridgeResponse> {
+    try {
+      return await operation(session);
+    } catch (error) {
+      return error instanceof AdapterExecutionError
+        ? errorResponse(request, error.code, error.message)
+        : errorResponse(
+            request,
+            "INTERNAL_ERROR",
+            "The bridge could not complete the request.",
+          );
+    }
   }
 
   async #closeSession(request: RequestEnvelope, session: Session): Promise<BridgeResponse> {
@@ -421,13 +506,6 @@ export class GameBridge {
     if ("response" in adapterCheck) {
       return adapterCheck.response;
     }
-    if (this.#safety.isStopped()) {
-      return errorResponse(
-        request,
-        "SAFETY_STOPPED",
-        "State-changing actions are disabled by the safety latch.",
-      );
-    }
     const decision = this.#policy.authorizeGameAction(
       adapterCheck.adapter,
       parsed.data.gameAction,
@@ -437,12 +515,39 @@ export class GameBridge {
     if (!decision.allowed) {
       return errorResponse(request, decision.code, decision.message);
     }
-    const result = await adapterCheck.adapter.execute(
-      parsed.data.gameAction,
-      decision.parsedInput,
-      request.mode,
-    );
-    return successResponse(request, result);
+    if (request.mode === "dry-run") {
+      const result = await adapterCheck.adapter.execute(
+        parsed.data.gameAction,
+        decision.parsedInput,
+        request.mode,
+      );
+      return successResponse(request, result);
+    }
+
+    const writePermit = this.#safety.beginWrite();
+    if (!writePermit.allowed) {
+      return writePermit.reason === "stopped"
+        ? errorResponse(
+            request,
+            "SAFETY_STOPPED",
+            "State-changing actions are disabled by the safety latch.",
+          )
+        : errorResponse(
+            request,
+            "RESOURCE_CAPACITY",
+            "Concurrent write capacity is exhausted.",
+          );
+    }
+    try {
+      const result = await adapterCheck.adapter.execute(
+        parsed.data.gameAction,
+        decision.parsedInput,
+        request.mode,
+      );
+      return successResponse(request, result);
+    } finally {
+      writePermit.release();
+    }
   }
 
   async #stop(request: RequestEnvelope, session: Session): Promise<BridgeResponse> {
