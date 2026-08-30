@@ -20,6 +20,11 @@ const bridge = new GameBridge({
   }),
   clock: () => fixedNow,
 });
+const localContext = { transport: "local" } as const;
+
+function handleLocal(requestEnvelope: RequestEnvelope) {
+  return bridge.handle(requestEnvelope, localContext);
+}
 
 function request(
   requestId: string,
@@ -39,7 +44,7 @@ function request(
 }
 
 async function main(): Promise<void> {
-  const opened = await bridge.handle(
+  const opened = await handleLocal(
     request("demo-open", "session.open", {
       adapterId: "mock-world",
       capabilities: ["game.observe", "game.act.move", "safety.stop"],
@@ -67,11 +72,11 @@ async function main(): Promise<void> {
 
   const output = {
     opened,
-    preview: await bridge.handle(preview),
-    committed: await bridge.handle(commit),
-    duplicateCommit: await bridge.handle(commit),
-    stopped: await bridge.handle(request("demo-stop", "safety.stop", {}, "commit", sessionId)),
-    blockedWrite: await bridge.handle(
+    preview: await handleLocal(preview),
+    committed: await handleLocal(commit),
+    duplicateCommit: await handleLocal(commit),
+    stopped: await handleLocal(request("demo-stop", "safety.stop", {}, "commit", sessionId)),
+    blockedWrite: await handleLocal(
       request(
         "demo-blocked",
         "game.act",
@@ -80,7 +85,7 @@ async function main(): Promise<void> {
         sessionId,
       ),
     ),
-    observationWhileStopped: await bridge.handle(
+    observationWhileStopped: await handleLocal(
       request(
         "demo-observe",
         "game.observe",

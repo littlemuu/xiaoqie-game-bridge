@@ -51,6 +51,10 @@ export interface RequestContext {
   principal?: { subject: string; method: string };
 }
 
+const UNTRUSTED_REQUEST_CONTEXT: RequestContext = Object.freeze({
+  transport: "remote",
+});
+
 export interface SessionAuthorizationRequest {
   adapterId: string;
   capabilities: readonly string[];
@@ -159,7 +163,10 @@ export class GameBridge {
     });
   }
 
-  async handle(raw: unknown, context: RequestContext = { transport: "local" }): Promise<BridgeResponse> {
+  async handle(
+    raw: unknown,
+    context: RequestContext = UNTRUSTED_REQUEST_CONTEXT,
+  ): Promise<BridgeResponse> {
     const parsed = requestEnvelopeSchema.safeParse(raw);
     if (!parsed.success) {
       const request = safeInvalidRequest(raw);
@@ -320,8 +327,10 @@ export class GameBridge {
     const cached = session.requests.get(request.requestId);
     if (cached !== undefined) {
       if (cached.fingerprint === fingerprint) {
-        await this.#record(request, cached.response, true, session.adapterId);
-        return cached.response;
+        const cachedResponse =
+          cached.state === "in-flight" ? await cached.responsePromise : cached.response;
+        await this.#record(request, cachedResponse, true, session.adapterId);
+        return cachedResponse;
       }
       const response = errorResponse(
         request,
@@ -332,16 +341,35 @@ export class GameBridge {
       return response;
     }
 
-    let response: BridgeResponse;
-    try {
-      response = await operation(session);
-    } catch (error) {
-      response =
-        error instanceof AdapterExecutionError
+    let resolveInFlight!: (response: BridgeResponse) => void;
+    const responsePromise = new Promise<BridgeResponse>((resolve) => {
+      resolveInFlight = resolve;
+    });
+    session.requests.set(request.requestId, {
+      fingerprint,
+      state: "in-flight",
+      responsePromise,
+    });
+
+    const response = await (async (): Promise<BridgeResponse> => {
+      try {
+        return await operation(session);
+      } catch (error) {
+        return error instanceof AdapterExecutionError
           ? errorResponse(request, error.code, error.message)
-          : errorResponse(request, "INTERNAL_ERROR", "The bridge could not complete the request.");
-    }
-    session.requests.set(request.requestId, { fingerprint, response });
+          : errorResponse(
+              request,
+              "INTERNAL_ERROR",
+              "The bridge could not complete the request.",
+            );
+      }
+    })();
+    session.requests.set(request.requestId, {
+      fingerprint,
+      state: "completed",
+      response,
+    });
+    resolveInFlight(response);
     await this.#record(request, response, false, session.adapterId);
     return response;
   }
@@ -466,14 +494,22 @@ export class GameBridge {
     adapterId?: string,
     metadata?: unknown,
   ): Promise<void> {
+    const actionIsRegistered = isKnownBridgeAction(request.action);
+    const adapterIsRegistered =
+      adapterId !== undefined && this.#registry.get(adapterId) !== undefined;
     const event: AuditEvent = {
       timestamp: new Date(this.#clock()).toISOString(),
       requestIdTag: safeIdentifierTag(request.requestId)!,
       ...(request.sessionId === undefined
         ? {}
         : { sessionIdTag: safeIdentifierTag(request.sessionId)! }),
-      ...(adapterId === undefined ? {} : { adapterId }),
-      action: request.action,
+      ...(adapterId === undefined
+        ? {}
+        : adapterIsRegistered
+          ? { adapterId }
+          : { adapterIdTag: safeIdentifierTag(adapterId)! }),
+      action: actionIsRegistered ? request.action : "unregistered",
+      ...(actionIsRegistered ? {} : { actionTag: safeIdentifierTag(request.action)! }),
       mode: request.mode,
       decision: response.ok ? "allow" : "deny",
       ...(!response.ok ? { errorCode: response.error.code } : {}),

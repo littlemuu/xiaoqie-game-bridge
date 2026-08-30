@@ -67,6 +67,7 @@ async function openSession(
       capabilities,
       ...(options.ttlMs === undefined ? {} : { ttlMs: options.ttlMs }),
     }),
+    { transport: "local" },
   );
   expect(response.ok).toBe(true);
   return (response as { result: { sessionId: string } }).result.sessionId;
@@ -187,6 +188,27 @@ describe("GameBridge safety contract", () => {
     );
   });
 
+  it("coalesces concurrent duplicate requests before adapter execution", async () => {
+    const harness = createHarness();
+    const sessionId = await openSession(harness, ["game.observe", "game.act.move"]);
+    const move = envelope(
+      "concurrent-move",
+      "game.act",
+      { adapterId: "mock-world", gameAction: "move", input: { dx: 1, dy: 0, dz: 0 } },
+      { sessionId },
+    );
+
+    const [first, duplicate] = await Promise.all([
+      harness.bridge.handle(move),
+      harness.bridge.handle(move),
+    ]);
+
+    expect(duplicate).toEqual(first);
+    const state = await observe(harness, sessionId, "after-concurrent-duplicate");
+    expect(state.ok && state.result).toMatchObject({ player: { x: 1, y: 1, z: 0 } });
+    expect(harness.audit.events.some((event) => event.idempotencyHit)).toBe(true);
+  });
+
   it("keeps dry-run side-effect free and applies authorized commit", async () => {
     const harness = createHarness();
     const sessionId = await openSession(harness, ["game.observe", "game.act.move"]);
@@ -261,6 +283,28 @@ describe("GameBridge safety contract", () => {
     );
   });
 
+  it("treats omitted and explicit remote caller context as untrusted", async () => {
+    const harness = createHarness();
+    const open = envelope("context-open", "session.open", {
+      adapterId: "mock-world",
+      capabilities: ["game.act.move"],
+    });
+
+    expectError(await harness.bridge.handle(open), "AUTHORIZATION_DENIED");
+    expectError(
+      await harness.bridge.handle({ ...open, requestId: "remote-open" }, { transport: "remote" }),
+      "AUTHORIZATION_DENIED",
+    );
+    expect(
+      (
+        await harness.bridge.handle(
+          { ...open, requestId: "explicit-local-open" },
+          { transport: "local" },
+        )
+      ).ok,
+    ).toBe(true);
+  });
+
   it("recursively redacts credentials and stores only hashed identifiers", async () => {
     const harness = createHarness();
     const sink = harness.audit;
@@ -288,6 +332,35 @@ describe("GameBridge safety contract", () => {
     const event = sink.events.at(-1)!;
     expect(event.requestIdTag).not.toBe("raw-request-id");
     expect(JSON.stringify(event)).not.toContain("raw-request-id");
+  });
+
+  it("never stores attacker-controlled action or adapter identifiers verbatim", async () => {
+    const harness = createHarness();
+    const actionSecret = "Bearer-review-secret-123";
+    const adapterSecret = "adapter-password-review-secret-456";
+
+    expectError(
+      await harness.bridge.handle(envelope("malicious-action", actionSecret, {})),
+      "UNKNOWN_ACTION",
+    );
+    const actionEvent = harness.audit.events.at(-1)!;
+    expect(actionEvent.action).toBe("unregistered");
+    expect(actionEvent.actionTag).toMatch(/^[a-f0-9]{12}$/);
+    expect(JSON.stringify(actionEvent)).not.toContain(actionSecret);
+
+    expectError(
+      await harness.bridge.handle(
+        envelope("malicious-adapter", "session.open", {
+          adapterId: adapterSecret,
+          capabilities: [],
+        }),
+      ),
+      "ADAPTER_NOT_FOUND",
+    );
+    const adapterEvent = harness.audit.events.at(-1)!;
+    expect(adapterEvent.adapterId).toBeUndefined();
+    expect(adapterEvent.adapterIdTag).toMatch(/^[a-f0-9]{12}$/);
+    expect(JSON.stringify(adapterEvent)).not.toContain(adapterSecret);
   });
 
   it("prevents capabilities from being used with another adapter", async () => {

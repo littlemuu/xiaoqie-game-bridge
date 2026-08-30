@@ -4,10 +4,19 @@ import type { BridgeResponse, ErrorCode } from "./protocol.js";
 export const DEFAULT_SESSION_TTL_MS = 15 * 60 * 1_000;
 export const MAX_SESSION_TTL_MS = 60 * 60 * 1_000;
 
-export interface CachedRequest {
+export interface InFlightRequest {
   fingerprint: string;
+  state: "in-flight";
+  responsePromise: Promise<BridgeResponse>;
+}
+
+export interface CompletedRequest {
+  fingerprint: string;
+  state: "completed";
   response: BridgeResponse;
 }
+
+export type CachedRequest = InFlightRequest | CompletedRequest;
 
 export interface Session {
   id: string;

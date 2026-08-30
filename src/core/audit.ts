@@ -31,7 +31,9 @@ export interface AuditEvent {
   requestIdTag?: string;
   sessionIdTag?: string;
   adapterId?: string;
+  adapterIdTag?: string;
   action: string;
+  actionTag?: string;
   mode: BridgeMode;
   decision: "allow" | "deny";
   errorCode?: ErrorCode;
