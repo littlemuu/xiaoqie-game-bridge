@@ -11,3 +11,7 @@ export * from "./core/request-context.js";
 export * from "./core/safety-latch.js";
 export * from "./core/session.js";
 export * from "./mcp/server.js";
+export * from "./operator/client.js";
+export * from "./operator/protocol.js";
+export * from "./operator/server.js";
+export * from "./runtime/product-runtime.js";

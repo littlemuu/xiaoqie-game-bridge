@@ -4,6 +4,7 @@ export interface SafetyStatus {
   stopped: boolean;
   inFlightWrites: number;
   maxInFlightWrites: number;
+  stopGeneration: number;
 }
 
 export type BeginWriteResult =
@@ -18,7 +19,7 @@ export type SafetyResumeResult =
   | (SafetyStatus & { resumed: true })
   | (SafetyStatus & {
       resumed: false;
-      reason: "writes-in-flight" | "not-stopped";
+      reason: "generation-mismatch" | "writes-in-flight" | "not-stopped";
     });
 
 function requirePositiveInteger(value: number): void {
@@ -30,6 +31,7 @@ function requirePositiveInteger(value: number): void {
 export class SafetyLatch {
   #stopped = false;
   #inFlightWrites = 0;
+  #stopGeneration = 0;
   readonly #maxInFlightWrites: number;
 
   constructor(options: SafetyLatchOptions = {}) {
@@ -44,6 +46,9 @@ export class SafetyLatch {
 
   stop(): SafetyStatus & { stopped: true; alreadyStopped: boolean } {
     const alreadyStopped = this.#stopped;
+    if (!alreadyStopped) {
+      this.#stopGeneration += 1;
+    }
     this.#stopped = true;
     return { ...this.status(), stopped: true, alreadyStopped };
   }
@@ -53,15 +58,23 @@ export class SafetyLatch {
       stopped: this.#stopped,
       inFlightWrites: this.#inFlightWrites,
       maxInFlightWrites: this.#maxInFlightWrites,
+      stopGeneration: this.#stopGeneration,
     };
   }
 
-  resume(): SafetyResumeResult {
-    if (this.#inFlightWrites > 0) {
-      return { ...this.status(), resumed: false, reason: "writes-in-flight" };
-    }
+  resume(expectedGeneration: number): SafetyResumeResult {
     if (!this.#stopped) {
       return { ...this.status(), resumed: false, reason: "not-stopped" };
+    }
+    if (
+      !Number.isSafeInteger(expectedGeneration) ||
+      expectedGeneration < 1 ||
+      expectedGeneration !== this.#stopGeneration
+    ) {
+      return { ...this.status(), resumed: false, reason: "generation-mismatch" };
+    }
+    if (this.#inFlightWrites > 0) {
+      return { ...this.status(), resumed: false, reason: "writes-in-flight" };
     }
     this.#stopped = false;
     return { ...this.status(), resumed: true };

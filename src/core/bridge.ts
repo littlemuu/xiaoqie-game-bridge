@@ -92,7 +92,7 @@ export interface BridgeOptions {
 export interface BridgeLocalControlPlane {
   stopSafety(): Promise<SafetyStatus & { stopped: true; alreadyStopped: boolean }>;
   getSafetyStatus(): SafetyStatus;
-  resumeSafety(): Promise<SafetyResumeResult>;
+  resumeSafety(generation: number): Promise<SafetyResumeResult>;
 }
 
 function stableStringify(value: unknown): string {
@@ -169,18 +169,20 @@ export class GameBridge {
         await this.#recordLocalSafety("safety.stop.local", "allow", {
           alreadyStopped: result.alreadyStopped,
           inFlightWrites: result.inFlightWrites,
+          stopGeneration: result.stopGeneration,
         });
         return result;
       },
       getSafetyStatus: () => this.#safety.status(),
-      resumeSafety: async () => {
-        const result = this.#safety.resume();
+      resumeSafety: async (generation: number) => {
+        const result = this.#safety.resume(generation);
         await this.#recordLocalSafety(
           "safety.resume.local",
           result.resumed ? "allow" : "deny",
           {
             resumed: result.resumed,
             inFlightWrites: result.inFlightWrites,
+            stopGeneration: result.stopGeneration,
             ...(!result.resumed ? { reason: result.reason } : {}),
           },
           !result.resumed && result.reason === "writes-in-flight"
