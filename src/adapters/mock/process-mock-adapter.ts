@@ -129,6 +129,8 @@ export class ProcessMockAdapter implements GameAdapter {
   #sequence = 0;
   #state: "idle" | "starting" | "running" | "closing" | "closed" | "failed" = "idle";
   #exitObserved = false;
+  #forcedClose = false;
+  #shutdownAcknowledged = false;
   #terminationRequested = false;
 
   constructor(options: ProcessMockAdapterOptions = {}) {
@@ -163,7 +165,7 @@ export class ProcessMockAdapter implements GameAdapter {
     this.#child = child;
     child.stdout!.on("data", (chunk: Buffer) => this.#consume(chunk));
     child.once("error", () => this.#fail("worker-exit"));
-    child.once("exit", (code) => this.#onExit(code));
+    child.once("close", (code) => this.#onProcessClose(code));
     return this.#startup;
   }
 
@@ -207,7 +209,7 @@ export class ProcessMockAdapter implements GameAdapter {
     if (previousState === "starting") {
       this.#settleStartup(new AdapterRunnerError("closed"));
       this.#failPending("closed");
-      this.#requestTermination();
+      this.#requestForcedClose();
       return this.#closePromise;
     }
     if (this.#exitObserved) {
@@ -216,10 +218,13 @@ export class ProcessMockAdapter implements GameAdapter {
     }
     if (this.#pending.size > 0 || previousState === "failed") {
       this.#failPending("closed");
-      this.#requestTermination();
+      this.#requestForcedClose();
       return this.#closePromise;
     }
-    this.#closeTimer = setTimeout(() => this.#requestTermination(), this.#options.closeTimeoutMs);
+    this.#closeTimer = setTimeout(
+      () => this.#requestForcedClose(),
+      this.#options.closeTimeoutMs,
+    );
     try {
       this.#write({ version: ADAPTER_IPC_VERSION, type: "shutdown" });
     } catch {
@@ -334,6 +339,7 @@ export class ProcessMockAdapter implements GameAdapter {
         this.#fail("protocol");
         return;
       }
+      this.#shutdownAcknowledged = true;
       this.#child?.stdin?.end();
       return;
     }
@@ -370,11 +376,15 @@ export class ProcessMockAdapter implements GameAdapter {
     pending.reject(new AdapterExecutionError(message.error.code, messages[message.error.code]));
   }
 
-  #onExit(_code: number | null): void {
+  #onProcessClose(code: number | null): void {
     this.#exitObserved = true;
     if (this.#state === "closed") return;
     if (this.#state === "closing") {
-      this.#finishClose();
+      if (this.#forcedClose || (this.#shutdownAcknowledged && code === 0)) {
+        this.#finishClose();
+      } else {
+        this.#rejectClose("worker-exit");
+      }
       return;
     }
     if (this.#state === "failed") return;
@@ -423,16 +433,29 @@ export class ProcessMockAdapter implements GameAdapter {
     this.#child?.kill();
   }
 
+  #requestForcedClose(): void {
+    this.#forcedClose = true;
+    this.#requestTermination();
+  }
+
   #failCloseWithoutExit(): void {
     if (this.#state !== "closing" || this.#exitObserved) return;
+    this.#rejectClose("worker-exit");
+  }
+
+  #rejectClose(category: AdapterRunnerFailure): void {
     if (this.#closeTimer !== undefined) {
       clearTimeout(this.#closeTimer);
       this.#closeTimer = undefined;
     }
+    if (this.#closeDeadlineTimer !== undefined) {
+      clearTimeout(this.#closeDeadlineTimer);
+      this.#closeDeadlineTimer = undefined;
+    }
     this.#state = "failed";
-    this.#settleStartup(new AdapterRunnerError("worker-exit"));
-    this.#failPending("worker-exit");
-    this.#closeReject?.(new AdapterRunnerError("worker-exit"));
+    this.#settleStartup(new AdapterRunnerError(category));
+    this.#failPending(category);
+    this.#closeReject?.(new AdapterRunnerError(category));
     this.#closeResolve = undefined;
     this.#closeReject = undefined;
   }

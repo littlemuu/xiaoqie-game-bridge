@@ -37,10 +37,20 @@ process.stdin.on("data", (chunk: string) => {
   const frame = input.slice(0, newline);
   input = input.slice(newline + 1);
   let callId = "call-1";
+  let messageType: string | undefined;
   try {
-    const parsed = JSON.parse(frame) as { callId?: unknown };
+    const parsed = JSON.parse(frame) as { callId?: unknown; type?: unknown };
     if (typeof parsed.callId === "string") callId = parsed.callId;
+    if (typeof parsed.type === "string") messageType = parsed.type;
   } catch {}
+
+  if (mode === "env-check" && messageType === "shutdown") {
+    process.stdout.write(
+      `${JSON.stringify({ version: ADAPTER_IPC_VERSION, type: "shutdown-complete" })}\n`,
+      () => process.exit(0),
+    );
+    return;
+  }
 
   switch (mode) {
     case "malformed":
