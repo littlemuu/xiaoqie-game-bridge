@@ -147,6 +147,27 @@ session close remain available. `safety.resume` is not a request action. Local
 resume is audited and denied while any write remains in flight; stop and denied
 resume are audited as well. Read-only status is intentionally not audited.
 
+The product operator channel is a separate Windows named pipe, not an MCP tool.
+Its per-launch 32-byte token is discovered only through the fixed Local AppData
+descriptor and compared at fixed length with a timing-safe primitive. The
+protocol cannot carry a bridge request, path, executable, endpoint override, or
+arbitrary action. A stale descriptor or listener collision prevents MCP
+startup rather than degrading to TCP or serving without the brake.
+
+This proves separation from the model/MCP request surface, not hostile same-user
+isolation. On the tested Windows host, `Get-Acl` shows the application directory
+and descriptor inherit the current profile's ordinary ACL entries; Node's
+requested `0700`/`0600` modes are not evidence of a Windows user-exclusive ACL.
+No custom DACL, integrity label, restricted token, or administrator boundary is
+installed. Therefore malicious code running as the same OS user, and any
+administrator, remains able to read or replace same-user runtime objects. The
+implementation accurately targets only the stated local same-user boundary.
+An ungraceful Windows process termination can leave a stale descriptor because
+regular files are not kernel-owned pipe objects. A subsequent product start
+fails closed and preserves it; it never guesses that an unmatched file is safe
+to delete. Normal MCP EOF, transport-error, and server-close paths are bounded
+and regression-tested to remove the exact launch object.
+
 The latch does not claim forced cancellation. An asynchronous action that
 passed `beginWrite()` and entered the worker may complete after stop or client
 disconnect; process termination is not proof a real game action rolled back.
@@ -182,6 +203,9 @@ plane. No unbounded tombstone or eviction path is introduced.
   transport exists.
 - Already-started adapter writes are not forcibly cancelled; real adapters may
   require cooperative cancellation semantics.
+- The operator launch token and stop generation are process-local. The token is
+  authentication only within the stated same-user boundary; the generation is
+  concurrency/replay protection, not authentication or a durable replay store.
 
 These are blockers for exposing a real game or remote endpoint, but they do not
 block the offline mock foundation.

@@ -17,6 +17,12 @@ local MCP client (owns and spawns one child process)
                     | bounded versioned adapter IPC
                     v
  ProcessMockAdapter -> fixed Node child -> mock-world only
+
+separate local operator CLI
+                    |
+                    | strict authenticated Windows named-pipe frames
+                    v
+ operator server -> same bridge local control -> same safety latch + audit sink
 ```
 
 The client-spawned stdio process is the first protocol boundary. It creates no
@@ -47,9 +53,14 @@ not bypass the core.
 - `mcp/server.ts` owns the pure, bridge-injected MCP server factory, its single
   tool, deterministic response mapping, logical byte limit, and bounded handler
   gate.
-- `mcp/stdio-server.ts` constructs only the mock registry and bridge, then uses
-  the SDK's public stdio transport with a 64 KiB buffer. Stdout is reserved for
-  MCP; its only diagnostics are fixed messages on stderr.
+- `runtime/product-runtime.ts` constructs the registry, process mock, bridge,
+  safety latch, audit sink, and local control object exactly once.
+- `operator/protocol.ts`, `operator/server.ts`, and `operator/client.ts` own the
+  closed-world operator contract, named-pipe listener, fixed descriptor, and
+  narrow CLI client.
+- `mcp/stdio-server.ts` starts the operator server before the SDK's public stdio
+  transport. Stdout is reserved for MCP; diagnostics are fixed messages on
+  stderr.
 - `adapters/mock/adapter-ipc.ts` is the single strict IPC contract and owns
   message/frame limits, fixed identity, internal call IDs, and lifecycle defaults.
 - `adapters/mock/process-mock-adapter.ts` owns fixed spawn configuration,
@@ -199,13 +210,41 @@ bounded exception that performs the idempotent close without adding a new cache
 entry. Local stop is outside the request path and is always available.
 
 The local control plane exposes `stopSafety()`, `getSafetyStatus()`, and
-`resumeSafety()`. Status includes `stopped`, `inFlightWrites`, and the configured
-maximum. Stop immediately blocks new commits but does not cancel work already
-inside an adapter. Resume is denied until the count reaches zero. Stop and
-resume attempts are audited; status is a read-only snapshot and is not audited.
+`resumeSafety(generation)`. Status includes `stopped`, `inFlightWrites`, the
+configured maximum, and `stopGeneration`. A running-to-stopped edge increments
+the generation; repeated stop does not. Stop immediately blocks new commits but
+does not cancel work already inside an adapter. Resume requires the exact
+current generation and zero in-flight writes. Stop and resume attempts are
+audited; status is a read-only snapshot and is not audited.
 That control-plane object is not returned to or callable from MCP. Cancellation,
 EOF, or client disconnect closes protocol work but is not evidence that an
 adapter write already past `beginWrite()` was forcibly cancelled.
+
+## Operator startup, protocol, and shutdown
+
+`createProductRuntime()` is the single construction seam. The stdio entrypoint
+starts `LocalOperatorServer` with that runtime's control object before calling
+`serveStdio`; any runtime-directory, descriptor, or listener failure writes one
+fixed stderr category and returns without accepting MCP. Shutdown first starts
+closing MCP, then closes operator connections/listener and the adapter with
+bounded waits, and finally waits briefly for MCP transport completion. A
+process-exit fallback performs the same identity-checked descriptor cleanup
+synchronously.
+
+Production supports Windows named pipes only. Each launch uses a random
+32-hex-suffix endpoint and a random 32-byte base64url token. A strict descriptor
+is atomically installed without replacement at a fixed Local AppData path. The
+server compares the fixed-length decoded token with `timingSafeEqual`. Frames
+are newline-delimited, limited to 4 KiB framing and 2 KiB logical JSON, allow
+one request/response only, and use strict versioned schemas. Four connections
+and finite listen/read/handler/close deadlines bound work; no queue or TCP
+fallback exists.
+
+The CLI can issue only `status`, `stop`, or `resume --generation <n>`. Endpoint
+and token are read from the fixed descriptor and cannot be selected by CLI,
+MCP, bridge params, or environment. Malformed, unknown, repeated, coalesced,
+oversized, unauthenticated, late, or disconnected traffic produces fixed
+failure categories and never enters the bridge action protocol.
 
 ## Deliberately absent
 

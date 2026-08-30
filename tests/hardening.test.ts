@@ -420,7 +420,7 @@ describe("bounded cache and local safety hardening", () => {
 
     const stop = await harness.control.stopSafety();
     expect(stop).toMatchObject({ stopped: true, inFlightWrites: 1 });
-    const refusedResume = await harness.control.resumeSafety();
+    const refusedResume = await harness.control.resumeSafety(stop.stopGeneration);
     expect(refusedResume).toMatchObject({
       resumed: false,
       reason: "writes-in-flight",
@@ -444,7 +444,7 @@ describe("bounded cache and local safety hardening", () => {
       stopped: true,
       inFlightWrites: 0,
     });
-    expect((await harness.control.resumeSafety()).resumed).toBe(true);
+    expect((await harness.control.resumeSafety(stop.stopGeneration)).resumed).toBe(true);
     expect(harness.sessions.sweep()).toBe(1);
 
     const localAudit = harness.audit.events.filter((event) => event.action.endsWith(".local"));
@@ -475,7 +475,7 @@ describe("bounded cache and local safety hardening", () => {
       "SAFETY_STOPPED",
     );
     expect(harness.adapter.commitEntries).toBe(1);
-    expect(await harness.control.resumeSafety()).toMatchObject({
+    expect(await harness.control.resumeSafety(stopped.stopGeneration)).toMatchObject({
       resumed: false,
       reason: "writes-in-flight",
     });
@@ -490,7 +490,7 @@ describe("bounded cache and local safety hardening", () => {
     harness.adapter.releaseNext();
     expect((await waiting).ok).toBe(true);
     expect(harness.control.getSafetyStatus().inFlightWrites).toBe(0);
-    expect((await harness.control.resumeSafety()).resumed).toBe(true);
+    expect((await harness.control.resumeSafety(stopped.stopGeneration)).resumed).toBe(true);
   });
 
   it("releases write capacity after known and unknown adapter errors", async () => {
