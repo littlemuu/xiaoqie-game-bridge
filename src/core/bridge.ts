@@ -92,7 +92,29 @@ export interface BridgeOptions {
 export interface BridgeLocalControlPlane {
   stopSafety(): Promise<SafetyStatus & { stopped: true; alreadyStopped: boolean }>;
   getSafetyStatus(): SafetyStatus;
-  resumeSafety(generation: number): Promise<SafetyResumeResult>;
+  resumeSafety(
+    generation: number,
+    options?: { signal?: AbortSignal },
+  ): Promise<SafetyResumeResult>;
+}
+
+function abortable<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (signal === undefined) return promise;
+  if (signal.aborted) return Promise.reject(new Error("local-control-aborted"));
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => reject(new Error("local-control-aborted"));
+    signal.addEventListener("abort", abort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", abort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", abort);
+        reject(error);
+      },
+    );
+  });
 }
 
 function stableStringify(value: unknown): string {
@@ -146,6 +168,7 @@ export class GameBridge {
   readonly #authorizer: SessionAuthorizer;
   readonly #clock: () => number;
   readonly #callerTagKey: Buffer;
+  #localResumePending = false;
 
   constructor(options: BridgeOptions) {
     this.#registry = options.registry;
@@ -174,22 +197,58 @@ export class GameBridge {
         return result;
       },
       getSafetyStatus: () => this.#safety.status(),
-      resumeSafety: async (generation: number) => {
-        const result = this.#safety.resume(generation);
-        await this.#recordLocalSafety(
-          "safety.resume.local",
-          result.resumed ? "allow" : "deny",
-          {
-            resumed: result.resumed,
-            inFlightWrites: result.inFlightWrites,
-            stopGeneration: result.stopGeneration,
-            ...(!result.resumed ? { reason: result.reason } : {}),
-          },
-          !result.resumed && result.reason === "writes-in-flight"
-            ? "RESOURCE_CAPACITY"
-            : undefined,
-        );
-        return result;
+      resumeSafety: async (
+        generation: number,
+        options: { signal?: AbortSignal } = {},
+      ) => {
+        const blockReason = this.#safety.resumeBlockReason(generation);
+        if (blockReason !== undefined || this.#localResumePending) {
+          const result: SafetyResumeResult = {
+            ...this.#safety.status(),
+            resumed: false,
+            reason: blockReason ?? "resume-pending",
+          };
+          await abortable(
+            this.#recordLocalSafety(
+              "safety.resume.local",
+              "deny",
+              {
+                resumed: false,
+                inFlightWrites: result.inFlightWrites,
+                stopGeneration: result.stopGeneration,
+                reason: result.reason,
+              },
+              result.reason === "writes-in-flight" || result.reason === "resume-pending"
+                ? "RESOURCE_CAPACITY"
+                : undefined,
+            ),
+            options.signal,
+          );
+          return result;
+        }
+
+        this.#localResumePending = true;
+        try {
+          const pendingStatus = this.#safety.status();
+          await abortable(
+            this.#recordLocalSafety("safety.resume.local", "allow", {
+              resumed: true,
+              inFlightWrites: pendingStatus.inFlightWrites,
+              stopGeneration: pendingStatus.stopGeneration,
+            }),
+            options.signal,
+          );
+          if (options.signal?.aborted) {
+            throw new Error("local-control-aborted");
+          }
+          const result = this.#safety.resume(generation);
+          if (!result.resumed) {
+            throw new Error("local-resume-state-changed");
+          }
+          return result;
+        } finally {
+          this.#localResumePending = false;
+        }
       },
     });
   }

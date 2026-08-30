@@ -26,6 +26,10 @@
   sharing the product bridge, safety latch, and audit sink
 - Fail-closed operator-before-MCP startup, bounded shutdown, and exact
   identity/digest-checked descriptor cleanup
+- Abort-aware audit-before-resume commit: deadline, disconnect, audit rejection,
+  and late settlement all leave the latch stopped
+- Immediate-destroy overflow admission with explicit socket/timer/response
+  counters and a 64-contender bounded-resource regression
 - Injectable audit sink, hashed identifiers, and recursive credential redaction
 - Deterministic in-memory mock adapter with movement and block placement
 - Fixed process-backed product mock with strict versioned pipe IPC, static
@@ -95,8 +99,8 @@ Actual local results on 2026-08-30 with Node.js `v22.23.1` and npm `10.9.8`:
 - `npm ci` — passed; 73 packages installed, 74 audited, 0 vulnerabilities
 - `npm audit` — passed; 0 vulnerabilities
 - `npm run check` — passed
-- `npm test` — passed; 6 files and 70 tests. The original 5 files / 62 tests
-  remain green, plus 8 operator groups covering real Windows named pipes,
+- `npm test` — passed; 6 files and 71 tests. The original 5 files / 62 tests
+  remain green, plus 9 operator groups covering real Windows named pipes,
   built CLI/stdio shared state, generations, in-flight and capacity pressure,
   hostile frames/connections, startup collisions, and exact cleanup
 - Real stdio contract — passed inside `npm test`; official
@@ -122,6 +126,12 @@ Both directory and descriptor were owned by the current user, had 6 inherited
 allow rules, no broad Everyone/Authenticated Users/ordinary Users allow rule,
 and retained SYSTEM/Administrators entries. `AreAccessRulesProtected` was
 false, so this is explicitly not claimed as a custom user-exclusive DACL.
+
+The checked-in workflow has two coherent jobs: Ubuntu executes the 60
+platform-neutral tests while marking 11 Windows-only built-child/operator cases
+skipped, and `windows-latest` executes all 71 tests including real named-pipe,
+CLI, and stdio-child evidence. Both jobs run check, test, demo, build, audit, and
+diff-check after `npm ci`.
 
 On this Windows managed host, Vitest, tsx, and the explicitly approved official
 stdio-client child test ran outside the process sandbox because child process

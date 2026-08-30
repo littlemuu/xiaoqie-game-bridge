@@ -84,6 +84,15 @@ interface FileIdentity {
   digest: string;
 }
 
+export interface OperatorResourceUsage {
+  trackedConnections: number;
+  readTimers: number;
+  closeTimers: number;
+  responsesInFlight: number;
+}
+
+class OperationTimeoutError extends Error {}
+
 function positiveInteger(value: number, label: string): number {
   if (!Number.isSafeInteger(value) || value <= 0) {
     throw new RangeError(`${label} must be a positive safe integer.`);
@@ -117,13 +126,20 @@ function isNodeError(error: unknown, code: string): boolean {
   return error instanceof Error && "code" in error && error.code === code;
 }
 
-async function bounded<T>(promise: Promise<T>, milliseconds: number): Promise<T> {
+async function bounded<T>(
+  promise: Promise<T>,
+  milliseconds: number,
+  onTimeout?: () => void,
+): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   try {
     return await Promise.race([
       promise,
       new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error("bounded-operation-timeout")), milliseconds);
+        timer = setTimeout(() => {
+          onTimeout?.();
+          reject(new OperationTimeoutError());
+        }, milliseconds);
       }),
     ]);
   } finally {
@@ -144,6 +160,8 @@ export class LocalOperatorServer {
   readonly #options: RequiredOperatorServerOptions;
   readonly #secret = randomBytes(OPERATOR_TOKEN_BYTES);
   readonly #connections = new Set<Socket>();
+  readonly #readTimers = new Set<NodeJS.Timeout>();
+  readonly #closeTimers = new Set<NodeJS.Timeout>();
   readonly #onFatal: (() => void) | undefined;
   readonly #testOnly: OperatorServerOptions["testOnly"];
   #server: Server | undefined;
@@ -151,6 +169,7 @@ export class LocalOperatorServer {
   #descriptorIdentity: FileIdentity | undefined;
   #started = false;
   #closing: Promise<void> | undefined;
+  #responsesInFlight = 0;
 
   constructor(control: BridgeLocalControlPlane, options: OperatorServerOptions = {}) {
     this.#control = control;
@@ -198,6 +217,7 @@ export class LocalOperatorServer {
         : randomBytes(16).toString("hex")
     }`;
     const server = createServer((socket) => this.#accept(socket));
+    server.maxConnections = this.#options.maxConnections;
     this.#server = server;
     try {
       await bounded(
@@ -240,6 +260,15 @@ export class LocalOperatorServer {
     return this.#closing;
   }
 
+  inspectResourceUsage(): OperatorResourceUsage {
+    return Object.freeze({
+      trackedConnections: this.#connections.size,
+      readTimers: this.#readTimers.size,
+      closeTimers: this.#closeTimers.size,
+      responsesInFlight: this.#responsesInFlight,
+    });
+  }
+
   cleanupRuntimeObjectsForProcessExit(): void {
     const identity = this.#descriptorIdentity;
     this.#descriptorIdentity = undefined;
@@ -273,6 +302,10 @@ export class LocalOperatorServer {
   async #close(): Promise<void> {
     for (const socket of this.#connections) socket.destroy();
     await this.#closeListener();
+    for (const timer of this.#readTimers) clearTimeout(timer);
+    for (const timer of this.#closeTimers) clearTimeout(timer);
+    this.#readTimers.clear();
+    this.#closeTimers.clear();
     await this.#cleanupDescriptor();
     await this.#cleanupRuntimeDirectory();
     this.#secret.fill(0);
@@ -337,7 +370,7 @@ export class LocalOperatorServer {
   #accept(socket: Socket): void {
     socket.on("error", () => undefined);
     if (this.#closing !== undefined || this.#connections.size >= this.#options.maxConnections) {
-      this.#sendAndClose(socket, fixedFailure("CAPACITY"));
+      socket.destroy();
       return;
     }
     this.#connections.add(socket);
@@ -346,12 +379,18 @@ export class LocalOperatorServer {
     let settled = false;
     let framePending = false;
     let finalizeImmediate: NodeJS.Immediate | undefined;
+    const clearReadTimer = () => {
+      clearTimeout(readTimer);
+      this.#readTimers.delete(readTimer);
+    };
     const readTimer = setTimeout(() => {
+      this.#readTimers.delete(readTimer);
       if (!settled) {
         settled = true;
         this.#sendAndClose(socket, fixedFailure("TIMEOUT"));
       }
     }, this.#options.readTimeoutMs);
+    this.#readTimers.add(readTimer);
 
     socket.on("data", (chunk: Buffer) => {
       if (settled) return;
@@ -365,13 +404,13 @@ export class LocalOperatorServer {
       const segment = newline < 0 ? chunk : chunk.subarray(0, newline);
       if (buffer.byteLength + segment.byteLength > OPERATOR_MAX_FRAME_BYTES) {
         settled = true;
-        clearTimeout(readTimer);
+        clearReadTimer();
         this.#sendAndClose(socket, fixedFailure("INVALID_REQUEST"));
         return;
       }
       buffer = Buffer.concat([buffer, segment]);
       if (newline < 0) return;
-      clearTimeout(readTimer);
+      clearReadTimer();
       const trailing = chunk.subarray(newline + 1);
       if (
         buffer.byteLength === 0 ||
@@ -390,7 +429,7 @@ export class LocalOperatorServer {
         const frame = buffer;
         buffer = Buffer.alloc(0);
         socket.pause();
-        void this.#handleFrame(frame).then(
+        void this.#handleFrame(frame, socket).then(
           (response) => this.#sendAndClose(socket, response),
           () => this.#sendAndClose(socket, fixedFailure("INTERNAL_ERROR")),
         );
@@ -398,13 +437,13 @@ export class LocalOperatorServer {
     });
 
     socket.once("close", () => {
-      clearTimeout(readTimer);
+      clearReadTimer();
       if (finalizeImmediate !== undefined) clearImmediate(finalizeImmediate);
       buffer.fill(0);
     });
   }
 
-  async #handleFrame(frame: Buffer): Promise<OperatorResponse> {
+  async #handleFrame(frame: Buffer, socket: Socket): Promise<OperatorResponse> {
     let raw: unknown;
     try {
       raw = JSON.parse(frame.toString("utf8"));
@@ -418,13 +457,22 @@ export class LocalOperatorServer {
     if (!this.#authenticate(parsed.data.token)) {
       return fixedFailure("AUTHENTICATION_FAILED");
     }
+    const controller = new AbortController();
+    const abortOnDisconnect = () => controller.abort();
+    socket.once("close", abortOnDisconnect);
+    if (socket.destroyed) controller.abort();
     try {
       return await bounded(
-        this.#execute(parsed.data),
+        this.#execute(parsed.data, controller.signal),
         this.#options.handlerTimeoutMs,
+        () => controller.abort(),
       );
-    } catch {
-      return fixedFailure("TIMEOUT");
+    } catch (error) {
+      return fixedFailure(
+        error instanceof OperationTimeoutError ? "TIMEOUT" : "INTERNAL_ERROR",
+      );
+    } finally {
+      socket.off("close", abortOnDisconnect);
     }
   }
 
@@ -440,7 +488,10 @@ export class LocalOperatorServer {
     }
   }
 
-  async #execute(request: OperatorRequest): Promise<OperatorResponse> {
+  async #execute(
+    request: OperatorRequest,
+    signal: AbortSignal,
+  ): Promise<OperatorResponse> {
     if (request.command === "status") {
       return {
         version: OPERATOR_PROTOCOL_VERSION,
@@ -461,7 +512,7 @@ export class LocalOperatorServer {
         alreadyStopped: result.alreadyStopped,
       };
     }
-    const result = await this.#control.resumeSafety(request.generation);
+    const result = await this.#control.resumeSafety(request.generation, { signal });
     if (result.resumed) {
       return {
         version: OPERATOR_PROTOCOL_VERSION,
@@ -474,6 +525,7 @@ export class LocalOperatorServer {
     const codes = {
       "generation-mismatch": "GENERATION_MISMATCH",
       "not-stopped": "NOT_STOPPED",
+      "resume-pending": "CAPACITY",
       "writes-in-flight": "WRITES_IN_FLIGHT",
     } as const;
     return fixedFailure(codes[result.reason]);
@@ -487,10 +539,26 @@ export class LocalOperatorServer {
       frame = encodeOperatorFrame(fixedFailure("INTERNAL_ERROR"));
     }
     const timer = setTimeout(() => socket.destroy(), this.#options.closeTimeoutMs);
-    socket.end(frame, () => {
+    this.#closeTimers.add(timer);
+    this.#responsesInFlight += 1;
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      clearTimeout(timer);
+      this.#closeTimers.delete(timer);
+      this.#responsesInFlight -= 1;
+    };
+    socket.once("close", release);
+    try {
+      socket.end(frame, () => {
+        frame.fill(0);
+      });
+    } catch {
       frame.fill(0);
-    });
-    socket.once("close", () => clearTimeout(timer));
+      release();
+      socket.destroy();
+    }
   }
 
   async #closeListener(): Promise<void> {

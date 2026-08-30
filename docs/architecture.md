@@ -240,11 +240,23 @@ one request/response only, and use strict versioned schemas. Four connections
 and finite listen/read/handler/close deadlines bound work; no queue or TCP
 fallback exists.
 
+Only admitted sockets receive read, handler, response, and close timers.
+Connections beyond the admission limit are destroyed immediately and are not
+placed in a rejection queue. Read-only resource counters expose tracked
+connections and timer/response work for bounded shutdown regression tests.
+
 The CLI can issue only `status`, `stop`, or `resume --generation <n>`. Endpoint
 and token are read from the fixed descriptor and cannot be selected by CLI,
 MCP, bridge params, or environment. Malformed, unknown, repeated, coalesced,
 oversized, unauthenticated, late, or disconnected traffic produces fixed
 failure categories and never enters the bridge action protocol.
+
+Resume uses an abort-aware two-phase path. The bridge first verifies generation,
+stopped state, in-flight writes, and single-resume admission while leaving the
+latch closed. It waits for the shared audit sink; only a successful audit within
+the operator handler deadline commits `SafetyLatch.resume()`. Deadline expiry or
+socket disconnect aborts the pending operation, and audit rejection or a late
+settlement cannot run the commit continuation.
 
 ## Deliberately absent
 

@@ -15,11 +15,17 @@ export interface SafetyLatchOptions {
   maxInFlightWrites?: number;
 }
 
+export type SafetyResumeFailureReason =
+  | "generation-mismatch"
+  | "not-stopped"
+  | "resume-pending"
+  | "writes-in-flight";
+
 export type SafetyResumeResult =
   | (SafetyStatus & { resumed: true })
   | (SafetyStatus & {
       resumed: false;
-      reason: "generation-mismatch" | "writes-in-flight" | "not-stopped";
+      reason: SafetyResumeFailureReason;
     });
 
 function requirePositiveInteger(value: number): void {
@@ -62,19 +68,29 @@ export class SafetyLatch {
     };
   }
 
-  resume(expectedGeneration: number): SafetyResumeResult {
+  resumeBlockReason(
+    expectedGeneration: number,
+  ): Exclude<SafetyResumeFailureReason, "resume-pending"> | undefined {
     if (!this.#stopped) {
-      return { ...this.status(), resumed: false, reason: "not-stopped" };
+      return "not-stopped";
     }
     if (
       !Number.isSafeInteger(expectedGeneration) ||
       expectedGeneration < 1 ||
       expectedGeneration !== this.#stopGeneration
     ) {
-      return { ...this.status(), resumed: false, reason: "generation-mismatch" };
+      return "generation-mismatch";
     }
     if (this.#inFlightWrites > 0) {
-      return { ...this.status(), resumed: false, reason: "writes-in-flight" };
+      return "writes-in-flight";
+    }
+    return undefined;
+  }
+
+  resume(expectedGeneration: number): SafetyResumeResult {
+    const reason = this.resumeBlockReason(expectedGeneration);
+    if (reason !== undefined) {
+      return { ...this.status(), resumed: false, reason };
     }
     this.#stopped = false;
     return { ...this.status(), resumed: true };

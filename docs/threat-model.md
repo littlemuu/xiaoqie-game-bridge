@@ -168,6 +168,13 @@ fails closed and preserves it; it never guesses that an unmatched file is safe
 to delete. Normal MCP EOF, transport-error, and server-close paths are bounded
 and regression-tested to remove the exact launch object.
 
+A valid resume request is not allowed to open the latch before its asynchronous
+audit work and operator deadline succeed. The server aborts the bridge resume
+on deadline or client disconnect; audit rejection and late settlement leave
+`stopped=true`. Concurrent resume admission is singular and excess attempts are
+denied as capacity. This avoids a failure response paired with an already-open
+write gate.
+
 The latch does not claim forced cancellation. An asynchronous action that
 passed `beginWrite()` and entered the worker may complete after stop or client
 disconnect; process termination is not proof a real game action rolled back.
@@ -187,6 +194,13 @@ Local stop does not traverse a session cache. A full request cache permits
 transition is idempotent. Remote `safety.stop` remains an ordinary cached
 request, so a caller under request-cache pressure must use the local control
 plane. No unbounded tombstone or eviction path is introduced.
+
+The operator connection cap also bounds application work rather than merely
+counting accepted sessions. Overflow sockets are immediately destroyed and do
+not allocate encoded failure responses, read timers, close timers, or an
+application queue. Shutdown enumerates every admitted socket and clears its
+tracked timers; a 64-contender flood regression proves the counters never rise
+above the configured admission limit.
 
 ## Residual risks before a real adapter
 

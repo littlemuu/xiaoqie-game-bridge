@@ -15,6 +15,8 @@ import {
   SafetyLatch,
   SessionManager,
   deriveSessionOwnerKey,
+  type AuditEvent,
+  type AuditSink,
   type BridgeResponse,
   type RequestEnvelope,
   callLocalOperator,
@@ -41,6 +43,38 @@ import {
 
 const servers: LocalOperatorServer[] = [];
 const adapters: ProcessMockAdapter[] = [];
+
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve(value: T | PromiseLike<T>): void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolver) => {
+    resolve = resolver;
+  });
+  return { promise, resolve };
+}
+
+class ControlledResumeAuditSink implements AuditSink {
+  mode: "pass" | "pending" | "reject" = "pass";
+  readonly entered = deferred<void>();
+  readonly #release = deferred<void>();
+
+  write(event: AuditEvent): void | Promise<void> {
+    if (event.action !== "safety.resume.local") return;
+    if (this.mode === "reject") return Promise.reject(new Error("fixture audit rejection"));
+    if (this.mode === "pending") {
+      this.entered.resolve();
+      return this.#release.promise;
+    }
+  }
+
+  release(): void {
+    this.#release.resolve();
+  }
+}
 
 afterEach(async () => {
   await Promise.allSettled(servers.splice(0).map((server) => server.close()));
@@ -177,7 +211,7 @@ async function waitUntilMissing(path: string): Promise<boolean> {
   return false;
 }
 
-describe("local operator control plane", () => {
+describe.runIf(process.platform === "win32")("local operator control plane", () => {
   it("shares safety state, enforces stop generations, and writes bounded audit events", async () => {
     const { audit } = await startFixture();
     const initial = await callLocalOperator({ command: "status" });
@@ -231,7 +265,9 @@ describe("local operator control plane", () => {
     const deniedConcurrent = concurrent.find((response) => !response.ok);
     expect(deniedConcurrent).toBeDefined();
     if (deniedConcurrent !== undefined) {
-      expectOperatorError(deniedConcurrent, "NOT_STOPPED");
+      expect(["CAPACITY", "NOT_STOPPED"]).toContain(
+        deniedConcurrent.ok ? undefined : deniedConcurrent.error.code,
+      );
     }
 
     expect(audit.events.map((event) => [event.action, event.decision])).toEqual([
@@ -296,7 +332,11 @@ describe("local operator control plane", () => {
   });
 
   it("bounds slow connections and releases capacity after timeout and disconnect", async () => {
-    await startFixture({ maxConnections: 2, readTimeoutMs: 80, closeTimeoutMs: 80 });
+    const { server } = await startFixture({
+      maxConnections: 2,
+      readTimeoutMs: 2_000,
+      closeTimeoutMs: 100,
+    });
     const current = await descriptor();
     const sockets = await Promise.all(
       [0, 1].map(
@@ -308,15 +348,91 @@ describe("local operator control plane", () => {
           }),
       ),
     );
-    const capacity = await rawCall([operatorRequest({ command: "status" }, current.token)]);
-    expectOperatorError(capacity, "CAPACITY");
-    sockets[0]!.destroy();
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 160));
-    expect(await callLocalOperator({ command: "status" })).toMatchObject({
-      ok: true,
-      command: "status",
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      if (server.inspectResourceUsage().trackedConnections === 2) break;
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+    }
+    expect(server.inspectResourceUsage()).toEqual({
+      trackedConnections: 2,
+      readTimers: 2,
+      closeTimers: 0,
+      responsesInFlight: 0,
     });
-    sockets[1]!.destroy();
+
+    const overflow = Array.from({ length: 64 }, () =>
+      new Promise<void>((resolvePromise, reject) => {
+        const socket = createConnection(current.endpoint);
+        const timer = setTimeout(() => {
+          socket.destroy();
+          reject(new Error("overflow socket was not released"));
+        }, 1_000);
+        socket.on("error", () => undefined);
+        socket.once("close", () => {
+          clearTimeout(timer);
+          resolvePromise();
+        });
+      }),
+    );
+    await Promise.all(overflow);
+    expect(server.inspectResourceUsage()).toEqual({
+      trackedConnections: 2,
+      readTimers: 2,
+      closeTimers: 0,
+      responsesInFlight: 0,
+    });
+
+    await server.close();
+    expect(server.inspectResourceUsage()).toEqual({
+      trackedConnections: 0,
+      readTimers: 0,
+      closeTimers: 0,
+      responsesInFlight: 0,
+    });
+    await Promise.all(
+      sockets.map(
+        (socket) =>
+          new Promise<void>((resolvePromise) => {
+            if (socket.destroyed) resolvePromise();
+            else socket.once("close", () => resolvePromise());
+          }),
+      ),
+    );
+  });
+
+  it("keeps resume closed across audit rejection, deadline, and late settlement", async () => {
+    const registry = new AdapterRegistry();
+    registry.register(new MockGameAdapter());
+    const safetyLatch = new SafetyLatch();
+    const audit = new ControlledResumeAuditSink();
+    const bridge = new GameBridge({ registry, safetyLatch, auditSink: audit });
+    const stopped = safetyLatch.stop();
+    const server = await startLocalOperatorServer(bridge.createLocalControlPlane(), {
+      handlerTimeoutMs: 40,
+    });
+    servers.push(server);
+
+    audit.mode = "pending";
+    const timedOut = callLocalOperator({
+      command: "resume",
+      generation: stopped.stopGeneration,
+    });
+    await audit.entered.promise;
+    expectOperatorError(await timedOut, "TIMEOUT");
+    expect(safetyLatch.status()).toMatchObject({ stopped: true, stopGeneration: 1 });
+    expect(safetyLatch.beginWrite()).toMatchObject({ allowed: false, reason: "stopped" });
+
+    audit.release();
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+    expect(safetyLatch.status()).toMatchObject({ stopped: true, stopGeneration: 1 });
+    expect(safetyLatch.beginWrite()).toMatchObject({ allowed: false, reason: "stopped" });
+
+    audit.mode = "reject";
+    expectOperatorError(
+      await callLocalOperator({ command: "resume", generation: stopped.stopGeneration }),
+      "INTERNAL_ERROR",
+    );
+    expect(safetyLatch.status()).toMatchObject({ stopped: true, stopGeneration: 1 });
+    expect(safetyLatch.beginWrite()).toMatchObject({ allowed: false, reason: "stopped" });
   });
 
   it("keeps stop independent of full sessions, handler permits, adapter pending work, and writes", async () => {

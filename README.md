@@ -174,3 +174,14 @@ does not claim to cancel or roll back an action already inside the adapter.
 The channel separates operator authority from the MCP/model surface, but it is
 not remote authentication and does not defend against malicious code already
 running as the same OS user or as administrator. No TCP fallback exists.
+
+Resume is transactional with respect to the operator deadline: the latch stays
+stopped while the audit sink is pending, and the transition is committed only
+after audit succeeds while the request is still live. Audit rejection,
+operator timeout, client disconnect, or a late audit continuation cannot open
+the latch. Connections beyond the fixed admission limit are destroyed
+immediately without allocating a response frame or close timer.
+
+CI has two explicit acceptance paths. Ubuntu runs the platform-neutral core and
+skips only Windows product-child/operator cases; `windows-latest` runs the full
+suite including real named pipes, the built CLI, and the built stdio child.
