@@ -10,6 +10,7 @@ import {
   type GameAdapter,
   MemoryAuditSink,
   SafetyLatch,
+  SessionIdCollisionError,
   SessionManager,
   type RequestEnvelope,
 } from "../src/index.js";
@@ -232,6 +233,59 @@ function expectError(response: BridgeResponse, code: string): void {
 }
 
 describe("bounded cache and local safety hardening", () => {
+  it("fails closed on generated session ID collisions without replacing the active session", async () => {
+    const collidingId = "Bearer-review-secret-123";
+    const directSessions = new SessionManager({
+      idGenerator: () => collidingId,
+      maxSessions: 2,
+      terminalRetentionMs: 10,
+      maxRequestsPerSession: 1,
+    });
+    const first = directSessions.open("first-adapter", ["first-capability"], 1_000);
+
+    expect(() =>
+      directSessions.open("second-adapter", ["second-capability"], 1_000),
+    ).toThrow(SessionIdCollisionError);
+    expect(directSessions.size).toBe(1);
+    expect(directSessions.find(collidingId)).toBe(first);
+    expect(first.adapterId).toBe("first-adapter");
+    expect([...first.capabilities]).toEqual(["first-capability"]);
+
+    const now = { value: 0 };
+    const sessions = new SessionManager({
+      clock: () => now.value,
+      idGenerator: () => collidingId,
+      maxSessions: 2,
+      terminalRetentionMs: 10,
+      maxRequestsPerSession: 1,
+    });
+    const adapter = new GatedAdapter();
+    const registry = new AdapterRegistry();
+    registry.register(adapter);
+    const audit = new MemoryAuditSink();
+    const bridge = new GameBridge({
+      registry,
+      sessions,
+      auditSink: audit,
+      clock: () => now.value,
+    });
+
+    const opened = await bridge.handle(openRequest("open-first"), {
+      transport: "local",
+    });
+    expect(opened.ok).toBe(true);
+    const retained = sessions.find(collidingId);
+
+    const collision = await bridge.handle(openRequest("open-second"), {
+      transport: "local",
+    });
+    expectError(collision, "INTERNAL_ERROR");
+    expect(JSON.stringify(collision)).not.toContain(collidingId);
+    expect(sessions.size).toBe(1);
+    expect(sessions.find(collidingId)).toBe(retained);
+    expect(JSON.stringify(audit.events)).not.toContain(collidingId);
+  });
+
   it("sweeps retained terminal sessions before refusing new capacity", async () => {
     const harness = createHarness({ maxSessions: 2, terminalRetentionMs: 10 });
     const firstId = await openSession(harness, "open-1");

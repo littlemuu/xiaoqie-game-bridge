@@ -67,19 +67,20 @@ without mutation, and applies authorized commits in memory only.
 
 1. Strictly validate the versioned envelope; reject additional envelope fields.
 2. Reject unknown bridge actions.
-3. For session-scoped requests, resolve the bound session, replay an existing
-   ID if present, then enforce the request-cache hard limit. Reserve a new
-   request ID with an in-flight promise before awaiting adapter completion.
-   Concurrent identical requests await that same promise; conflicting content
-   is rejected.
-4. Reject closed/expired sessions, adapter mismatches, missing capabilities,
-   unknown game actions, and invalid action inputs.
-5. For commit writes, synchronously check stop/write capacity and increment the
+3. For session-scoped requests, resolve the bound session and reject it if it is
+   closed or expired. Terminal sessions do not replay cached request IDs.
+4. For an active session, replay an existing request ID if present, then enforce
+   the request-cache hard limit. Reserve a new request ID with an in-flight
+   promise before awaiting adapter completion. Concurrent identical requests
+   await that same promise; conflicting content is rejected.
+5. Reject adapter mismatches, missing capabilities, unknown game actions, and
+   invalid action inputs.
+6. For commit writes, synchronously check stop/write capacity and increment the
    global in-flight count in one `beginWrite()` operation. Dry-runs skip this
    gate and remain non-mutating.
-6. Execute the adapter and release the in-flight count in `finally`, including
+7. Execute the adapter and release the in-flight count in `finally`, including
    known and unknown adapter failures.
-7. Replace the in-flight entry with the completed response and record a
+8. Replace the in-flight entry with the completed response and record a
    sanitized audit event. Unknown action and unregistered adapter values are
    represented only by fixed categories and hashed tags.
 
@@ -95,6 +96,8 @@ entries per session, and four concurrent commit writes. `SessionManager.sweep()`
 uses the injected clock and removes only closed/expired sessions whose retention
 deadline passed and which have no in-flight request. `open()` performs this
 sweep before rejecting session capacity. It never evicts an active session.
+Generated session IDs are checked before insertion; a collision fails closed
+without replacing the retained session or exposing the colliding value.
 
 Request entries are never evicted within a retained session. This preserves
 successful commit evidence and in-flight promises. At capacity, new ordinary

@@ -14,6 +14,13 @@ export class SessionCapacityError extends Error {
   }
 }
 
+export class SessionIdCollisionError extends Error {
+  constructor() {
+    super("The generated session identifier is already in use.");
+    this.name = "SessionIdCollisionError";
+  }
+}
+
 export interface InFlightRequest {
   fingerprint: string;
   state: "in-flight";
@@ -102,8 +109,12 @@ export class SessionManager {
       throw new SessionCapacityError();
     }
     const now = this.now();
+    const sessionId = this.#idGenerator();
+    if (this.#sessions.has(sessionId)) {
+      throw new SessionIdCollisionError();
+    }
     const session: Session = {
-      id: this.#idGenerator(),
+      id: sessionId,
       adapterId,
       capabilities: new Set(capabilities),
       createdAt: now,

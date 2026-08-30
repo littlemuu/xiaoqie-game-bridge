@@ -6,7 +6,7 @@
 - Versioned strict request/response protocol and stable error codes
 - Memory-only, adapter-bound sessions with configurable 15-minute default TTL
   and 60-minute maximum, a 64-session hard limit, and deterministic terminal
-  retention/sweep
+  retention/sweep; generated ID collisions fail closed without replacement
 - Separate observation and per-action capabilities
 - Default-deny policy with strict adapter action schemas
 - Per-session request idempotency, in-flight duplicate coalescing, and
@@ -55,7 +55,7 @@ Actual local results on 2026-08-30 with Node.js `v22.23.1` and npm `10.9.8`:
 - `npm ci` — passed; 60 packages installed, 61 audited, 0 vulnerabilities
 - `npm audit` — passed; 0 vulnerabilities
 - `npm run check` — passed
-- `npm test` — passed; 2 files and 20 tests, including 6 deterministic
+- `npm test` — passed; 2 files and 21 tests, including 7 deterministic
   hardening tests
 - `npm run demo` — passed; one idempotency hit, one committed move, safety-stop
   denial, and safe observation were demonstrated
