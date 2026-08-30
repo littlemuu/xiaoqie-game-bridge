@@ -1,9 +1,9 @@
 # xiaoqie-game-bridge
 
 An offline-first, default-deny foundation for narrowly scoped game adapters,
-with a client-spawned local stdio/MCP contract. The server still uses only a
-deterministic in-memory mock world: it does not start, inspect, or control any
-real game or desktop application.
+with a client-spawned local stdio/MCP contract. The product server runs only a
+deterministic mock world in a bounded child process: it does not start, inspect,
+or control any real game or desktop application.
 
 ## Requirements
 
@@ -48,6 +48,28 @@ latch, and proves that observation remains available while writes are denied.
 
 See [architecture](docs/architecture.md), [threat model](docs/threat-model.md),
 [handoff](docs/HANDOFF.md), and [open questions](docs/OPEN_QUESTIONS.md).
+
+## Isolated mock adapter process
+
+The product stdio entrypoint registers `ProcessMockAdapter`. It launches one
+fixed built `mock-worker.js` with `process.execPath`, fixed argv/cwd, `shell:
+false`, hidden windows, pipe-only stdio, and an explicit minimal parent-supplied
+environment. Requests cannot select an executable, path, argument, environment,
+or adapter identity. The pure in-memory mock remains the worker implementation
+and a unit-test fixture only.
+
+Adapter IPC is newline-delimited, versioned, strict JSON with a 64 KiB frame
+limit, 32 KiB logical-message limit, eight pending calls, two-second handshake
+and call deadlines, and a one-second graceful-close deadline. Parent-generated
+`call-N` identifiers are unrelated to MCP, bridge request, session, or caller
+identity. Malformed/unknown/oversized output, wrong or duplicate IDs, timeout,
+EOF, crash, and non-zero exit fail closed and settle pending calls with fixed
+sanitized bridge errors.
+
+This is fault containment between trusted components running as the same OS
+user, not a proven OS sandbox. The worker remains trusted code requiring
+separate review. It receives no caller context, principal, session/owner data,
+caller-tag key, credential, or host secret. No real adapter is authorized.
 
 ## Capacity defaults and configuration
 
@@ -114,7 +136,7 @@ defaults. Tests may inject a `HandlerConcurrencyGate` directly to inspect permit
 release without introducing timers.
 
 Client cancellation or disconnect closes the transport but does not claim to
-forcibly cancel a write that already entered the core or adapter. The client
+forcibly cancel or roll back a write that already entered the core or worker. The client
 must close first, followed by the server/transport. The MCP surface exposes no
 local safety status/resume control plane, and `safety.resume` remains unknown to
 ordinary bridge requests.
