@@ -11,7 +11,7 @@ export const requestEnvelopeSchema = z
     requestId: z.string().min(1).max(128),
     sessionId: z.string().min(1).max(128).optional(),
     action: z.string().min(1).max(128),
-    params: z.record(z.unknown()),
+    params: z.record(z.string(), z.unknown()),
     mode: bridgeModeSchema,
   })
   .strict();
