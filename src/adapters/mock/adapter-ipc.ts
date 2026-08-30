@@ -1,4 +1,11 @@
 import { z } from "zod";
+import {
+  mockMoveInputSchema,
+  mockMoveResultSchema,
+  mockObservationResultSchema,
+  mockPlaceBlockInputSchema,
+  mockPlaceBlockResultSchema,
+} from "./mock-adapter.js";
 
 export const ADAPTER_IPC_VERSION = "1.0" as const;
 export const ADAPTER_IPC_MAX_FRAME_BYTES = 64 * 1_024;
@@ -29,7 +36,7 @@ const callIdSchema = z.string().regex(/^call-[1-9][0-9]{0,15}$/);
 export const adapterReadySchema = baseSchema
   .extend({ type: z.literal("ready"), adapter: identitySchema })
   .strict();
-export const adapterCallSchema = z.discriminatedUnion("operation", [
+export const adapterCallSchema = z.union([
   baseSchema
     .extend({
       type: z.literal("call"),
@@ -37,16 +44,28 @@ export const adapterCallSchema = z.discriminatedUnion("operation", [
       operation: z.literal("observe"),
     })
     .strict(),
-  baseSchema
-    .extend({
-      type: z.literal("call"),
-      callId: callIdSchema,
-      operation: z.literal("execute"),
-      action: z.enum(["move", "place_block"]),
-      input: z.unknown(),
-      mode: z.enum(["dry-run", "commit"]),
-    })
-    .strict(),
+  z.discriminatedUnion("action", [
+    baseSchema
+      .extend({
+        type: z.literal("call"),
+        callId: callIdSchema,
+        operation: z.literal("execute"),
+        action: z.literal("move"),
+        input: mockMoveInputSchema,
+        mode: z.enum(["dry-run", "commit"]),
+      })
+      .strict(),
+    baseSchema
+      .extend({
+        type: z.literal("call"),
+        callId: callIdSchema,
+        operation: z.literal("execute"),
+        action: z.literal("place_block"),
+        input: mockPlaceBlockInputSchema,
+        mode: z.enum(["dry-run", "commit"]),
+      })
+      .strict(),
+  ]),
 ]);
 export const adapterResultSchema = z.discriminatedUnion("ok", [
   baseSchema
@@ -54,7 +73,11 @@ export const adapterResultSchema = z.discriminatedUnion("ok", [
       type: z.literal("result"),
       callId: callIdSchema,
       ok: z.literal(true),
-      result: z.unknown(),
+      result: z.union([
+        mockObservationResultSchema,
+        mockMoveResultSchema,
+        mockPlaceBlockResultSchema,
+      ]),
     })
     .strict(),
   baseSchema

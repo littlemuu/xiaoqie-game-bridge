@@ -6,6 +6,10 @@ import {
 } from "../../src/adapters/mock/adapter-ipc.js";
 
 const mode = process.env.XIAOQIE_TEST_MODE ?? "hang";
+const observation = {
+  player: { x: 0, y: 1, z: 0 },
+  nearbyBlocks: [],
+};
 
 function write(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -52,10 +56,10 @@ process.stdin.on("data", (chunk: string) => {
       process.stdout.write(`${"x".repeat(ADAPTER_IPC_MAX_MESSAGE_BYTES + 1)}\n`);
       break;
     case "wrong-id":
-      write({ version: ADAPTER_IPC_VERSION, type: "result", callId: "call-999", ok: true, result: {} });
+      write({ version: ADAPTER_IPC_VERSION, type: "result", callId: "call-999", ok: true, result: observation });
       break;
     case "duplicate-id": {
-      const result = { version: ADAPTER_IPC_VERSION, type: "result", callId, ok: true, result: { fixture: true } };
+      const result = { version: ADAPTER_IPC_VERSION, type: "result", callId, ok: true, result: observation };
       write(result);
       write(result);
       break;
@@ -72,7 +76,34 @@ process.stdin.on("data", (chunk: string) => {
         type: "result",
         callId,
         ok: true,
-        result: { environmentKeys: Object.keys(process.env).sort() },
+        result: process.env.ADAPTER_PASSWORD_SENTINEL === undefined
+          ? observation
+          : { player: { x: 99, y: 1, z: 0 }, nearbyBlocks: [] },
+      });
+      break;
+    case "wrong-result":
+      write({
+        version: ADAPTER_IPC_VERSION,
+        type: "result",
+        callId,
+        ok: true,
+        result: {
+          applied: true,
+          change: {
+            type: "move",
+            from: { x: 0, y: 1, z: 0 },
+            to: { x: 1, y: 1, z: 0 },
+          },
+        },
+      });
+      break;
+    case "credential-result":
+      write({
+        version: ADAPTER_IPC_VERSION,
+        type: "result",
+        callId,
+        ok: true,
+        result: { authorization: "Bearer-worker-result-secret" },
       });
       break;
     case "hang":

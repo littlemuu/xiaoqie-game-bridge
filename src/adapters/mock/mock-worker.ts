@@ -69,23 +69,23 @@ async function handleFrame(frame: Buffer): Promise<void> {
 }
 
 process.stdin.on("data", (chunk: Buffer) => {
-  if (input.byteLength + chunk.byteLength > ADAPTER_IPC_MAX_FRAME_BYTES) {
-    failClosed();
-  }
-  input = Buffer.concat([input, chunk]);
-  let newline = input.indexOf(0x0a);
-  while (newline >= 0) {
-    const frame = input.subarray(0, newline);
-    input = input.subarray(newline + 1);
-    if (
-      frame.byteLength === 0 ||
-      frame.byteLength > ADAPTER_IPC_MAX_FRAME_BYTES ||
-      frame.byteLength > ADAPTER_IPC_MAX_MESSAGE_BYTES
-    ) {
+  let offset = 0;
+  while (offset < chunk.byteLength) {
+    const newline = chunk.indexOf(0x0a, offset);
+    const end = newline < 0 ? chunk.byteLength : newline;
+    const segment = chunk.subarray(offset, end);
+    if (input.byteLength + segment.byteLength > ADAPTER_IPC_MAX_FRAME_BYTES) {
       failClosed();
     }
+    input = Buffer.concat([input, segment]);
+    if (newline < 0) return;
+    if (input.byteLength === 0 || input.byteLength > ADAPTER_IPC_MAX_MESSAGE_BYTES) {
+      failClosed();
+    }
+    const frame = input;
+    input = Buffer.alloc(0);
+    offset = newline + 1;
     void handleFrame(frame).catch(failClosed);
-    newline = input.indexOf(0x0a);
   }
 });
 process.stdin.once("end", () => {

@@ -1,13 +1,19 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { ZodType } from "zod";
 import {
   AdapterExecutionError,
   type AdapterActionDefinition,
   type GameAdapter,
 } from "../../core/adapter.js";
 import type { BridgeMode } from "../../core/protocol.js";
-import { MockGameAdapter } from "./mock-adapter.js";
+import {
+  MockGameAdapter,
+  mockMoveResultSchema,
+  mockObservationResultSchema,
+  mockPlaceBlockResultSchema,
+} from "./mock-adapter.js";
 import {
   ADAPTER_IPC_CALL_TIMEOUT_MS,
   ADAPTER_IPC_CLOSE_TIMEOUT_MS,
@@ -49,6 +55,8 @@ export type AdapterWorkerFaultMode =
   | "oversized"
   | "unknown-field"
   | "unknown-type"
+  | "credential-result"
+  | "wrong-result"
   | "wrong-id";
 
 export interface ProcessMockAdapterOptions {
@@ -64,6 +72,7 @@ export interface ProcessMockAdapterOptions {
 interface PendingCall {
   resolve(value: unknown): void;
   reject(error: AdapterRunnerError | AdapterExecutionError): void;
+  resultSchema: ZodType<unknown>;
   timer: NodeJS.Timeout;
 }
 
@@ -113,11 +122,14 @@ export class ProcessMockAdapter implements GameAdapter {
   #startupTimer: NodeJS.Timeout | undefined;
   #closePromise: Promise<void> | undefined;
   #closeResolve: (() => void) | undefined;
+  #closeReject: ((error: AdapterRunnerError) => void) | undefined;
   #closeTimer: NodeJS.Timeout | undefined;
+  #closeDeadlineTimer: NodeJS.Timeout | undefined;
   #stdoutBuffer = Buffer.alloc(0);
   #sequence = 0;
   #state: "idle" | "starting" | "running" | "closing" | "closed" | "failed" = "idle";
-  #shutdownAcknowledged = false;
+  #exitObserved = false;
+  #terminationRequested = false;
 
   constructor(options: ProcessMockAdapterOptions = {}) {
     this.#options = {
@@ -156,7 +168,7 @@ export class ProcessMockAdapter implements GameAdapter {
   }
 
   async observe(): Promise<unknown> {
-    return this.#call({ operation: "observe" });
+    return this.#call({ operation: "observe" }, mockObservationResultSchema);
   }
 
   async execute(action: string, input: unknown, mode: BridgeMode): Promise<unknown> {
@@ -165,7 +177,13 @@ export class ProcessMockAdapter implements GameAdapter {
     if (definition === undefined || parsed === undefined || !parsed.success) {
       throw new AdapterRunnerError("protocol");
     }
-    return this.#call({ operation: "execute", action, input: parsed.data, mode });
+    const resultSchema = action === "move"
+      ? mockMoveResultSchema
+      : mockPlaceBlockResultSchema;
+    return this.#call(
+      { operation: "execute", action, input: parsed.data, mode },
+      resultSchema,
+    );
   }
 
   async close(): Promise<void> {
@@ -175,20 +193,37 @@ export class ProcessMockAdapter implements GameAdapter {
       return;
     }
     if (this.#closePromise !== undefined) return this.#closePromise;
-    this.#closePromise = new Promise<void>((resolve) => {
+    this.#closePromise = new Promise<void>((resolve, reject) => {
       this.#closeResolve = resolve;
+      this.#closeReject = reject;
     });
-    if (this.#pending.size > 0 || this.#state === "failed") {
+    const previousState = this.#state;
+    this.#state = "closing";
+    this.#closeDeadlineTimer = setTimeout(
+      () => this.#failCloseWithoutExit(),
+      Math.max(this.#options.closeTimeoutMs * 2, this.#options.closeTimeoutMs + 50),
+    );
+
+    if (previousState === "starting") {
+      this.#settleStartup(new AdapterRunnerError("closed"));
       this.#failPending("closed");
-      this.#terminateAndClose();
+      this.#requestTermination();
       return this.#closePromise;
     }
-    this.#state = "closing";
-    this.#closeTimer = setTimeout(() => this.#terminateAndClose(), this.#options.closeTimeoutMs);
+    if (this.#exitObserved) {
+      this.#finishClose();
+      return this.#closePromise;
+    }
+    if (this.#pending.size > 0 || previousState === "failed") {
+      this.#failPending("closed");
+      this.#requestTermination();
+      return this.#closePromise;
+    }
+    this.#closeTimer = setTimeout(() => this.#requestTermination(), this.#options.closeTimeoutMs);
     try {
       this.#write({ version: ADAPTER_IPC_VERSION, type: "shutdown" });
     } catch {
-      this.#terminateAndClose();
+      this.#requestTermination();
     }
     return this.#closePromise;
   }
@@ -201,7 +236,7 @@ export class ProcessMockAdapter implements GameAdapter {
     return this.#child?.pid;
   }
 
-  async #call(call: Record<string, unknown>): Promise<unknown> {
+  async #call(call: Record<string, unknown>, resultSchema: ZodType<unknown>): Promise<unknown> {
     await this.start();
     if (this.#state !== "running") throw new AdapterRunnerError("closed");
     if (this.#pending.size >= this.#options.maxPendingCalls) {
@@ -214,7 +249,7 @@ export class ProcessMockAdapter implements GameAdapter {
         reject(new AdapterRunnerError("timeout"));
         this.#fail("timeout");
       }, this.#options.callTimeoutMs);
-      this.#pending.set(callId, { resolve, reject, timer });
+      this.#pending.set(callId, { resolve, reject, resultSchema, timer });
       try {
         this.#write({
           version: ADAPTER_IPC_VERSION,
@@ -290,11 +325,8 @@ export class ProcessMockAdapter implements GameAdapter {
         this.#fail("handshake");
         return;
       }
-      if (this.#startupTimer !== undefined) clearTimeout(this.#startupTimer);
       this.#state = "running";
-      this.#startupResolve?.();
-      this.#startupResolve = undefined;
-      this.#startupReject = undefined;
+      this.#settleStartup();
       return;
     }
     if (message.type === "shutdown-complete") {
@@ -302,7 +334,6 @@ export class ProcessMockAdapter implements GameAdapter {
         this.#fail("protocol");
         return;
       }
-      this.#shutdownAcknowledged = true;
       this.#child?.stdin?.end();
       return;
     }
@@ -318,7 +349,13 @@ export class ProcessMockAdapter implements GameAdapter {
     this.#pending.delete(message.callId);
     clearTimeout(pending.timer);
     if (message.ok) {
-      pending.resolve(message.result);
+      const parsedResult = pending.resultSchema.safeParse(message.result);
+      if (!parsedResult.success) {
+        pending.reject(new AdapterRunnerError("protocol"));
+        this.#fail("protocol");
+        return;
+      }
+      pending.resolve(parsedResult.data);
       return;
     }
     if (message.error.code === "ADAPTER_FAILURE") {
@@ -333,24 +370,29 @@ export class ProcessMockAdapter implements GameAdapter {
     pending.reject(new AdapterExecutionError(message.error.code, messages[message.error.code]));
   }
 
-  #onExit(code: number | null): void {
+  #onExit(_code: number | null): void {
+    this.#exitObserved = true;
     if (this.#state === "closed") return;
-    if (this.#state === "closing" && this.#shutdownAcknowledged && code === 0) {
+    if (this.#state === "closing") {
       this.#finishClose();
       return;
     }
+    if (this.#state === "failed") return;
     this.#fail("worker-exit");
   }
 
   #fail(category: AdapterRunnerFailure): void {
     if (this.#state === "failed" || this.#state === "closed") return;
+    if (this.#state === "closing") {
+      this.#settleStartup(new AdapterRunnerError(category));
+      this.#failPending(category);
+      this.#requestTermination();
+      return;
+    }
     this.#state = "failed";
-    if (this.#startupTimer !== undefined) clearTimeout(this.#startupTimer);
-    this.#startupReject?.(new AdapterRunnerError(category));
-    this.#startupResolve = undefined;
-    this.#startupReject = undefined;
+    this.#settleStartup(new AdapterRunnerError(category));
     this.#failPending(category);
-    this.#child?.kill();
+    this.#requestTermination();
   }
 
   #failPending(category: AdapterRunnerFailure): void {
@@ -361,15 +403,53 @@ export class ProcessMockAdapter implements GameAdapter {
     this.#pending.clear();
   }
 
-  #terminateAndClose(): void {
+  #settleStartup(error?: AdapterRunnerError): void {
+    if (this.#startupTimer !== undefined) {
+      clearTimeout(this.#startupTimer);
+      this.#startupTimer = undefined;
+    }
+    if (error === undefined) {
+      this.#startupResolve?.();
+    } else {
+      this.#startupReject?.(error);
+    }
+    this.#startupResolve = undefined;
+    this.#startupReject = undefined;
+  }
+
+  #requestTermination(): void {
+    if (this.#terminationRequested || this.#exitObserved) return;
+    this.#terminationRequested = true;
     this.#child?.kill();
-    this.#finishClose();
+  }
+
+  #failCloseWithoutExit(): void {
+    if (this.#state !== "closing" || this.#exitObserved) return;
+    if (this.#closeTimer !== undefined) {
+      clearTimeout(this.#closeTimer);
+      this.#closeTimer = undefined;
+    }
+    this.#state = "failed";
+    this.#settleStartup(new AdapterRunnerError("worker-exit"));
+    this.#failPending("worker-exit");
+    this.#closeReject?.(new AdapterRunnerError("worker-exit"));
+    this.#closeResolve = undefined;
+    this.#closeReject = undefined;
   }
 
   #finishClose(): void {
-    if (this.#closeTimer !== undefined) clearTimeout(this.#closeTimer);
+    if (this.#child !== undefined && !this.#exitObserved) return;
+    if (this.#closeTimer !== undefined) {
+      clearTimeout(this.#closeTimer);
+      this.#closeTimer = undefined;
+    }
+    if (this.#closeDeadlineTimer !== undefined) {
+      clearTimeout(this.#closeDeadlineTimer);
+      this.#closeDeadlineTimer = undefined;
+    }
     this.#state = "closed";
     this.#closeResolve?.();
     this.#closeResolve = undefined;
+    this.#closeReject = undefined;
   }
 }
