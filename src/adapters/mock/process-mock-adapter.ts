@@ -45,6 +45,7 @@ export class AdapterRunnerError extends Error {
 
 export type AdapterWorkerFaultMode =
   | "bad-handshake"
+  | "ack-invalid"
   | "crash"
   | "duplicate-id"
   | "env-check"
@@ -125,6 +126,7 @@ export class ProcessMockAdapter implements GameAdapter {
   #closeReject: ((error: AdapterRunnerError) => void) | undefined;
   #closeTimer: NodeJS.Timeout | undefined;
   #closeDeadlineTimer: NodeJS.Timeout | undefined;
+  #closingFailure: AdapterRunnerFailure | undefined;
   #stdoutBuffer = Buffer.alloc(0);
   #sequence = 0;
   #state: "idle" | "starting" | "running" | "closing" | "closed" | "failed" = "idle";
@@ -380,7 +382,9 @@ export class ProcessMockAdapter implements GameAdapter {
     this.#exitObserved = true;
     if (this.#state === "closed") return;
     if (this.#state === "closing") {
-      if (this.#forcedClose || (this.#shutdownAcknowledged && code === 0)) {
+      if (this.#closingFailure !== undefined) {
+        this.#rejectClose(this.#closingFailure);
+      } else if (this.#forcedClose || (this.#shutdownAcknowledged && code === 0)) {
         this.#finishClose();
       } else {
         this.#rejectClose("worker-exit");
@@ -394,6 +398,7 @@ export class ProcessMockAdapter implements GameAdapter {
   #fail(category: AdapterRunnerFailure): void {
     if (this.#state === "failed" || this.#state === "closed") return;
     if (this.#state === "closing") {
+      this.#closingFailure ??= category;
       this.#settleStartup(new AdapterRunnerError(category));
       this.#failPending(category);
       this.#requestTermination();

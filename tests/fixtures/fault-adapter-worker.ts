@@ -51,6 +51,13 @@ process.stdin.on("data", (chunk: string) => {
     );
     return;
   }
+  if (mode === "ack-invalid" && messageType === "shutdown") {
+    process.stdout.write(
+      `${JSON.stringify({ version: ADAPTER_IPC_VERSION, type: "shutdown-complete" })}\n{}\n`,
+      () => process.exit(0),
+    );
+    return;
+  }
 
   switch (mode) {
     case "malformed":

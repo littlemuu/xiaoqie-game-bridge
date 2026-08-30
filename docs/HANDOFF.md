@@ -91,9 +91,9 @@ Actual local results on 2026-08-30 with Node.js `v22.23.1` and npm `10.9.8`:
 - `npm ci` — passed; 73 packages installed, 74 audited, 0 vulnerabilities
 - `npm audit` — passed; 0 vulnerabilities
 - `npm run check` — passed
-- `npm test` — passed; 5 files and 61 tests, including 9 owner-binding,
+- `npm test` — passed; 5 files and 62 tests, including 9 owner-binding,
   cross-caller cache/in-flight, descriptor-snapshot Proxy, keyed caller-tag,
-  strict-context, TOCTOU, and 23 real built worker protocol/lifecycle regressions
+  strict-context, TOCTOU, and 24 real built worker protocol/lifecycle regressions
 - Real stdio contract — passed inside `npm test`; official
   `Client@2.0.0`/`StdioClientTransport` started the built Node entrypoint,
   completed initialize/list/calls, and closed client first then transport

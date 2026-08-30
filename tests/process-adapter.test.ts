@@ -346,6 +346,15 @@ describe("isolated mock adapter runner", () => {
     },
   );
 
+  it("latches a protocol failure after shutdown acknowledgement", async () => {
+    const adapter = fixtureAdapter("ack-invalid");
+    await adapter.start();
+    const pid = adapter.workerPid!;
+    expect(await category(adapter.close())).toBe("protocol");
+    expect(adapter.pendingCalls).toBe(0);
+    expect(() => process.kill(pid, 0)).toThrow();
+  });
+
   it("bounds handshake, call time, pending capacity, and close with pending work", async () => {
     const noHandshake = fixtureAdapter("no-handshake", { handshakeTimeoutMs: 20 });
     expect(await category(noHandshake.start())).toBe("handshake");
