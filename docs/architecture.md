@@ -30,7 +30,11 @@ not bypass the core.
 - `protocol.ts` owns the versioned, strict request and response contracts and
   stable error codes.
 - `session.ts` owns memory-only, expiring, closeable, adapter-bound sessions,
-  bounded per-session idempotency caches, and deterministic terminal cleanup.
+  immutable caller-owner bindings, bounded per-session idempotency caches, and
+  deterministic terminal cleanup.
+- `request-context.ts` synchronously validates and snapshots trusted caller
+  context, then derives domain-separated, length-prefixed SHA-256 owner keys
+  and separate short audit tags.
 - `policy.ts` default-denies unknown game actions, enforces action capability,
   and validates the adapter's strict input schema.
 - `safety-latch.ts` owns a process-wide stop state and an atomic bounded-write
@@ -51,8 +55,17 @@ not bypass the core.
 `SessionAuthorizer` interface is the future identity/authentication seam. A
 transport that accepts remote callers must inject a real authorizer; the core
 does not implement an account database. Omitted caller context is treated as
-untrusted remote, so forgetting to propagate context cannot silently gain local
-session-opening authority.
+untrusted, so forgetting to propagate context cannot silently gain local
+session-opening or session-use authority. Context is not part of a request
+envelope or MCP arguments.
+
+Trusted local context is exactly `{ transport: "local" }`. Trusted remote
+context is exactly `{ transport: "remote", principal: { subject, method } }`;
+both nested strings are non-empty and bounded, and additional properties are
+rejected. The bridge copies and deeply freezes this structure synchronously
+before its first `await`. Sessions store only the derived full owner digest,
+not raw principal data. The local owner is a fixed process-local domain; since
+sessions are not persisted or shared, it conveys no cross-process authority.
 
 ## Why adapters stay separate
 
@@ -70,28 +83,35 @@ without mutation, and applies authorized commits in memory only.
 ## Request lifecycle
 
 1. Strictly validate the versioned envelope; reject additional envelope fields.
-2. Reject unknown bridge actions.
-3. For session-scoped requests, resolve the bound session and reject it if it is
-   closed or expired. Terminal sessions do not replay cached request IDs.
-4. For an active session, replay an existing request ID if present, then enforce
+2. Synchronously validate, copy, and freeze the out-of-band caller context;
+   reject unknown bridge actions. `bridge.describe` remains context-free.
+3. For session-scoped requests, resolve the bound session and compare its
+   immutable owner key before checking active state, cache, capability, adapter,
+   world, or safety state. Untrusted or different callers receive the same
+   `AUTHORIZATION_DENIED` and cannot read or join another owner's cache.
+4. Reject an owner-matched session if it is closed or expired. Terminal
+   sessions do not replay cached request IDs.
+5. For an active session, replay an existing request ID if present, then enforce
    the request-cache hard limit. Reserve a new request ID with an in-flight
    promise before awaiting adapter completion. Concurrent identical requests
    await that same promise; conflicting content is rejected.
-5. Reject adapter mismatches, missing capabilities, unknown game actions, and
+6. Reject adapter mismatches, missing capabilities, unknown game actions, and
    invalid action inputs.
-6. For commit writes, synchronously check stop/write capacity and increment the
+7. For commit writes, synchronously check stop/write capacity and increment the
    global in-flight count in one `beginWrite()` operation. Dry-runs skip this
    gate and remain non-mutating.
-7. Execute the adapter and release the in-flight count in `finally`, including
+8. Execute the adapter and release the in-flight count in `finally`, including
    known and unknown adapter failures.
-8. Replace the in-flight entry with the completed response and record a
+9. Replace the in-flight entry with the completed response and record a
    sanitized audit event. Unknown action and unregistered adapter values are
-   represented only by fixed categories and hashed tags.
+   represented only by fixed categories and hashed tags. Valid session calls
+   and cross-owner denials carry only a separately derived short caller tag.
 
 `session.open` is necessarily the one pre-session lifecycle operation. In
 `dry-run` mode it only describes the session that would be opened. A committed
 session is created only after the adapter, requested capabilities, and injected
-authorizer approve it.
+authorizer approve it, and `SessionManager.open` requires the caller owner key
+explicitly. Dry-run creates neither session nor owner state.
 
 ## MCP boundary lifecycle
 
