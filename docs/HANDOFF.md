@@ -53,6 +53,7 @@ git diff --check
 Actual local results on 2026-08-30 with Node.js `v22.23.1` and npm `10.9.8`:
 
 - `npm ci` — passed; 60 packages installed, 61 audited, 0 vulnerabilities
+- `npm audit` — passed; 0 vulnerabilities
 - `npm run check` — passed
 - `npm test` — passed; 2 files and 20 tests, including 6 deterministic
   hardening tests
