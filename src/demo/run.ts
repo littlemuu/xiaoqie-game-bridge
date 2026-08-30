@@ -2,14 +2,15 @@ import {
   AdapterRegistry,
   GameBridge,
   MemoryAuditSink,
-  MockGameAdapter,
+  ProcessMockAdapter,
   SessionManager,
   type RequestEnvelope,
 } from "../index.js";
 
 const fixedNow = Date.parse("2026-08-29T00:00:00.000Z");
 const registry = new AdapterRegistry();
-registry.register(new MockGameAdapter());
+const adapter = new ProcessMockAdapter();
+registry.register(adapter);
 const audit = new MemoryAuditSink();
 const bridge = new GameBridge({
   registry,
@@ -104,4 +105,8 @@ async function main(): Promise<void> {
   console.log(JSON.stringify(output, null, 2));
 }
 
-await main();
+try {
+  await main();
+} finally {
+  await adapter.close();
+}
