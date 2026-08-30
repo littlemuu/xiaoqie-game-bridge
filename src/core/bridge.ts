@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { randomBytes } from "node:crypto";
 import { AdapterExecutionError, describeAdapter } from "./adapter.js";
 import { AdapterRegistry } from "./adapter-registry.js";
 import {
@@ -26,6 +27,7 @@ import {
   SafetyLatch,
 } from "./safety-latch.js";
 import {
+  CALLER_TAG_KEY_BYTES,
   deriveSessionOwnerKey,
   sessionCallerTag,
   snapshotRequestContext,
@@ -84,6 +86,7 @@ export interface BridgeOptions {
   auditSink?: AuditSink;
   authorizer?: SessionAuthorizer;
   clock?: () => number;
+  callerTagKey?: Uint8Array;
 }
 
 export interface BridgeLocalControlPlane {
@@ -132,6 +135,8 @@ function safeInvalidRequest(raw: unknown): RequestEnvelope {
   };
 }
 
+const PROCESS_CALLER_TAG_KEY = randomBytes(CALLER_TAG_KEY_BYTES);
+
 export class GameBridge {
   readonly #registry: AdapterRegistry;
   readonly #sessions: SessionManager;
@@ -140,6 +145,7 @@ export class GameBridge {
   readonly #audit: AuditSink;
   readonly #authorizer: SessionAuthorizer;
   readonly #clock: () => number;
+  readonly #callerTagKey: Buffer;
 
   constructor(options: BridgeOptions) {
     this.#registry = options.registry;
@@ -149,6 +155,11 @@ export class GameBridge {
     this.#audit = options.auditSink ?? new MemoryAuditSink();
     this.#authorizer = options.authorizer ?? new OfflineLocalAuthorizer();
     this.#clock = options.clock ?? Date.now;
+    const callerTagKey = options.callerTagKey ?? PROCESS_CALLER_TAG_KEY;
+    if (!(callerTagKey instanceof Uint8Array) || callerTagKey.byteLength !== CALLER_TAG_KEY_BYTES) {
+      throw new RangeError("callerTagKey must contain exactly 32 bytes.");
+    }
+    this.#callerTagKey = Buffer.from(callerTagKey);
   }
 
   createLocalControlPlane(): BridgeLocalControlPlane {
@@ -648,7 +659,7 @@ export class GameBridge {
       timestamp: new Date(this.#clock()).toISOString(),
       ...(callerOwnerKey === undefined
         ? {}
-        : { callerTag: sessionCallerTag(callerOwnerKey) }),
+        : { callerTag: sessionCallerTag(callerOwnerKey, this.#callerTagKey) }),
       requestIdTag: safeIdentifierTag(request.requestId)!,
       ...(request.sessionId === undefined
         ? {}

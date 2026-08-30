@@ -34,7 +34,7 @@ not bypass the core.
   deterministic terminal cleanup.
 - `request-context.ts` synchronously validates and snapshots trusted caller
   context, then derives domain-separated, length-prefixed SHA-256 owner keys
-  and separate short audit tags.
+  and keyed, domain-separated short audit tags.
 - `policy.ts` default-denies unknown game actions, enforces action capability,
   and validates the adapter's strict input schema.
 - `safety-latch.ts` owns a process-wide stop state and an atomic bounded-write
@@ -62,8 +62,10 @@ envelope or MCP arguments.
 Trusted local context is exactly `{ transport: "local" }`. Trusted remote
 context is exactly `{ transport: "remote", principal: { subject, method } }`;
 both nested strings are non-empty and bounded, and additional properties are
-rejected. The bridge copies and deeply freezes this structure synchronously
-before its first `await`. Sessions store only the derived full owner digest,
+rejected. The bridge captures each own data-property descriptor value once,
+validates and copies only that captured graph, and deeply freezes the result
+before its first `await`; it never rereads the caller object after validation.
+Sessions store only the derived full owner digest,
 not raw principal data. The local owner is a fixed process-local domain; since
 sessions are not persisted or shared, it conveys no cross-process authority.
 
@@ -105,7 +107,13 @@ without mutation, and applies authorized commits in memory only.
 9. Replace the in-flight entry with the completed response and record a
    sanitized audit event. Unknown action and unregistered adapter values are
    represented only by fixed categories and hashed tags. Valid session calls
-   and cross-owner denials carry only a separately derived short caller tag.
+   and cross-owner denials carry only a short caller tag derived with HMAC-SHA-256.
+
+The caller-tag HMAC uses a 32-byte process-memory-only random key. A bridge may
+receive a copied fixed key for deterministic tests, but the default key is
+generated at module initialization. It is never placed in a session, response,
+audit event, demo, or transport payload. This prevents an audit observer from
+testing low-entropy subject/method candidates with the public owner derivation.
 
 `session.open` is necessarily the one pre-session lifecycle operation. In
 `dry-run` mode it only describes the session that would be opened. A committed

@@ -39,13 +39,18 @@ transports must keep bearer credentials outside request params, authenticate
 before opening a session, encrypt transport traffic, and bound token lifetime.
 
 Caller context is an out-of-band trusted transport input, never an envelope or
-MCP field. It is strict-validated, copied, and deeply frozen before any `await`,
-preventing a transport from mutating a nested principal during asynchronous
-authorization. A session stores only a domain-separated, length-prefixed full
+MCP field. Its own data-property descriptor values are captured once, then that
+captured graph is strict-validated, copied, and deeply frozen before any
+`await`. Validation never rereads the caller object, so stateful Proxy values
+cannot create a check/copy gap or escape as a raw exception. A session stores
+only a domain-separated, length-prefixed full
 SHA-256 owner key. Remote ownership binds transport, authentication method, and
 subject; local ownership uses a fixed process-local domain. Raw principal,
 owner key, and full digest are never serialized. Audit correlation uses a
-separately domain-separated 12-hex caller tag.
+separately domain-separated 12-hex HMAC tag with a process-memory-only random
+32-byte key. The key is copied on bridge construction and never persisted or
+serialized, preventing offline enumeration of low-entropy principals from an
+observed tag.
 
 Replay within a session is handled by a request-ID cache. The first request
 installs an in-flight promise before adapter completion; concurrent or later

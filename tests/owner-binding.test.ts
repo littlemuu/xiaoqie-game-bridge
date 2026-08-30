@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import {
   AdapterRegistry,
@@ -7,6 +7,8 @@ import {
   MockGameAdapter,
   SafetyLatch,
   SessionManager,
+  deriveSessionOwnerKey,
+  sessionCallerTag,
   type AdapterActionDefinition,
   type BridgeMode,
   type BridgeResponse,
@@ -16,6 +18,11 @@ import {
   type SessionAuthorizationRequest,
   type SessionAuthorizer,
 } from "../src/index.js";
+
+const TEST_CALLER_TAG_KEY = Uint8Array.from(
+  { length: 32 },
+  (_, index) => index + 1,
+);
 
 const REMOTE_A = Object.freeze({
   transport: "remote",
@@ -59,6 +66,7 @@ interface Harness {
 function createHarness(options: {
   adapter?: GameAdapter;
   authorizer?: SessionAuthorizer;
+  callerTagKey?: Uint8Array;
   maxRequestsPerSession?: number;
 } = {}): Harness {
   const registry = new AdapterRegistry();
@@ -76,6 +84,7 @@ function createHarness(options: {
       registry,
       auditSink: audit,
       authorizer,
+      callerTagKey: options.callerTagKey ?? TEST_CALLER_TAG_KEY,
       sessions,
       safetyLatch: new SafetyLatch(),
     }),
@@ -259,6 +268,42 @@ describe("session owner binding", () => {
       .toBe(true);
   });
 
+  it("fail-closes stateful Proxy value changes from one descriptor snapshot", async () => {
+    const authorizer = new AllowTrustedRemoteAuthorizer();
+    const replacements = [
+      { subject: "", method: "" },
+      { subject: undefined, method: undefined },
+    ];
+
+    for (const [index, replacement] of replacements.entries()) {
+      const harness = createHarness({ authorizer });
+      const validPrincipal = { subject: "masked-subject", method: "masked-method" };
+      let principalReads = 0;
+      const changingContext = new Proxy(
+        { transport: "remote", principal: replacement },
+        {
+          get(target, property, receiver) {
+            if (property === "principal" && principalReads++ < 3) {
+              return validPrincipal;
+            }
+            return Reflect.get(target, property, receiver);
+          },
+        },
+      );
+      const registryGet = vi.spyOn(harness.registry, "get");
+
+      const response = await harness.bridge.handle(
+        openRequest(`proxy-change-${index}`),
+        changingContext,
+      );
+
+      expectError(response, "AUTHORIZATION_DENIED");
+      expect(authorizer.calls).toBe(0);
+      expect(harness.sessions.size).toBe(0);
+      expect(registryGet).not.toHaveBeenCalled();
+    }
+  });
+
   it("uses an immutable nested context snapshot across an asynchronous authorizer", async () => {
     const gate = deferred<void>();
     let receivedContext: RequestContext | undefined;
@@ -346,6 +391,46 @@ describe("session owner binding", () => {
     });
     expect(JSON.stringify(harness.audit.events.at(-1))).not.toContain(session.ownerKey);
     expect(JSON.stringify(harness.audit.events.at(-1))).not.toContain(subject);
+  });
+
+  it("prevents low-entropy principal enumeration without the caller-tag secret", async () => {
+    const actualSubject = "alice@example.test";
+    const method = "password";
+    const context = {
+      transport: "remote",
+      principal: { subject: actualSubject, method },
+    } as const;
+    const harness = createHarness();
+    await harness.bridge.handle(openRequest("enumeration-open"), context);
+    const observedTag = harness.audit.events.at(-1)?.callerTag;
+    expect(observedTag).toMatch(/^[a-f0-9]{12}$/);
+
+    const attackerGuessKey = Uint8Array.from(
+      { length: 32 },
+      (_, index) => 255 - index,
+    );
+    const candidates = [
+      "admin@example.test",
+      "alice@example.test",
+      "bob@example.test",
+      "guest@example.test",
+    ];
+    const guessedTags = candidates.map((subject) =>
+      sessionCallerTag(
+        deriveSessionOwnerKey({
+          transport: "remote",
+          principal: { subject, method },
+        }),
+        attackerGuessKey,
+      ),
+    );
+    expect(guessedTags).not.toContain(observedTag);
+
+    const actualOwnerKey = deriveSessionOwnerKey(context);
+    expect(sessionCallerTag(actualOwnerKey, TEST_CALLER_TAG_KEY)).toBe(observedTag);
+    const serializedAudit = JSON.stringify(harness.audit.events);
+    expect(serializedAudit).not.toContain(Buffer.from(TEST_CALLER_TAG_KEY).toString("hex"));
+    expect(serializedAudit).not.toContain(Buffer.from(TEST_CALLER_TAG_KEY).toString("base64"));
   });
 });
 

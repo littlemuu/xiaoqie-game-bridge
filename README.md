@@ -39,8 +39,9 @@ latch, and proves that observation remains available while writes are denied.
   control plane provides stop, status, and conservative resume; resume is
   refused while a bounded write is still in flight.
 - Audit events contain hashed request/session tags and recursively redact common
-  credential fields. Session events may contain a domain-separated short caller
-  tag, never the caller principal or full owner digest.
+  credential fields. Session events may contain a short caller tag derived by
+  HMAC with a process-memory-only random key, never the caller principal, full
+  owner digest, or HMAC key.
 - The product server exposes no shell, generic process, filesystem, network,
   keyboard, mouse, tunnel, or real-game capability. The dev-only official MCP
   client starts exactly the built stdio server in contract tests.
@@ -89,8 +90,9 @@ transport identity. MCP's JSON-RPC request ID and the envelope's bridge
 `requestId` are separate: the wrapper preserves the latter byte-for-byte,
 generates no replacement ID, and performs no automatic retry.
 
-At the core boundary, caller context is synchronously strict-validated, copied,
-and deeply frozen before the first asynchronous authorization step. Local
+At the core boundary, caller context is captured once from own data-property
+descriptors, strict-validated from those captured values, copied, and deeply
+frozen before the first asynchronous authorization step. Local
 context has exactly one field. A future remote transport must provide exactly
 `transport`, `principal.subject`, and `principal.method`; both principal fields
 are non-empty and bounded. Omitted, malformed, or extended context is

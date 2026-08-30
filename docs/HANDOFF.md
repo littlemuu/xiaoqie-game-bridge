@@ -8,10 +8,13 @@
   and 60-minute maximum, a 64-session hard limit, and deterministic terminal
   retention/sweep; generated ID collisions fail closed without replacement
 - Strict out-of-band caller-context snapshots and immutable session ownership:
-  local uses a process-local owner domain, while the future remote seam binds
-  authentication method plus subject; omitted/malformed context is denied
+  values are captured once from own data-property descriptors before
+  validation/copy, local uses a process-local owner domain, and the future
+  remote seam binds authentication method plus subject; omitted/malformed or
+  statefully changing context is denied without throwing
 - Domain-separated, length-prefixed full SHA-256 owner keys stored only inside
-  sessions, with separate short caller tags for allowed/mismatched audit events
+  sessions, with 32-byte process-secret HMAC caller tags for
+  allowed/mismatched audit events; the secret is never persisted or serialized
 - Separate observation and per-action capabilities
 - Default-deny policy with strict adapter action schemas
 - Per-session request idempotency, in-flight duplicate coalescing, and
@@ -82,8 +85,9 @@ Actual local results on 2026-08-30 with Node.js `v22.23.1` and npm `10.9.8`:
 - `npm ci` — passed; 73 packages installed, 74 audited, 0 vulnerabilities
 - `npm audit` — passed; 0 vulnerabilities
 - `npm run check` — passed
-- `npm test` — passed; 4 files and 36 tests, including 7 owner-binding,
-  cross-caller cache/in-flight, strict-context, and TOCTOU regressions
+- `npm test` — passed; 4 files and 38 tests, including 9 owner-binding,
+  cross-caller cache/in-flight, descriptor-snapshot Proxy, keyed caller-tag,
+  strict-context, and TOCTOU regressions
 - Real stdio contract — passed inside `npm test`; official
   `Client@2.0.0`/`StdioClientTransport` started the built Node entrypoint,
   completed initialize/list/calls, and closed client first then transport

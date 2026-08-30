@@ -1,6 +1,7 @@
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 
 export const MAX_PRINCIPAL_FIELD_LENGTH = 128;
+export const CALLER_TAG_KEY_BYTES = 32;
 
 export interface LocalRequestContext {
   readonly transport: "local";
@@ -21,33 +22,43 @@ export type SessionOwnerKey = string & {
   readonly [sessionOwnerKeyBrand]: true;
 };
 
-function hasExactDataProperties(
+function captureOwnDataProperties(
   value: unknown,
-  expectedKeys: readonly string[],
-): value is Record<string, unknown> {
+): ReadonlyMap<string, unknown> | undefined {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    return false;
+    return undefined;
   }
   try {
     const prototype = Object.getPrototypeOf(value);
     if (prototype !== Object.prototype && prototype !== null) {
-      return false;
+      return undefined;
     }
     const keys = Reflect.ownKeys(value);
-    if (
-      keys.length !== expectedKeys.length ||
-      expectedKeys.some((key) => !keys.includes(key)) ||
-      keys.some((key) => typeof key !== "string")
-    ) {
-      return false;
+    if (keys.some((key) => typeof key !== "string")) {
+      return undefined;
     }
-    return expectedKeys.every((key) => {
+    const captured = new Map<string, unknown>();
+    for (const key of keys as string[]) {
       const descriptor = Object.getOwnPropertyDescriptor(value, key);
-      return descriptor !== undefined && "value" in descriptor;
-    });
+      if (descriptor === undefined || !("value" in descriptor)) {
+        return undefined;
+      }
+      captured.set(key, descriptor.value);
+    }
+    return captured;
   } catch {
-    return false;
+    return undefined;
   }
+}
+
+function hasExactKeys(
+  captured: ReadonlyMap<string, unknown>,
+  expectedKeys: readonly string[],
+): boolean {
+  return (
+    captured.size === expectedKeys.length &&
+    expectedKeys.every((key) => captured.has(key))
+  );
 }
 
 function isBoundedPrincipalField(value: unknown): value is string {
@@ -64,21 +75,35 @@ function isBoundedPrincipalField(value: unknown): value is string {
  */
 export function snapshotRequestContext(value: unknown): RequestContext | undefined {
   try {
-    if (hasExactDataProperties(value, ["transport"]) && value.transport === "local") {
+    const context = captureOwnDataProperties(value);
+    if (context === undefined) {
+      return undefined;
+    }
+    const transport = context.get("transport");
+    if (hasExactKeys(context, ["transport"]) && transport === "local") {
       return Object.freeze({ transport: "local" });
     }
     if (
-      !hasExactDataProperties(value, ["transport", "principal"]) ||
-      value.transport !== "remote" ||
-      !hasExactDataProperties(value.principal, ["subject", "method"]) ||
-      !isBoundedPrincipalField(value.principal.subject) ||
-      !isBoundedPrincipalField(value.principal.method)
+      !hasExactKeys(context, ["transport", "principal"]) ||
+      transport !== "remote"
     ) {
       return undefined;
     }
+    const capturedPrincipal = captureOwnDataProperties(context.get("principal"));
+    if (
+      capturedPrincipal === undefined ||
+      !hasExactKeys(capturedPrincipal, ["subject", "method"])
+    ) {
+      return undefined;
+    }
+    const subject = capturedPrincipal.get("subject");
+    const method = capturedPrincipal.get("method");
+    if (!isBoundedPrincipalField(subject) || !isBoundedPrincipalField(method)) {
+      return undefined;
+    }
     const principal = Object.freeze({
-      subject: value.principal.subject,
-      method: value.principal.method,
+      subject,
+      method,
     });
     return Object.freeze({ transport: "remote", principal });
   } catch {
@@ -117,8 +142,17 @@ export function deriveSessionOwnerKey(context: RequestContext): SessionOwnerKey 
   return domainHash("xiaoqie-game-bridge/session-owner/v1", fields) as SessionOwnerKey;
 }
 
-export function sessionCallerTag(ownerKey: SessionOwnerKey): string {
-  return domainHash("xiaoqie-game-bridge/session-caller-tag/v1", [ownerKey]).slice(0, 12);
+export function sessionCallerTag(
+  ownerKey: SessionOwnerKey,
+  secretKey: Uint8Array,
+): string {
+  if (secretKey.byteLength !== CALLER_TAG_KEY_BYTES) {
+    throw new RangeError("Caller tag key must contain exactly 32 bytes.");
+  }
+  const hmac = createHmac("sha256", secretKey);
+  hmac.update(lengthPrefixed("xiaoqie-game-bridge/session-caller-tag/v2"));
+  hmac.update(lengthPrefixed(ownerKey));
+  return hmac.digest("hex").slice(0, 12);
 }
 
 export function isSessionOwnerKey(value: unknown): value is SessionOwnerKey {
