@@ -277,8 +277,9 @@ abort signal. When the deadline fires, tracked application promises reject
 promptly and no later confirmation, checkpoint, append, retry, or background retention action can run. A native
 OS operation already pending cannot be forcibly cancelled by Node; close does
 not await or reuse that handle. When it settles, its only continuation closes
-the handle, with process exit as fallback; bytes without either evidence file
-remain unacknowledged recovery input on restart.
+the handle whenever the shutdown signal is aborted, including before the final
+closed-state assignment, with process exit as fallback; bytes without either
+evidence file remain unacknowledged recovery input on restart.
 
 ## Bounded lifetime and control-plane behavior
 

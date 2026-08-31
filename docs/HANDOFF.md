@@ -119,8 +119,8 @@ Actual local results on 2026-08-31 with Node.js `v22.23.1` and npm `10.9.8`:
 - `npm ci` — passed; 73 packages installed, 74 audited, 0 vulnerabilities
 - `npm audit` — passed; 0 vulnerabilities
 - `npm run check` — passed
-- `npm test` — passed; 7 files and 91 tests. All prior 74 tests remain green,
-  plus 16 durable-ledger groups and one corrupt-product-startup regression
+- `npm test` — passed; 7 files and 92 tests. All prior 74 tests remain green,
+  plus 17 durable-ledger groups and one corrupt-product-startup regression
   covering deterministic records, recursive leakage resistance, strict serial
   chains, all final-frame byte truncation points, committed corruption,
   identity/symlink faults, recovery idempotence, hard capacity, atomic commit
@@ -154,9 +154,9 @@ root was path-checked and removed (`TEMP_EVIDENCE_CLEANED=True`). These inherite
 ACLs and Node mode requests are explicitly not claimed as a custom
 user-exclusive DACL or hostile same-user isolation.
 
-The checked-in workflow has two coherent jobs: Ubuntu executes the 76
+The checked-in workflow has two coherent jobs: Ubuntu executes the 77
 platform-neutral tests while marking 15 Windows-only built-child/operator cases
-skipped, and `windows-latest` executes all 91 tests including real named-pipe,
+skipped, and `windows-latest` executes all 92 tests including real named-pipe,
 CLI, and stdio-child evidence. Both jobs run check, test, demo, build, audit, and
 diff-check after `npm ci`.
 
@@ -201,7 +201,8 @@ configuration was accessed. GitHub-hosted CI status is recorded in the Draft PR.
 - A shutdown deadline cannot cancel a native OS operation already pending, but
   the application stops awaiting/reusing the handle and forbids every later
   append/confirmation/checkpoint continuation. The native operation's only later
-  continuation closes the handle when it settles; process exit is the fallback.
+  continuation closes the handle when it settles, keyed directly to the abort
+  signal even before the final closed-state assignment; process exit is fallback.
 - A forced Windows process kill can leave a stale descriptor. Restart then
   fails closed and preserves it; normal EOF/error/close paths clean up, and no
   automatic stale-file deletion is attempted without launch identity evidence.

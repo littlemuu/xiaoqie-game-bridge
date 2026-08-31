@@ -119,6 +119,7 @@ export interface DurableAuditLedgerOptions {
     limits?: Partial<AuditLedgerLimits>;
     beforeAppend?: () => void | Promise<void>;
     beforeSync?: () => void | Promise<void>;
+    onShutdownAbort?: () => void;
     write?: (handle: FileHandle, bytes: Buffer) => Promise<number>;
     sync?: (handle: FileHandle) => Promise<void>;
   };
@@ -520,6 +521,7 @@ export class DurableAuditLedger implements AuditSink {
       new Promise<false>((resolve) => {
         drainTimer = setTimeout(() => {
           this.#shutdownController.abort();
+          this.#testOnly?.onShutdownAbort?.();
           resolve(false);
         }, this.#limits.shutdownDrainMs);
         drainTimer.unref();
@@ -1085,7 +1087,7 @@ export class DurableAuditLedger implements AuditSink {
       .then(operation)
       .finally(() => {
         this.#nativeIoHandles.delete(handle);
-        if (this.#closed) void handle.close().catch(() => undefined);
+        if (this.#closed || signal.aborted) void handle.close().catch(() => undefined);
       });
     return new Promise<T>((resolve, reject) => {
       const abort = () => {

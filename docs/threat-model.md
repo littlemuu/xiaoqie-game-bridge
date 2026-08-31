@@ -144,7 +144,8 @@ When shutdown reaches its deadline, native segment/evidence write and sync
 continuations reject and no later frame, confirmation, or checkpoint write can
 run. Node cannot forcibly cancel an OS file operation already pending; the ledger stops awaiting/reusing that handle.
 When the operation settles, its only continuation closes the handle, with
-process exit as fallback; bytes lacking both evidence files remain
+the abort signal—not a later closed-state assignment—owning that cleanup.
+Process exit is the fallback; bytes lacking both evidence files remain
 unacknowledged on restart.
 
 ### Adapter exceeds its authority

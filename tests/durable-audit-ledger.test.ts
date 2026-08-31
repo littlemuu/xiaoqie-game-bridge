@@ -10,6 +10,7 @@ import {
   symlink,
   unlink,
   writeFile,
+  type FileHandle,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -527,6 +528,53 @@ describe("durable local audit ledger", () => {
     appendGate.resolve();
     await new Promise((resolve) => setTimeout(resolve, 30));
     expect(await readdir(fixture.root)).toEqual(["segment-0001.audit"]);
+  });
+
+  it("closes an evidence handle settling between shutdown abort and closed state", async () => {
+    const fixture = await temporaryLedgerRoot("evidence-handle-shutdown");
+    const checkpointStarted = deferred();
+    const checkpointGate = deferred();
+    let writeCalls = 0;
+    let evidenceHandle: FileHandle | undefined;
+    const ledger = await DurableAuditLedger.open({
+      testOnly: {
+        rootDirectory: fixture.root,
+        limits: { shutdownDrainMs: 25 },
+        onShutdownAbort: () => checkpointGate.resolve(),
+        write: async (handle, bytes) => {
+          writeCalls += 1;
+          if (writeCalls === 3) {
+            evidenceHandle = handle;
+            checkpointStarted.resolve();
+            await checkpointGate.promise;
+            return bytes.byteLength;
+          }
+          return (await handle.write(bytes, 0, bytes.byteLength, null)).bytesWritten;
+        },
+      },
+    });
+    const pending = ledger.write(event());
+    const pendingRejection = expect(pending).rejects.toMatchObject({ code: "closed" });
+    await checkpointStarted.promise;
+    await ledger.close();
+    await pendingRejection;
+    expect(evidenceHandle).toBeDefined();
+    await expect(evidenceHandle!.stat()).rejects.toMatchObject({ code: "EBADF" });
+    const snapshot = await Promise.all(
+      (await readdir(fixture.root)).sort().map(async (name) => ({
+        name,
+        size: (await lstat(join(fixture.root, name))).size,
+      })),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    await expect(
+      Promise.all(
+        (await readdir(fixture.root)).sort().map(async (name) => ({
+          name,
+          size: (await lstat(join(fixture.root, name))).size,
+        })),
+      ),
+    ).resolves.toEqual(snapshot);
   });
 
   it("rejects an ordinary commit without changing mock state after total capacity is full", async () => {

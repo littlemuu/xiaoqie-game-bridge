@@ -204,8 +204,9 @@ fragmentation. On shutdown, the 500 ms deadline aborts application continuations
 waiting on native segment/evidence writes or syncs. If an OS file operation
 itself remains pending, close returns without later confirmation, checkpoint,
 retry, or write. Its only later continuation closes the handle when the native
-operation settles; process exit is the fallback, and startup treats any bytes
-without either evidence file conservatively.
+operation settles. That cleanup keys directly off the abort signal, including
+the abort-to-closed transition window; process exit is the fallback, and
+startup treats any bytes without either evidence file conservatively.
 
 ## Local operator CLI (Windows)
 
