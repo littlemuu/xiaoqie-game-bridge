@@ -10,8 +10,9 @@ boundary, and adapters are treated as separately reviewable capability modules.
 
 The current implementation touches none of those real assets. Its only mutable
 game asset is an in-memory mock world held by a fixed adapter worker. The MCP
-stdio child and nested adapter child are local process boundaries, not proof of
-remote identity or OS sandboxing.
+stdio child is a local protocol boundary. The nested adapter child additionally
+uses a real Windows Restricted Token and dedicated Job Object, but this is not
+proof of remote identity or a complete OS sandbox.
 
 ## Threats and current controls
 
@@ -159,9 +160,11 @@ malicious implementation code.
 The parent still owns identity, session binding, capabilities, action schemas,
 policy, idempotency, safety, and audit. Static metadata must exactly match the
 worker handshake. Caller/session/request identity and secrets never enter IPC.
-Fixed executable/argv/cwd plus a minimal supplied environment prevent requests
-from turning this into a generic launcher; a credential-shaped parent sentinel
-is regression-tested as absent from a real built child.
+Fixed native-launcher/executable/argv/cwd plus a minimal supplied environment
+prevent requests from turning this into a generic launcher; a credential-shaped
+parent sentinel is regression-tested as absent from a real built child. The
+product runtime does not publish commit surfaces until trusted containment
+attestation and the exact worker handshake both succeed.
 
 ### Worker protocol or lifecycle failure
 
@@ -172,10 +175,20 @@ worker/path/stack/raw output never reaches bridge responses or audit. Pending
 promises settle once with timers/capacity released; normal close waits for
 acknowledged zero exit. There is no unbounded queue.
 
-Process separation contains ordinary faults but does not make the worker
-non-malicious. Parent and child share one OS user; there is no restricted token,
-container, VM, filesystem ACL boundary, or proven CPU/memory sandbox. A real
-adapter still requires separate OS-isolation and permission approval.
+The native helper now verifies a Restricted Token and dedicated Job before
+resuming worker code. Kernel limits deny a second process, cap process/job
+memory and CPU, disallow breakaway, and kill members when the Job handle closes.
+The helper suppresses worker stderr and exposes only strict attestation/fault
+categories. Token/Job/create/assign/attest/resume failures all close handles and
+fail before a worker handshake; the pre-assignment failure path explicitly
+terminates the still-suspended process.
+
+This does not make a malicious worker safe. Restricting SIDs intentionally
+preserve the source user and enabled non-privileged groups needed by the fixed
+Node and repository ACLs. There is no AppContainer, VM, container, custom file
+or registry ACL, network policy, or same-user adversary defense. A real adapter
+still requires separate filesystem, network, game API, save, and cancellation
+permission approval.
 
 ### Game save corruption
 
@@ -273,8 +286,8 @@ settlement and then returns to zero.
 - The durable audit ledger detects ordinary corruption but is not tamper-proof
   against hostile same-user, administrator, or offline-disk rewriting. It has
   no automatic retention/deletion policy or external anchor.
-- The mock worker is a same-user process boundary, not a proven OS sandbox for
-  hostile or real-game adapter code.
+- The mock worker has a kernel-enforced Restricted Token + Job boundary, but it
+  is not a proven filesystem/network sandbox for hostile or real-game code.
 - Capability grants are approved by a simple local-only authorizer; the stdio
   boundary is the trusted component that asserts locality. A test-only remote
   authorizer proves the core seam, but no production remote authentication or

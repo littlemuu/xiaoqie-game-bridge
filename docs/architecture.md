@@ -16,7 +16,9 @@ local MCP client (owns and spawns one child process)
                     |
                     | bounded versioned adapter IPC
                     v
- ProcessMockAdapter -> fixed Node child -> mock-world only
+ ProcessMockAdapter -> fixed native containment launcher
+                    -> restricted-token + dedicated-Job Node child
+                    -> mock-world only
 
 separate local operator CLI
                     |
@@ -70,7 +72,13 @@ not bypass the core.
 - `adapters/mock/adapter-ipc.ts` is the single strict IPC contract and owns
   message/frame limits, fixed identity, internal call IDs, and lifecycle defaults.
 - `adapters/mock/process-mock-adapter.ts` owns fixed spawn configuration,
-  deadlines, bounded pending state, response correlation, and failure settlement.
+  containment/worker handshake ordering, deadlines, bounded pending state,
+  response correlation, and failure settlement.
+- `native/windows-worker-launcher.cpp` is the narrow Windows trusted-computing
+  base. It owns restricted-token creation and validation, suspended process
+  creation, handle allowlisting, Job assignment/query, resume, and Job-handle
+  lifetime. `scripts/build-native.mjs` compiles product and test-only variants
+  from source with MSVC or MinGW-w64; no native binary is committed or fetched.
 - `adapters/mock/mock-worker.ts` is the fixed built child. It owns only the
   deterministic in-memory mock state and executes already-authorized calls.
 
@@ -107,17 +115,51 @@ without mutation, and applies authorized commits in memory only.
 
 ## Adapter process lifecycle
 
+### Native implementation choice
+
+The selected implementation is one auditable C++17 Win32 launcher compiled from
+repository source. It keeps the token, process, thread, Job, and inherited-handle
+operations in one narrow executable with fixed arguments and fixed result
+categories. A Node native addon would put the same Win32 surface and native ABI
+lifecycle inside the long-lived bridge process, expand npm packaging risk, and
+make a native fault capable of taking down bridge state. Pure
+`child_process.spawn()` cannot create a restricted primary token or perform the
+suspended-create/assign/query/resume sequence. PowerShell, `runas`, environment
+flags, and shell wrappers neither establish these kernel constraints nor keep a
+closed-world process contract. No new npm/native package, postinstall hook,
+prebuilt download, service, driver, registry/ACL change, or elevation is used.
+
 The parent statically declares mock identity, capabilities, actions, and input
 schemas. Worker `ready` must exactly match and cannot add authority. The parent
 generates internal `call-N` IDs only after bridge policy and safety checks; no
 bridge/MCP request ID, session ID, caller context, principal, owner digest, or
 audit HMAC key crosses IPC. Dry-run remains explicit and non-mutating.
 
-The executable is `process.execPath`; the sole argv and cwd are derived from the
-fixed built module path. `shell` is false, stdio is pipe/pipe/ignored, and the
-supplied environment contains only a fixed worker marker (plus isolated fixture
-mode in tests). Windows may materialize OS-required environment entries, but a
-credential-shaped parent sentinel is proven absent from the real child.
+The Node parent executes only the fixed native launcher. Its closed-world argv
+contains fixed `process.execPath` and the fixed built module path; cwd is derived
+from that module, the launcher environment is empty, shell is false, and stdio
+is pipe/pipe/ignored. The helper independently accepts only the product path
+shape (or a separately built test-only fixture shape), creates an explicit
+`SystemRoot` plus worker-marker environment, and passes only stdin, stdout, and
+a newly opened NUL stderr handle through `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`.
+
+The security-critical startup order is: reject elevated/invalid host state;
+create and configure a dedicated Job; derive and kernel-validate a restricted
+primary token; create the fixed Node worker suspended; assign it to the Job;
+query Job membership, limits, token state, and one-member count; emit a strict
+attestation; then resume the worker thread. `ready` before that attestation is a
+containment failure. Product runtime awaits both attestation and the exact
+worker identity before registering the adapter or exposing operator/MCP commit
+surfaces. Missing/incompatible nested-Job support fails closed and never uses
+`CREATE_BREAKAWAY_FROM_JOB`.
+
+The Job constants are one active process, 256 MiB per-process memory, 192 MiB
+job memory, 20% CPU hard cap, kill-on-close, and no breakaway flags. The token
+uses `DISABLE_MAX_PRIVILEGE`, disables administrator/power/account/system/backup
+operator groups, retains medium-or-lower integrity, and uses the source user
+plus enabled non-privileged source groups as restricting SIDs. That latter
+choice keeps fixed Node/repository ACL access portable across managed Windows
+hosts; it is not claimed to isolate files.
 
 At most eight calls are pending and there is no application wait queue. Strict
 64 KiB frame and 32 KiB message limits apply. Malformed JSON, unknown
@@ -127,8 +169,10 @@ pending promise once, release timers/capacity, and terminate the child. Normal
 close waits for shutdown acknowledgement and zero exit; close with pending work
 settles that work before termination.
 
-This is a same-OS-user process boundary, not a proven OS sandbox. The worker is
-trusted and separately reviewable code.
+The helper remains a small trusted-computing base and the worker remains trusted
+and separately reviewable. Restricted Token + Job Object bounds privilege,
+process count, resources, and lifetime; it does not deny every current-user
+file, registry key, or network destination and is not a hostile-code sandbox.
 
 ## Request lifecycle
 

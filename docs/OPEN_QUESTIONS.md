@@ -7,9 +7,10 @@ The local resume-owner question is resolved for this mock phase: a narrow CLI
 uses a per-launch authenticated Windows named pipe that is separate from MCP and
 controls the same product safety latch. The remaining choices are:
 
-1. Before a real adapter, which actual OS isolation should wrap the now-proven
-   narrow process IPC: restricted token/job object, container, VM, or an
-   adapter-specific sandbox?
+1. Restricted Token + Job Object is now selected for the trusted mock worker's
+   privilege, process-tree, resource, and lifetime boundary. Before a real
+   adapter, which additional file, registry, network, game API, and save boundary
+   is required: AppContainer, container/VM, ACL policy, or adapter-specific broker?
 2. The bounded fixed local audit destination is now selected. Should a future
    ticket add an explicitly approved retention/deletion policy, and if so how
    should evidence be deleted without accepting arbitrary paths or silently

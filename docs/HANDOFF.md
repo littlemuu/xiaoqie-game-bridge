@@ -50,6 +50,12 @@
 - Fixed process-backed product mock with strict versioned pipe IPC, static
   identity, 64/32 KiB frame/message limits, eight pending calls, bounded
   handshake/call/close, minimal supplied environment, and fail-closed faults
+- Source-built narrow Win32 launcher with no committed binary/runtime download;
+  real Restricted Token validation, suspended Job assignment/attestation before
+  resume, inherited-handle allowlist, and no unrestricted product fallback
+- Dedicated Job limits verified from kernel state: kill-on-close, one active
+  process, 256 MiB process memory, 192 MiB job memory, 20% CPU hard cap, and no
+  breakaway; bounded probes cover child denial, memory/CPU and all setup stages
 - Pure bridge-injected MCP server factory with exactly one
   `game_bridge_request` tool and no resource, prompt, or control-plane surface
 - Client-spawned stdio entrypoint with a 64 KiB frame limit, 32 KiB logical
@@ -62,9 +68,10 @@
 
 - MCP uses only client-spawned local stdio. The separate operator channel uses
   one same-user Windows named pipe; neither opens TCP or provides remote auth.
-- The nested worker uses fixed `process.execPath`, argv, built path/cwd,
-  `shell: false`, and pipe-only stdio. It is a same-user process boundary, not
-  a proven OS sandbox, and remains trusted separately reviewable code.
+- The parent starts only the fixed native launcher; the helper alone starts the
+  fixed `process.execPath` + built worker under a verified Restricted Token and
+  Job. The boundary is not a file/network sandbox and remains trusted,
+  separately reviewable code.
 - The default authorizer only opens sessions for explicit local request
   contexts; omitted or invalid caller context is untrusted for both opening and
   using sessions. The stdio tool cannot accept identity fields and injects its
@@ -119,12 +126,12 @@ Actual local results on 2026-08-31 with Node.js `v22.23.1` and npm `10.9.8`:
 - `npm ci` — passed; 73 packages installed, 74 audited, 0 vulnerabilities
 - `npm audit` — passed; 0 vulnerabilities
 - `npm run check` — passed
-- `npm test` — passed; 7 files and 92 tests. All prior 74 tests remain green,
-  plus 17 durable-ledger groups and one corrupt-product-startup regression
-  covering deterministic records, recursive leakage resistance, strict serial
-  chains, all final-frame byte truncation points, committed corruption,
-  identity/symlink faults, recovery idempotence, hard capacity, atomic commit
-  reservation, bounded shutdown, and built-child restart
+- `npm test` — passed; 8 files, 110 tests passed and one non-Windows gate was
+  skipped on Windows. All prior protocol, MCP, operator, audit, safety,
+  idempotency and capacity regressions remain green. The new real Windows groups
+  cover kernel token/Job attestation before worker entry, child-process denial,
+  bounded memory and CPU probes, normal/abnormal parent cleanup, six injected
+  setup failures, closed-world argv, and fixed containment categories.
 - Real stdio contract — passed inside `npm test`; official
   `Client@2.0.0`/`StdioClientTransport` started the built Node entrypoint,
   completed initialize/list/calls, and closed client first then transport
@@ -143,7 +150,22 @@ Actual local results on 2026-08-31 with Node.js `v22.23.1` and npm `10.9.8`:
 Installed versions were `@modelcontextprotocol/server@2.0.0`, dev-only
 `@modelcontextprotocol/client@2.0.0`, and `zod@4.5.4`, with one deduplicated Zod
 version and no peer conflict. The verification runner used TypeScript `5.9.2`
-and Vitest `3.2.7`.
+and Vitest `3.2.7`. Native compilation used the already-installed MinGW-w64
+`g++.exe 8.1.0` (`x86_64-posix-seh-rev0`) with C++17, warnings-as-errors, and
+static GCC/C++ runtimes. CI discovers the installed MSVC x64 environment via
+`vswhere` and compiles the same source with `/W4 /WX`; there is no native npm
+dependency, postinstall hook, committed binary, or runtime download.
+
+The verified host reported Windows NT `10.0.22000.0`, 64-bit OS and `x64` Node
+process. The trusted helper reported the host process was already in a Job and
+successfully established a real nested dedicated Job. Kernel-derived,
+closed-world evidence was: restricted token true; dangerous privileges
+disabled; privileged groups disabled or deny-only; source-user plus enabled
+non-privileged-group restricting policy; medium integrity; membership true;
+kill-on-close true; active-process limit 1; process memory 256 MiB; job memory
+192 MiB; CPU hard cap 20%; breakaway false. No SID, username, PID, token handle,
+path, command line, native error, stack, or secret was emitted by the product
+attestation/fault API.
 
 Windows audit-file evidence was sampled from a real append-and-sync in a
 uniquely named temporary directory. The ledger object was a directory, its
@@ -154,18 +176,22 @@ root was path-checked and removed (`TEMP_EVIDENCE_CLEANED=True`). These inherite
 ACLs and Node mode requests are explicitly not claimed as a custom
 user-exclusive DACL or hostile same-user isolation.
 
-The checked-in workflow has two coherent jobs: Ubuntu executes the 77
-platform-neutral tests while marking 15 Windows-only built-child/operator cases
-skipped, and `windows-latest` executes all 92 tests including real named-pipe,
-CLI, and stdio-child evidence. Both jobs run check, test, demo, build, audit, and
-diff-check after `npm ci`.
+The checked-in workflow has two coherent jobs. Ubuntu is configured for 54
+platform-neutral passes and 57 explicit Windows-only skips, including one
+non-Windows fail-closed containment test; its demo returns a fixed skip result
+instead of using an unrestricted worker. `windows-latest` is configured for the
+full suite (locally 110 passed/1 skipped), including native containment, real
+named-pipe, CLI, and stdio-child evidence. Both jobs run check, test, demo,
+build, audit, and diff-check after `npm ci`.
 
 On this Windows managed host, the final commands used the existing fnm
 Node.js `v22.23.1` and npm `10.9.8` explicitly. Vitest, tsx, and approved built
 children ran outside the process sandbox because child creation receives
 `spawn EPERM` inside it. Every product/operator child used a unique temporary
 profile, and suite teardown removed it; the ACL fixture was also precisely
-removed. No network (except npm install/audit and later GitHub delivery), real
+removed. Every fixed probe/launcher settled, and the direct lifecycle checks
+found no remaining launcher after normal, failure-injected, or abnormal-parent
+paths. No network (except npm install/audit and later GitHub delivery), real
 game, desktop application, account, save, existing user file, or host
 configuration was accessed. GitHub-hosted CI status is recorded in the Draft PR.
 
@@ -182,7 +208,8 @@ configuration was accessed. GitHub-hosted CI status is recorded in the Draft PR.
   remote endpoint.
 - Session, idempotency, safety-latch, and mock-game state still disappear on
   process exit. Only the bounded sanitized audit ledger survives restart.
-- The mock process boundary is not an OS sandbox or authorization for a real adapter.
+- Restricted Token + Job Object is not a complete OS sandbox or authorization
+  for a real adapter; it does not block every user-readable file or network use.
 - Safety stop blocks new writes but does not forcibly cancel an asynchronous
   adapter action already in flight; real adapters may need cooperative
   cancellation.
