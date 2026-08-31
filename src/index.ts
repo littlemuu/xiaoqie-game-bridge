@@ -1,6 +1,7 @@
 export * from "./adapters/mock/mock-adapter.js";
 export * from "./adapters/mock/adapter-ipc.js";
 export * from "./adapters/mock/process-mock-adapter.js";
+export * from "./audit/durable-ledger.js";
 export * from "./core/adapter.js";
 export * from "./core/adapter-registry.js";
 export * from "./core/audit.js";

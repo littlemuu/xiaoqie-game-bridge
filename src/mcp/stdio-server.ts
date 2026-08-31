@@ -7,7 +7,15 @@ import {
 } from "./server.js";
 
 async function run(): Promise<void> {
-  const runtime = createProductRuntime();
+  let runtime;
+  try {
+    runtime = await createProductRuntime();
+  } catch {
+    process.stderr.write("Local audit ledger startup failed.\n");
+    process.exitCode = 1;
+    process.stdin.pause();
+    return;
+  }
   let closing = false;
   let closeRuntime: (() => Promise<void>) | undefined;
   let operator;
