@@ -10,8 +10,10 @@ controls the same product safety latch. The remaining choices are:
 1. Before a real adapter, which actual OS isolation should wrap the now-proven
    narrow process IPC: restricted token/job object, container, VM, or an
    adapter-specific sandbox?
-2. What durable audit destination and retention period should be used without
-   collecting game chat, credentials, or unnecessary personal data?
+2. The bounded fixed local audit destination is now selected. Should a future
+   ticket add an explicitly approved retention/deletion policy, and if so how
+   should evidence be deleted without accepting arbitrary paths or silently
+   evicting history under pressure?
 3. Beyond the bounded stdio handler gate, which per-principal and per-action
    rate limits would a future authenticated transport require, and which
    authentication methods should map to stable subjects without account
@@ -25,6 +27,9 @@ controls the same product safety latch. The remaining choices are:
    receive an explicit Windows DACL, a restricted-token broker, or a different
    OS-owned rendezvous mechanism? Current inherited ACL evidence is not such a
    proof.
+7. Does a future audit design need a protected signing key or external anchor?
+   The current SHA-256 chain deliberately detects ordinary damage only and is
+   not hostile same-user or offline-disk tamper proof.
 
 The next work order is intentionally not preselected. First review the
 mock-only stdio/MCP and operator boundaries, including cancellation, identity,
@@ -41,3 +46,7 @@ separate design and authorization gates before any remote endpoint exists.
 The fixed mock worker answers only protocol and ordinary fault-containment
 questions. It does not authorize real adapter code, establish a hostile-code
 sandbox, guarantee cooperative cancellation, or protect game saves.
+
+The durable ledger is likewise not authorization for cloud logging, a
+database, telemetry upload, persistent bearer secrets, arbitrary file access,
+automatic deletion, or a game-save format. Each requires a separate work order.

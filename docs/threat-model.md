@@ -35,7 +35,8 @@ Sessions are memory-only. Audit events store truncated SHA-256 tags instead of
 raw request/session identifiers. Attacker-controlled unknown actions and
 unregistered adapter IDs are also reduced to fixed categories plus hashed tags.
 Structured metadata recursively redacts keys such as token, password, secret,
-authorization, cookie, credential, and API key. Future
+authorization, cookie, credential, API key, endpoint, path, PID, username,
+stack, and raw payload/request/record. Future
 transports must keep bearer credentials outside request params, authenticate
 before opening a session, encrypt transport traffic, and bound token lifetime.
 
@@ -99,6 +100,39 @@ serialized deterministically. Invalid output, thrown errors, and mismatched
 request identity become a fixed `INTERNAL_ERROR`; raw results, stack traces, and
 exceptions are not written to MCP. Stdout carries MCP only. Transport failures
 write a fixed message to stderr without embedding the received frame or error.
+
+### Audit loss, corruption, or false durability
+
+The product sink is a fixed-directory, append-only, bounded local ledger rather
+than process memory. Each strict versioned frame carries a monotonic sequence,
+previous-record digest, and current digest over canonical bytes. Writes are
+serialized and do not acknowledge until the complete append and
+`FileHandle.sync()` resolve. Startup verifies the whole owned chain before
+operator/MCP commit admission. A recognizable incomplete tail is retained and
+continued only through one bounded recovery marker in a new segment; committed
+checksum/schema/order failures, unexpected objects, and object-identity changes
+fail startup closed without repair.
+
+Limits are 4 KiB per record, 8 outstanding writes, 64 KiB per segment, 8
+segments, and 500 ms for ledger shutdown drain. There is no eviction, deletion,
+retry loop, retention timer, upload, database, or remote log service. At the
+hard segment limit, ordinary commits and resume refuse before new side effects.
+Stop is intentionally asymmetric: it closes the latch synchronously before
+attempting audit, so a full/rejected/corrupt sink can degrade the command result
+but cannot reopen the gate. A resume authorization must be sync-acknowledged
+while its generation/deadline transaction is still live.
+
+The ledger is not a game save and has no fields for requests, adapter
+input/output, observations, world/player state, chat, accounts, screens, or
+save data. Identifier correlation is limited to existing safe tags. No MCP or
+operator command reads records or selects a path.
+
+SHA-256 here detects accidental damage and inconsistent ordering inside a
+trusted same-user boundary. There is no protected signing key or external
+anchor. Hostile same-user code, an administrator, or an offline disk editor can
+rewrite both data and digests or remove a complete tail; this design is not
+tamper-proof. Likewise, Node/OS `sync()` acknowledgement does not bypass
+hardware caches or guarantee every physical power-loss model.
 
 ### Adapter exceeds its authority
 
@@ -222,7 +256,9 @@ settlement and then returns to zero.
 - Client-spawned stdio has no remote authentication, encryption, origin binding,
   per-principal rate limiting, or distributed replay store and must not be
   exposed as a network service.
-- The in-memory audit sink is demonstrative, not durable or tamper-evident.
+- The durable audit ledger detects ordinary corruption but is not tamper-proof
+  against hostile same-user, administrator, or offline-disk rewriting. It has
+  no automatic retention/deletion policy or external anchor.
 - The mock worker is a same-user process boundary, not a proven OS sandbox for
   hostile or real-game adapter code.
 - Capability grants are approved by a simple local-only authorizer; the stdio
