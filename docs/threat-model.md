@@ -172,8 +172,12 @@ A valid resume request is not allowed to open the latch before its asynchronous
 audit work and operator deadline succeed. The server aborts the bridge resume
 on deadline or client disconnect; audit rejection and late settlement leave
 `stopped=true`. Concurrent resume admission is singular and excess attempts are
-denied as capacity. This avoids a failure response paired with an already-open
-write gate.
+denied as capacity. A later stop aborts every older pending resume transaction,
+including a repeated stop that intentionally preserves `stopGeneration`. The
+awaited event is explicitly a pre-commit attempt with `resumed=false`; only a
+post-commit event may claim resume success, so a late pre-commit settlement is
+not a false outcome. This avoids a failure response paired with an already-open
+write gate or a successful stop later being undone by older work.
 
 The latch does not claim forced cancellation. An asynchronous action that
 passed `beginWrite()` and entered the worker may complete after stop or client
@@ -200,7 +204,11 @@ counting accepted sessions. Overflow sockets are immediately destroyed and do
 not allocate encoded failure responses, read timers, close timers, or an
 application queue. Shutdown enumerates every admitted socket and clears its
 tracked timers; a 64-contender flood regression proves the counters never rise
-above the configured admission limit.
+above the configured admission limit. Pending authenticated handlers are also
+tracked: disconnect aborts their work, shutdown performs a bounded wait, and
+destroyed/closing sockets are rejected before response encoding or timer
+allocation. A pending-audit disconnect/shutdown regression releases the audit
+late and proves all four public resource counters remain zero.
 
 ## Residual risks before a real adapter
 

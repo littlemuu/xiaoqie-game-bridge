@@ -166,8 +166,8 @@ npm run operator -- resume --generation 1
 
 The CLI accepts no endpoint, path, host, port, URL, executable, or environment
 override. It emits one fixed result and deterministic exit code. `status` is
-read-only and unaudited; stop, successful resume, and denied resume use the
-same bridge audit sink as MCP. Stop bypasses sessions, the request cache, MCP
+read-only and unaudited; stop and resume attempts use the same bridge audit
+sink as MCP. Stop bypasses sessions, the request cache, MCP
 handler permits, and adapter pending capacity. It blocks only new commits and
 does not claim to cancel or roll back an action already inside the adapter.
 
@@ -176,11 +176,15 @@ not remote authentication and does not defend against malicious code already
 running as the same OS user or as administrator. No TCP fallback exists.
 
 Resume is transactional with respect to the operator deadline: the latch stays
-stopped while the audit sink is pending, and the transition is committed only
-after audit succeeds while the request is still live. Audit rejection,
-operator timeout, client disconnect, or a late audit continuation cannot open
-the latch. Connections beyond the fixed admission limit are destroyed
-immediately without allocating a response frame or close timer.
+stopped while an explicitly named pre-commit audit event is pending, and the
+transition is committed only after that event succeeds while the request is
+still live. The pre-commit event records `resumed=false`; only the post-commit
+outcome can record a successful resume. Audit rejection, operator timeout,
+client disconnect, or a late audit continuation cannot open the latch. Every
+later stop invalidates an older pending resume even when the repeated stop keeps
+the same public generation. Connections beyond the fixed admission limit are
+destroyed immediately without allocating a response frame or close timer, and
+late handlers cannot add response work after disconnect or shutdown.
 
 CI has two explicit acceptance paths. Ubuntu runs the platform-neutral core and
 skips only Windows product-child/operator cases; `windows-latest` runs the full

@@ -215,7 +215,9 @@ configured maximum, and `stopGeneration`. A running-to-stopped edge increments
 the generation; repeated stop does not. Stop immediately blocks new commits but
 does not cancel work already inside an adapter. Resume requires the exact
 current generation and zero in-flight writes. Stop and resume attempts are
-audited; status is a read-only snapshot and is not audited.
+audited; status is a read-only snapshot and is not audited. Every stop also
+invalidates any older local resume transaction without changing the public
+generation rule for repeated stops.
 That control-plane object is not returned to or callable from MCP. Cancellation,
 EOF, or client disconnect closes protocol work but is not evidence that an
 adapter write already past `beginWrite()` was forcibly cancelled.
@@ -244,6 +246,9 @@ Only admitted sockets receive read, handler, response, and close timers.
 Connections beyond the admission limit are destroyed immediately and are not
 placed in a rejection queue. Read-only resource counters expose tracked
 connections and timer/response work for bounded shutdown regression tests.
+Authenticated handlers are tracked separately; disconnect aborts their control
+operation, shutdown waits for their bounded settlement, and a destroyed socket
+or closing server cannot allocate late response work.
 
 The CLI can issue only `status`, `stop`, or `resume --generation <n>`. Endpoint
 and token are read from the fixed descriptor and cannot be selected by CLI,
@@ -253,10 +258,12 @@ failure categories and never enters the bridge action protocol.
 
 Resume uses an abort-aware two-phase path. The bridge first verifies generation,
 stopped state, in-flight writes, and single-resume admission while leaving the
-latch closed. It waits for the shared audit sink; only a successful audit within
-the operator handler deadline commits `SafetyLatch.resume()`. Deadline expiry or
-socket disconnect aborts the pending operation, and audit rejection or a late
-settlement cannot run the commit continuation.
+latch closed. It waits for a `safety.resume.precommit.local` audit event whose
+metadata explicitly says `phase=precommit` and `resumed=false`; only its success
+within the operator handler deadline permits `SafetyLatch.resume()`. The bridge
+then submits the truthful `safety.resume.local` outcome after the latch is open.
+Deadline expiry, socket disconnect, or a later stop aborts the transaction;
+audit rejection or a late settlement cannot run the commit continuation.
 
 ## Deliberately absent
 

@@ -19,6 +19,7 @@ export type SafetyResumeFailureReason =
   | "generation-mismatch"
   | "not-stopped"
   | "resume-pending"
+  | "stop-superseded"
   | "writes-in-flight";
 
 export type SafetyResumeResult =
@@ -70,7 +71,7 @@ export class SafetyLatch {
 
   resumeBlockReason(
     expectedGeneration: number,
-  ): Exclude<SafetyResumeFailureReason, "resume-pending"> | undefined {
+  ): Exclude<SafetyResumeFailureReason, "resume-pending" | "stop-superseded"> | undefined {
     if (!this.#stopped) {
       return "not-stopped";
     }

@@ -59,16 +59,19 @@ function deferred<T>(): Deferred<T> {
 
 class ControlledResumeAuditSink implements AuditSink {
   mode: "pass" | "pending" | "reject" = "pass";
+  readonly events: AuditEvent[] = [];
   readonly entered = deferred<void>();
   readonly #release = deferred<void>();
 
-  write(event: AuditEvent): void | Promise<void> {
-    if (event.action !== "safety.resume.local") return;
-    if (this.mode === "reject") return Promise.reject(new Error("fixture audit rejection"));
-    if (this.mode === "pending") {
-      this.entered.resolve();
-      return this.#release.promise;
+  async write(event: AuditEvent): Promise<void> {
+    if (event.action === "safety.resume.precommit.local") {
+      if (this.mode === "reject") throw new Error("fixture audit rejection");
+      if (this.mode === "pending") {
+        this.entered.resolve();
+        await this.#release.promise;
+      }
     }
+    this.events.push(event);
   }
 
   release(): void {
@@ -274,13 +277,25 @@ describe.runIf(process.platform === "win32")("local operator control plane", () 
       ["safety.stop.local", "allow"],
       ["safety.stop.local", "allow"],
       ["safety.resume.local", "deny"],
+      ["safety.resume.precommit.local", "allow"],
       ["safety.resume.local", "allow"],
       ["safety.resume.local", "deny"],
       ["safety.stop.local", "allow"],
       ["safety.resume.local", "deny"],
+      ["safety.resume.precommit.local", "allow"],
       ["safety.resume.local", "allow"],
       ["safety.resume.local", "deny"],
     ]);
+    const successfulResumeOutcomes = audit.events.filter(
+      (event) => event.action === "safety.resume.local" && event.decision === "allow",
+    );
+    expect(successfulResumeOutcomes).toHaveLength(2);
+    for (const event of successfulResumeOutcomes) {
+      expect(event).toMatchObject({
+        safetyStopped: false,
+        metadata: { phase: "outcome", resumed: true },
+      });
+    }
     const serialized = JSON.stringify(audit.events);
     const current = await descriptor();
     expect(serialized).not.toContain(current.token);
@@ -425,6 +440,31 @@ describe.runIf(process.platform === "win32")("local operator control plane", () 
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
     expect(safetyLatch.status()).toMatchObject({ stopped: true, stopGeneration: 1 });
     expect(safetyLatch.beginWrite()).toMatchObject({ allowed: false, reason: "stopped" });
+    expect(
+      audit.events.filter(
+        (event) => event.action === "safety.resume.local" && event.decision === "allow",
+      ),
+    ).toHaveLength(0);
+    expect(audit.events).toContainEqual(
+      expect.objectContaining({
+        action: "safety.resume.precommit.local",
+        decision: "allow",
+        safetyStopped: true,
+        metadata: expect.objectContaining({ phase: "precommit", resumed: false }),
+      }),
+    );
+    expect(audit.events).toContainEqual(
+      expect.objectContaining({
+        action: "safety.resume.local",
+        decision: "deny",
+        safetyStopped: true,
+        metadata: expect.objectContaining({
+          phase: "outcome",
+          resumed: false,
+          reason: "aborted",
+        }),
+      }),
+    );
 
     audit.mode = "reject";
     expectOperatorError(
@@ -433,6 +473,128 @@ describe.runIf(process.platform === "win32")("local operator control plane", () 
     );
     expect(safetyLatch.status()).toMatchObject({ stopped: true, stopGeneration: 1 });
     expect(safetyLatch.beginWrite()).toMatchObject({ allowed: false, reason: "stopped" });
+    expect(
+      audit.events.filter(
+        (event) => event.action === "safety.resume.local" && event.decision === "allow",
+      ),
+    ).toHaveLength(0);
+    expect(audit.events).toContainEqual(
+      expect.objectContaining({
+        action: "safety.resume.local",
+        decision: "deny",
+        metadata: expect.objectContaining({ reason: "audit-failed" }),
+      }),
+    );
+  });
+
+  it("keeps a later repeated stop authoritative over an older pending resume", async () => {
+    const registry = new AdapterRegistry();
+    registry.register(new MockGameAdapter());
+    const safetyLatch = new SafetyLatch();
+    const audit = new ControlledResumeAuditSink();
+    const bridge = new GameBridge({ registry, safetyLatch, auditSink: audit });
+    const initialStop = safetyLatch.stop();
+    const server = await startLocalOperatorServer(bridge.createLocalControlPlane());
+    servers.push(server);
+
+    audit.mode = "pending";
+    const olderResume = callLocalOperator({
+      command: "resume",
+      generation: initialStop.stopGeneration,
+    });
+    await audit.entered.promise;
+
+    const laterStop = await callLocalOperator({ command: "stop" });
+    expect(laterStop).toMatchObject({
+      ok: true,
+      command: "stop",
+      alreadyStopped: true,
+      status: { stopped: true, stopGeneration: initialStop.stopGeneration },
+    });
+    expectOperatorError(await olderResume, "GENERATION_MISMATCH");
+
+    audit.release();
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+    expect(safetyLatch.status()).toMatchObject({
+      stopped: true,
+      stopGeneration: initialStop.stopGeneration,
+    });
+    expect(safetyLatch.beginWrite()).toMatchObject({ allowed: false, reason: "stopped" });
+    expect(
+      audit.events.filter(
+        (event) => event.action === "safety.resume.local" && event.decision === "allow",
+      ),
+    ).toHaveLength(0);
+    expect(audit.events).toContainEqual(
+      expect.objectContaining({
+        action: "safety.resume.local",
+        decision: "deny",
+        metadata: expect.objectContaining({ reason: "stop-superseded" }),
+      }),
+    );
+  });
+
+  it("does not create late response resources after disconnect and shutdown", async () => {
+    const registry = new AdapterRegistry();
+    registry.register(new MockGameAdapter());
+    const safetyLatch = new SafetyLatch();
+    const audit = new ControlledResumeAuditSink();
+    const bridge = new GameBridge({ registry, safetyLatch, auditSink: audit });
+    const initialStop = safetyLatch.stop();
+    const server = await startLocalOperatorServer(bridge.createLocalControlPlane(), {
+      closeTimeoutMs: 100,
+    });
+    servers.push(server);
+    const current = await descriptor();
+
+    audit.mode = "pending";
+    const socket = await new Promise<Socket>((resolvePromise, reject) => {
+      const candidate = createConnection(current.endpoint);
+      candidate.once("connect", () => resolvePromise(candidate));
+      candidate.once("error", reject);
+    });
+    socket.write(
+      operatorRequest(
+        { command: "resume", generation: initialStop.stopGeneration },
+        current.token,
+      ),
+    );
+    await audit.entered.promise;
+
+    const disconnected = new Promise<void>((resolvePromise) => {
+      socket.once("close", () => resolvePromise());
+    });
+    socket.destroy();
+    await disconnected;
+    await server.close();
+    expect(server.inspectResourceUsage()).toEqual({
+      trackedConnections: 0,
+      readTimers: 0,
+      closeTimers: 0,
+      responsesInFlight: 0,
+    });
+
+    audit.release();
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+    expect(server.inspectResourceUsage()).toEqual({
+      trackedConnections: 0,
+      readTimers: 0,
+      closeTimers: 0,
+      responsesInFlight: 0,
+    });
+    expect(safetyLatch.status()).toMatchObject({ stopped: true });
+    expect(
+      audit.events.filter(
+        (event) => event.action === "safety.resume.local" && event.decision === "allow",
+      ),
+    ).toHaveLength(0);
+    expect(audit.events).toContainEqual(
+      expect.objectContaining({
+        action: "safety.resume.local",
+        decision: "deny",
+        metadata: expect.objectContaining({ reason: "aborted" }),
+      }),
+    );
   });
 
   it("keeps stop independent of full sessions, handler permits, adapter pending work, and writes", async () => {

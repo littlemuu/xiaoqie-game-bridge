@@ -160,6 +160,7 @@ export class LocalOperatorServer {
   readonly #options: RequiredOperatorServerOptions;
   readonly #secret = randomBytes(OPERATOR_TOKEN_BYTES);
   readonly #connections = new Set<Socket>();
+  readonly #handlers = new Set<Promise<void>>();
   readonly #readTimers = new Set<NodeJS.Timeout>();
   readonly #closeTimers = new Set<NodeJS.Timeout>();
   readonly #onFatal: (() => void) | undefined;
@@ -302,6 +303,10 @@ export class LocalOperatorServer {
   async #close(): Promise<void> {
     for (const socket of this.#connections) socket.destroy();
     await this.#closeListener();
+    await bounded(
+      Promise.allSettled([...this.#handlers]).then(() => undefined),
+      this.#options.closeTimeoutMs,
+    ).catch(() => undefined);
     for (const timer of this.#readTimers) clearTimeout(timer);
     for (const timer of this.#closeTimers) clearTimeout(timer);
     this.#readTimers.clear();
@@ -429,10 +434,13 @@ export class LocalOperatorServer {
         const frame = buffer;
         buffer = Buffer.alloc(0);
         socket.pause();
-        void this.#handleFrame(frame, socket).then(
-          (response) => this.#sendAndClose(socket, response),
-          () => this.#sendAndClose(socket, fixedFailure("INTERNAL_ERROR")),
-        );
+        const handler = this.#handleFrame(frame, socket)
+          .then(
+            (response) => this.#sendAndClose(socket, response),
+            () => this.#sendAndClose(socket, fixedFailure("INTERNAL_ERROR")),
+          )
+          .finally(() => this.#handlers.delete(handler));
+        this.#handlers.add(handler);
       });
     });
 
@@ -526,12 +534,14 @@ export class LocalOperatorServer {
       "generation-mismatch": "GENERATION_MISMATCH",
       "not-stopped": "NOT_STOPPED",
       "resume-pending": "CAPACITY",
+      "stop-superseded": "GENERATION_MISMATCH",
       "writes-in-flight": "WRITES_IN_FLIGHT",
     } as const;
     return fixedFailure(codes[result.reason]);
   }
 
   #sendAndClose(socket: Socket, response: OperatorResponse): void {
+    if (socket.destroyed || this.#closing !== undefined) return;
     let frame: Buffer;
     try {
       frame = encodeOperatorFrame(response);
