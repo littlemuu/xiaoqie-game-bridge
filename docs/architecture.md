@@ -248,7 +248,10 @@ placed in a rejection queue. Read-only resource counters expose tracked
 connections and timer/response work for bounded shutdown regression tests.
 Authenticated handlers are tracked separately; disconnect aborts their control
 operation, shutdown waits for their bounded settlement, and a destroyed socket
-or closing server cannot allocate late response work.
+or closing server cannot allocate late response work. The bridge also tracks
+every audit-sink promise. Operator shutdown performs a second bounded wait for
+audit idle, so a disconnected request's still-pending authorization remains
+observable and cannot become unowned background work.
 
 The CLI can issue only `status`, `stop`, or `resume --generation <n>`. Endpoint
 and token are read from the fixed descriptor and cannot be selected by CLI,
@@ -258,12 +261,14 @@ failure categories and never enters the bridge action protocol.
 
 Resume uses an abort-aware two-phase path. The bridge first verifies generation,
 stopped state, in-flight writes, and single-resume admission while leaving the
-latch closed. It waits for a `safety.resume.precommit.local` audit event whose
-metadata explicitly says `phase=precommit` and `resumed=false`; only its success
-within the operator handler deadline permits `SafetyLatch.resume()`. The bridge
-then submits the truthful `safety.resume.local` outcome after the latch is open.
-Deadline expiry, socket disconnect, or a later stop aborts the transaction;
-audit rejection or a late settlement cannot run the commit continuation.
+latch closed. It waits for a `safety.resume.authorization.local` audit event
+whose metadata names `phase=authorization` and the exact authorized generation.
+The event is the durable authority for that one transaction, not a claim that
+the latch already opened. Only sink acknowledgement within the operator handler
+deadline permits the synchronous `SafetyLatch.resume()` and success response;
+there is no untracked post-commit audit promise. Deadline expiry, socket
+disconnect, or a later stop aborts the transaction, and audit rejection or a
+late settlement cannot run the commit continuation.
 
 ## Deliberately absent
 

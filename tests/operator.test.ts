@@ -59,17 +59,27 @@ function deferred<T>(): Deferred<T> {
 
 class ControlledResumeAuditSink implements AuditSink {
   mode: "pass" | "pending" | "reject" = "pass";
+  legacyOutcomeMode: "pass" | "pending" | "reject" = "pass";
+  legacyOutcomeCalls = 0;
   readonly events: AuditEvent[] = [];
   readonly entered = deferred<void>();
   readonly #release = deferred<void>();
+  readonly #never = deferred<void>();
 
   async write(event: AuditEvent): Promise<void> {
-    if (event.action === "safety.resume.precommit.local") {
+    if (event.action === "safety.resume.authorization.local") {
       if (this.mode === "reject") throw new Error("fixture audit rejection");
       if (this.mode === "pending") {
         this.entered.resolve();
         await this.#release.promise;
       }
+    }
+    if (event.action === "safety.resume.local" && event.decision === "allow") {
+      this.legacyOutcomeCalls += 1;
+      if (this.legacyOutcomeMode === "reject") {
+        throw new Error("legacy outcome must not be required");
+      }
+      if (this.legacyOutcomeMode === "pending") await this.#never.promise;
     }
     this.events.push(event);
   }
@@ -277,23 +287,22 @@ describe.runIf(process.platform === "win32")("local operator control plane", () 
       ["safety.stop.local", "allow"],
       ["safety.stop.local", "allow"],
       ["safety.resume.local", "deny"],
-      ["safety.resume.precommit.local", "allow"],
-      ["safety.resume.local", "allow"],
+      ["safety.resume.authorization.local", "allow"],
       ["safety.resume.local", "deny"],
       ["safety.stop.local", "allow"],
       ["safety.resume.local", "deny"],
-      ["safety.resume.precommit.local", "allow"],
-      ["safety.resume.local", "allow"],
+      ["safety.resume.authorization.local", "allow"],
       ["safety.resume.local", "deny"],
     ]);
-    const successfulResumeOutcomes = audit.events.filter(
-      (event) => event.action === "safety.resume.local" && event.decision === "allow",
+    const durableResumeAuthorizations = audit.events.filter(
+      (event) =>
+        event.action === "safety.resume.authorization.local" && event.decision === "allow",
     );
-    expect(successfulResumeOutcomes).toHaveLength(2);
-    for (const event of successfulResumeOutcomes) {
+    expect(durableResumeAuthorizations).toHaveLength(2);
+    for (const event of durableResumeAuthorizations) {
       expect(event).toMatchObject({
-        safetyStopped: false,
-        metadata: { phase: "outcome", resumed: true },
+        safetyStopped: true,
+        metadata: { phase: "authorization" },
       });
     }
     const serialized = JSON.stringify(audit.events);
@@ -420,8 +429,9 @@ describe.runIf(process.platform === "win32")("local operator control plane", () 
     const safetyLatch = new SafetyLatch();
     const audit = new ControlledResumeAuditSink();
     const bridge = new GameBridge({ registry, safetyLatch, auditSink: audit });
+    const control = bridge.createLocalControlPlane();
     const stopped = safetyLatch.stop();
-    const server = await startLocalOperatorServer(bridge.createLocalControlPlane(), {
+    const server = await startLocalOperatorServer(control, {
       handlerTimeoutMs: 40,
     });
     servers.push(server);
@@ -433,11 +443,13 @@ describe.runIf(process.platform === "win32")("local operator control plane", () 
     });
     await audit.entered.promise;
     expectOperatorError(await timedOut, "TIMEOUT");
+    expect(control.getOutstandingAuditWrites()).toBe(1);
     expect(safetyLatch.status()).toMatchObject({ stopped: true, stopGeneration: 1 });
     expect(safetyLatch.beginWrite()).toMatchObject({ allowed: false, reason: "stopped" });
 
     audit.release();
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+    expect(control.getOutstandingAuditWrites()).toBe(0);
     expect(safetyLatch.status()).toMatchObject({ stopped: true, stopGeneration: 1 });
     expect(safetyLatch.beginWrite()).toMatchObject({ allowed: false, reason: "stopped" });
     expect(
@@ -447,21 +459,12 @@ describe.runIf(process.platform === "win32")("local operator control plane", () 
     ).toHaveLength(0);
     expect(audit.events).toContainEqual(
       expect.objectContaining({
-        action: "safety.resume.precommit.local",
+        action: "safety.resume.authorization.local",
         decision: "allow",
         safetyStopped: true,
-        metadata: expect.objectContaining({ phase: "precommit", resumed: false }),
-      }),
-    );
-    expect(audit.events).toContainEqual(
-      expect.objectContaining({
-        action: "safety.resume.local",
-        decision: "deny",
-        safetyStopped: true,
         metadata: expect.objectContaining({
-          phase: "outcome",
-          resumed: false,
-          reason: "aborted",
+          phase: "authorization",
+          authorizedGeneration: stopped.stopGeneration,
         }),
       }),
     );
@@ -478,13 +481,53 @@ describe.runIf(process.platform === "win32")("local operator control plane", () 
         (event) => event.action === "safety.resume.local" && event.decision === "allow",
       ),
     ).toHaveLength(0);
-    expect(audit.events).toContainEqual(
-      expect.objectContaining({
-        action: "safety.resume.local",
-        decision: "deny",
-        metadata: expect.objectContaining({ reason: "audit-failed" }),
-      }),
-    );
+  });
+
+  it("requires an acknowledged durable authorization without untracked outcome work", async () => {
+    for (const legacyOutcomeMode of ["reject", "pending"] as const) {
+      const registry = new AdapterRegistry();
+      registry.register(new MockGameAdapter());
+      const safetyLatch = new SafetyLatch();
+      const audit = new ControlledResumeAuditSink();
+      audit.mode = "pending";
+      audit.legacyOutcomeMode = legacyOutcomeMode;
+      const bridge = new GameBridge({ registry, safetyLatch, auditSink: audit });
+      const control = bridge.createLocalControlPlane();
+      const stopped = safetyLatch.stop();
+      const server = await startLocalOperatorServer(control, {
+        handlerTimeoutMs: 1_000,
+      });
+      servers.push(server);
+
+      const resume = callLocalOperator({
+        command: "resume",
+        generation: stopped.stopGeneration,
+      });
+      await audit.entered.promise;
+      expect(safetyLatch.status()).toMatchObject({ stopped: true });
+      expect(audit.events).toHaveLength(0);
+
+      audit.release();
+      expect(await resume).toMatchObject({
+        ok: true,
+        command: "resume",
+        status: { stopped: false, stopGeneration: stopped.stopGeneration },
+      });
+      expect(audit.legacyOutcomeCalls).toBe(0);
+      expect(control.getOutstandingAuditWrites()).toBe(0);
+      expect(audit.events).toEqual([
+        expect.objectContaining({
+          action: "safety.resume.authorization.local",
+          decision: "allow",
+          safetyStopped: true,
+          metadata: expect.objectContaining({
+            phase: "authorization",
+            authorizedGeneration: stopped.stopGeneration,
+          }),
+        }),
+      ]);
+      await server.close();
+    }
   });
 
   it("keeps a later repeated stop authoritative over an older pending resume", async () => {
@@ -525,13 +568,6 @@ describe.runIf(process.platform === "win32")("local operator control plane", () 
         (event) => event.action === "safety.resume.local" && event.decision === "allow",
       ),
     ).toHaveLength(0);
-    expect(audit.events).toContainEqual(
-      expect.objectContaining({
-        action: "safety.resume.local",
-        decision: "deny",
-        metadata: expect.objectContaining({ reason: "stop-superseded" }),
-      }),
-    );
   });
 
   it("does not create late response resources after disconnect and shutdown", async () => {
@@ -540,8 +576,9 @@ describe.runIf(process.platform === "win32")("local operator control plane", () 
     const safetyLatch = new SafetyLatch();
     const audit = new ControlledResumeAuditSink();
     const bridge = new GameBridge({ registry, safetyLatch, auditSink: audit });
+    const control = bridge.createLocalControlPlane();
     const initialStop = safetyLatch.stop();
-    const server = await startLocalOperatorServer(bridge.createLocalControlPlane(), {
+    const server = await startLocalOperatorServer(control, {
       closeTimeoutMs: 100,
     });
     servers.push(server);
@@ -560,6 +597,7 @@ describe.runIf(process.platform === "win32")("local operator control plane", () 
       ),
     );
     await audit.entered.promise;
+    expect(control.getOutstandingAuditWrites()).toBe(1);
 
     const disconnected = new Promise<void>((resolvePromise) => {
       socket.once("close", () => resolvePromise());
@@ -567,6 +605,7 @@ describe.runIf(process.platform === "win32")("local operator control plane", () 
     socket.destroy();
     await disconnected;
     await server.close();
+    expect(control.getOutstandingAuditWrites()).toBe(1);
     expect(server.inspectResourceUsage()).toEqual({
       trackedConnections: 0,
       readTimers: 0,
@@ -576,6 +615,7 @@ describe.runIf(process.platform === "win32")("local operator control plane", () 
 
     audit.release();
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+    expect(control.getOutstandingAuditWrites()).toBe(0);
     expect(server.inspectResourceUsage()).toEqual({
       trackedConnections: 0,
       readTimers: 0,
@@ -588,13 +628,6 @@ describe.runIf(process.platform === "win32")("local operator control plane", () 
         (event) => event.action === "safety.resume.local" && event.decision === "allow",
       ),
     ).toHaveLength(0);
-    expect(audit.events).toContainEqual(
-      expect.objectContaining({
-        action: "safety.resume.local",
-        decision: "deny",
-        metadata: expect.objectContaining({ reason: "aborted" }),
-      }),
-    );
   });
 
   it("keeps stop independent of full sessions, handler permits, adapter pending work, and writes", async () => {

@@ -26,11 +26,11 @@
   sharing the product bridge, safety latch, and audit sink
 - Fail-closed operator-before-MCP startup, bounded shutdown, and exact
   identity/digest-checked descriptor cleanup
-- Abort-aware explicit pre-commit resume audit: deadline, disconnect, audit
-  rejection, later stop, and late settlement all leave the latch stopped; only
-  a post-commit outcome may claim success
+- Abort-aware acknowledged resume authorization: one durable event authorizes
+  an exact generation before synchronous commit; deadline, disconnect, audit
+  rejection, later stop, and late settlement all leave the latch stopped
 - Immediate-destroy overflow admission with explicit socket/timer/response
-  counters, tracked handler settlement, and flood/late-shutdown regressions
+  counters, tracked handler/audit settlement, and flood/late-shutdown regressions
 - Injectable audit sink, hashed identifiers, and recursive credential redaction
 - Deterministic in-memory mock adapter with movement and block placement
 - Fixed process-backed product mock with strict versioned pipe IPC, static
@@ -100,8 +100,8 @@ Actual local results on 2026-08-31 with Node.js `v22.23.1` and npm `10.9.8`:
 - `npm ci` — passed; 73 packages installed, 74 audited, 0 vulnerabilities
 - `npm audit` — passed; 0 vulnerabilities
 - `npm run check` — passed
-- `npm test` — passed; 6 files and 73 tests. The original 5 files / 62 tests
-  remain green, plus 11 operator groups covering real Windows named pipes,
+- `npm test` — passed; 6 files and 74 tests. The original 5 files / 62 tests
+  remain green, plus 12 operator groups covering real Windows named pipes,
   built CLI/stdio shared state, generations, in-flight and capacity pressure,
   hostile frames/connections, startup collisions, and exact cleanup
 - Real stdio contract — passed inside `npm test`; official
@@ -129,8 +129,8 @@ and retained SYSTEM/Administrators entries. `AreAccessRulesProtected` was
 false, so this is explicitly not claimed as a custom user-exclusive DACL.
 
 The checked-in workflow has two coherent jobs: Ubuntu executes the 60
-platform-neutral tests while marking 13 Windows-only built-child/operator cases
-skipped, and `windows-latest` executes all 73 tests including real named-pipe,
+platform-neutral tests while marking 14 Windows-only built-child/operator cases
+skipped, and `windows-latest` executes all 74 tests including real named-pipe,
 CLI, and stdio-child evidence. Both jobs run check, test, demo, build, audit, and
 diff-check after `npm ci`.
 

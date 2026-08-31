@@ -176,15 +176,18 @@ not remote authentication and does not defend against malicious code already
 running as the same OS user or as administrator. No TCP fallback exists.
 
 Resume is transactional with respect to the operator deadline: the latch stays
-stopped while an explicitly named pre-commit audit event is pending, and the
-transition is committed only after that event succeeds while the request is
-still live. The pre-commit event records `resumed=false`; only the post-commit
-outcome can record a successful resume. Audit rejection, operator timeout,
-client disconnect, or a late audit continuation cannot open the latch. Every
+stopped while an explicitly named authorization audit event is pending. That
+event durably authorizes one exact stop generation but does not claim the latch
+already opened; only after its sink acknowledgement, while the transaction is
+still live, does the bridge synchronously commit and return success. There is no
+fire-and-forget success outcome. Audit rejection, operator timeout, client
+disconnect, or a late authorization continuation cannot open the latch. Every
 later stop invalidates an older pending resume even when the repeated stop keeps
 the same public generation. Connections beyond the fixed admission limit are
 destroyed immediately without allocating a response frame or close timer, and
-late handlers cannot add response work after disconnect or shutdown.
+late handlers cannot add response work after disconnect or shutdown. Every
+audit-sink promise is tracked; operator shutdown performs a bounded audit-idle
+wait, including authorization writes that outlive a disconnected request.
 
 CI has two explicit acceptance paths. Ubuntu runs the platform-neutral core and
 skips only Windows product-child/operator cases; `windows-latest` runs the full

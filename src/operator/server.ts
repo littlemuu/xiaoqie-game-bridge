@@ -307,6 +307,10 @@ export class LocalOperatorServer {
       Promise.allSettled([...this.#handlers]).then(() => undefined),
       this.#options.closeTimeoutMs,
     ).catch(() => undefined);
+    await bounded(
+      this.#control.waitForAuditIdle(),
+      this.#options.closeTimeoutMs,
+    ).catch(() => undefined);
     for (const timer of this.#readTimers) clearTimeout(timer);
     for (const timer of this.#closeTimers) clearTimeout(timer);
     this.#readTimers.clear();

@@ -451,8 +451,7 @@ describe("bounded cache and local safety hardening", () => {
     expect(localAudit.map((event) => [event.action, event.decision])).toEqual([
       ["safety.stop.local", "allow"],
       ["safety.resume.local", "deny"],
-      ["safety.resume.precommit.local", "allow"],
-      ["safety.resume.local", "allow"],
+      ["safety.resume.authorization.local", "allow"],
     ]);
     expect(JSON.stringify(localAudit)).not.toContain(sessionId);
   });

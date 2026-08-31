@@ -174,10 +174,13 @@ on deadline or client disconnect; audit rejection and late settlement leave
 `stopped=true`. Concurrent resume admission is singular and excess attempts are
 denied as capacity. A later stop aborts every older pending resume transaction,
 including a repeated stop that intentionally preserves `stopGeneration`. The
-awaited event is explicitly a pre-commit attempt with `resumed=false`; only a
-post-commit event may claim resume success, so a late pre-commit settlement is
-not a false outcome. This avoids a failure response paired with an already-open
-write gate or a successful stop later being undone by older work.
+awaited event is explicitly a durable authorization for one exact generation,
+not a claim that resume already completed. A success response is possible only
+after that authorization is acknowledged and the still-live transaction commits
+synchronously; no fire-and-forget success audit can be lost or remain pending.
+A late authorization settlement is therefore not a false completion outcome.
+This avoids a failure response paired with an already-open write gate or a
+successful stop later being undone by older work.
 
 The latch does not claim forced cancellation. An asynchronous action that
 passed `beginWrite()` and entered the worker may complete after stop or client
@@ -208,7 +211,10 @@ above the configured admission limit. Pending authenticated handlers are also
 tracked: disconnect aborts their work, shutdown performs a bounded wait, and
 destroyed/closing sockets are rejected before response encoding or timer
 allocation. A pending-audit disconnect/shutdown regression releases the audit
-late and proves all four public resource counters remain zero.
+late and proves all four public resource counters remain zero. Audit promises
+have a separate tracked count; shutdown waits for audit idle within its fixed
+deadline, and the regression proves the count remains visible until late
+settlement and then returns to zero.
 
 ## Residual risks before a real adapter
 
