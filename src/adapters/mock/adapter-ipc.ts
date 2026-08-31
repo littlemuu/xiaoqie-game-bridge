@@ -14,6 +14,11 @@ export const ADAPTER_IPC_MAX_PENDING_CALLS = 8;
 export const ADAPTER_IPC_HANDSHAKE_TIMEOUT_MS = 2_000;
 export const ADAPTER_IPC_CALL_TIMEOUT_MS = 2_000;
 export const ADAPTER_IPC_CLOSE_TIMEOUT_MS = 1_000;
+export const CONTAINMENT_ATTESTATION_VERSION = 1 as const;
+export const CONTAINMENT_ACTIVE_PROCESS_LIMIT = 1 as const;
+export const CONTAINMENT_PROCESS_MEMORY_LIMIT_BYTES = 256 * 1_024 * 1_024;
+export const CONTAINMENT_JOB_MEMORY_LIMIT_BYTES = 192 * 1_024 * 1_024;
+export const CONTAINMENT_CPU_RATE_PERCENT = 20 as const;
 
 export const MOCK_ADAPTER_IDENTITY = Object.freeze({
   id: "mock-world",
@@ -32,6 +37,37 @@ const identitySchema = z
   })
   .strict();
 const callIdSchema = z.string().regex(/^call-[1-9][0-9]{0,15}$/);
+
+export const containmentReadySchema = z
+  .object({
+    version: z.literal(CONTAINMENT_ATTESTATION_VERSION),
+    type: z.literal("containment-ready"),
+    attestation: z
+      .object({
+        tokenRestricted: z.literal(true),
+        dangerousPrivilegesDisabled: z.literal(true),
+        privilegedGroupsDisabledOrDenyOnly: z.literal(true),
+        restrictingSidPolicy: z.literal("source-user-and-enabled-groups"),
+        integrity: z.enum(["low", "medium"]),
+        jobAssigned: z.literal(true),
+        killOnClose: z.literal(true),
+        activeProcessLimit: z.literal(CONTAINMENT_ACTIVE_PROCESS_LIMIT),
+        processMemoryLimitBytes: z.literal(CONTAINMENT_PROCESS_MEMORY_LIMIT_BYTES),
+        jobMemoryLimitBytes: z.literal(CONTAINMENT_JOB_MEMORY_LIMIT_BYTES),
+        cpuRatePercent: z.literal(CONTAINMENT_CPU_RATE_PERCENT),
+        breakawayAllowed: z.literal(false),
+        hostJob: z.enum(["nested", "none"]),
+      })
+      .strict(),
+  })
+  .strict();
+export const containmentFaultSchema = z
+  .object({
+    version: z.literal(CONTAINMENT_ATTESTATION_VERSION),
+    type: z.literal("containment-fault"),
+    category: z.enum(["memory-limit", "process-limit"]),
+  })
+  .strict();
 
 export const adapterReadySchema = baseSchema
   .extend({ type: z.literal("ready"), adapter: identitySchema })
@@ -108,6 +144,8 @@ export const adapterParentMessageSchema = z.union([
   adapterShutdownSchema,
 ]);
 export const adapterWorkerMessageSchema = z.union([
+  containmentReadySchema,
+  containmentFaultSchema,
   adapterReadySchema,
   adapterResultSchema,
   adapterShutdownCompleteSchema,
@@ -115,6 +153,7 @@ export const adapterWorkerMessageSchema = z.union([
 
 export type AdapterCall = z.infer<typeof adapterCallSchema>;
 export type AdapterWorkerMessage = z.infer<typeof adapterWorkerMessageSchema>;
+export type ContainmentAttestation = z.infer<typeof containmentReadySchema>["attestation"];
 
 export function encodeAdapterFrame(message: unknown): Buffer {
   const payload = Buffer.from(JSON.stringify(message), "utf8");

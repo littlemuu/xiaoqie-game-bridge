@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ZodType } from "zod";
 import {
@@ -22,6 +22,7 @@ import {
   ADAPTER_IPC_MAX_MESSAGE_BYTES,
   ADAPTER_IPC_MAX_PENDING_CALLS,
   ADAPTER_IPC_VERSION,
+  type ContainmentAttestation,
   MOCK_ADAPTER_IDENTITY,
   adapterWorkerMessageSchema,
   encodeAdapterFrame,
@@ -31,6 +32,7 @@ import {
 export type AdapterRunnerFailure =
   | "capacity"
   | "closed"
+  | "containment"
   | "handshake"
   | "protocol"
   | "timeout"
@@ -67,8 +69,18 @@ export interface ProcessMockAdapterOptions {
   maxPendingCalls?: number;
   testOnly?: {
     faultMode: AdapterWorkerFaultMode;
+    containmentFaultStage?: ContainmentFaultStage;
   };
 }
+
+export type ContainmentFaultStage =
+  | "none"
+  | "job"
+  | "token"
+  | "create"
+  | "assign"
+  | "attestation"
+  | "resume";
 
 interface PendingCall {
   resolve(value: unknown): void;
@@ -88,21 +100,36 @@ const FIXED_FAULT_WORKER_PATH = fileURLToPath(
     ? new URL("../../../dist/tests/fixtures/fault-adapter-worker.js", import.meta.url)
     : new URL("../../../tests/fixtures/fault-adapter-worker.js", import.meta.url),
 );
+const NATIVE_DIRECTORY = fileURLToPath(
+  import.meta.url.endsWith(".ts")
+    ? new URL("../../../dist/native/", import.meta.url)
+    : new URL("../../../native/", import.meta.url),
+);
+const PRODUCT_LAUNCHER_PATH = join(NATIVE_DIRECTORY, "xiaoqie-worker-launcher.exe");
+const TEST_LAUNCHER_PATH = join(NATIVE_DIRECTORY, "xiaoqie-worker-test-launcher.exe");
+
+function isContainmentLauncherExit(code: number | null): boolean {
+  return code !== null && code >= 40 && code <= 47;
+}
 
 export function fixedWorkerLaunchSpec(options: ProcessMockAdapterOptions = {}) {
   const workerPath = options.testOnly === undefined
     ? DEFAULT_WORKER_PATH
     : FIXED_FAULT_WORKER_PATH;
+  const launcherPath = options.testOnly === undefined
+    ? PRODUCT_LAUNCHER_PATH
+    : TEST_LAUNCHER_PATH;
   return Object.freeze({
-    executable: process.execPath,
-    argv: Object.freeze([workerPath]),
-    cwd: dirname(workerPath),
-    env: Object.freeze({
-      XIAOQIE_ADAPTER_WORKER: "mock-v1",
+    executable: launcherPath,
+    argv: Object.freeze([
+      process.execPath,
+      workerPath,
       ...(options.testOnly === undefined
-        ? {}
-        : { XIAOQIE_TEST_MODE: options.testOnly.faultMode }),
-    }),
+        ? []
+        : [options.testOnly.faultMode, options.testOnly.containmentFaultStage ?? "none"]),
+    ]),
+    cwd: dirname(workerPath),
+    env: Object.freeze({}),
     shell: false as const,
   });
 }
@@ -134,6 +161,7 @@ export class ProcessMockAdapter implements GameAdapter {
   #forcedClose = false;
   #shutdownAcknowledged = false;
   #terminationRequested = false;
+  #containmentAttestation: ContainmentAttestation | undefined;
 
   constructor(options: ProcessMockAdapterOptions = {}) {
     this.#options = {
@@ -150,23 +178,33 @@ export class ProcessMockAdapter implements GameAdapter {
     if (this.#state === "starting") return this.#startup;
     if (this.#state !== "idle") throw new AdapterRunnerError("closed");
 
+    if (process.platform !== "win32") throw new AdapterRunnerError("containment");
     this.#state = "starting";
     const spec = fixedWorkerLaunchSpec(this.#options);
     this.#startup = new Promise<void>((resolve, reject) => {
       this.#startupResolve = resolve;
       this.#startupReject = reject;
     });
-    this.#startupTimer = setTimeout(() => this.#fail("handshake"), this.#options.handshakeTimeoutMs);
-    const child = spawn(spec.executable, spec.argv, {
-      cwd: spec.cwd,
-      env: spec.env,
-      shell: spec.shell,
-      windowsHide: true,
-      stdio: ["pipe", "pipe", "ignore"],
-    });
+    this.#startupTimer = setTimeout(
+      () => this.#fail(this.#containmentAttestation === undefined ? "containment" : "handshake"),
+      this.#options.handshakeTimeoutMs,
+    );
+    let child: ChildProcess;
+    try {
+      child = spawn(spec.executable, spec.argv, {
+        cwd: spec.cwd,
+        env: spec.env,
+        shell: spec.shell,
+        windowsHide: true,
+        stdio: ["pipe", "pipe", "ignore"],
+      });
+    } catch {
+      this.#fail("containment");
+      return this.#startup;
+    }
     this.#child = child;
     child.stdout!.on("data", (chunk: Buffer) => this.#consume(chunk));
-    child.once("error", () => this.#fail("worker-exit"));
+    child.once("error", () => this.#fail("containment"));
     child.once("close", (code) => this.#onProcessClose(code));
     return this.#startup;
   }
@@ -239,8 +277,10 @@ export class ProcessMockAdapter implements GameAdapter {
     return this.#pending.size;
   }
 
-  get workerPid(): number | undefined {
-    return this.#child?.pid;
+  get containmentAttestation(): Readonly<ContainmentAttestation> | undefined {
+    return this.#containmentAttestation === undefined
+      ? undefined
+      : Object.freeze({ ...this.#containmentAttestation });
   }
 
   async #call(call: Record<string, unknown>, resultSchema: ZodType<unknown>): Promise<unknown> {
@@ -317,19 +357,39 @@ export class ProcessMockAdapter implements GameAdapter {
     }
     const parsed = adapterWorkerMessageSchema.safeParse(raw);
     if (!parsed.success) {
-      this.#fail(this.#state === "starting" ? "handshake" : "protocol");
+      const isContainmentFrame =
+        typeof raw === "object" && raw !== null &&
+        "type" in raw && raw.type === "containment-ready";
+      this.#fail(
+        this.#state === "starting"
+          ? isContainmentFrame ? "containment" : "handshake"
+          : "protocol",
+      );
       return;
     }
     this.#handleMessage(parsed.data);
   }
 
   #handleMessage(message: AdapterWorkerMessage): void {
+    if (message.type === "containment-ready") {
+      if (this.#state !== "starting" || this.#containmentAttestation !== undefined) {
+        this.#fail("containment");
+        return;
+      }
+      this.#containmentAttestation = Object.freeze({ ...message.attestation });
+      return;
+    }
+    if (message.type === "containment-fault") {
+      this.#fail("containment");
+      return;
+    }
     if (message.type === "ready") {
       if (
         this.#state !== "starting" ||
+        this.#containmentAttestation === undefined ||
         JSON.stringify(message.adapter) !== JSON.stringify(MOCK_ADAPTER_IDENTITY)
       ) {
-        this.#fail("handshake");
+        this.#fail(this.#containmentAttestation === undefined ? "containment" : "handshake");
         return;
       }
       this.#state = "running";
@@ -392,7 +452,11 @@ export class ProcessMockAdapter implements GameAdapter {
       return;
     }
     if (this.#state === "failed") return;
-    this.#fail("worker-exit");
+    this.#fail(
+      isContainmentLauncherExit(code) || this.#containmentAttestation === undefined
+        ? "containment"
+        : "worker-exit",
+    );
   }
 
   #fail(category: AdapterRunnerFailure): void {
