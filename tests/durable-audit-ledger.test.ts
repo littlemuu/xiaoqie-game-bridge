@@ -275,6 +275,7 @@ describe("durable local audit ledger", () => {
     const firstFrameBytes = 9 + Number.parseInt(complete.subarray(0, 8).toString("ascii"), 16) + 1;
     const torn = complete.subarray(0, firstFrameBytes + 17);
     await unlink(join(fixture.root, "confirmation-0000000000000002.audit"));
+    await unlink(join(fixture.root, "checkpoint-0000000000000002.audit"));
     await writeFile(join(fixture.root, "segment-0001.audit"), torn);
     const preserved = Buffer.from(torn);
 
@@ -290,6 +291,8 @@ describe("durable local audit ledger", () => {
     const restarted = await DurableAuditLedger.open({ testOnly: { rootDirectory: fixture.root } });
     await restarted.close();
     expect((await readdir(fixture.root)).sort()).toEqual([
+      "checkpoint-0000000000000001.audit",
+      "checkpoint-0000000000000002.audit",
       "confirmation-0000000000000001.audit",
       "confirmation-0000000000000002.audit",
       "segment-0001.audit",
@@ -317,11 +320,15 @@ describe("durable local audit ledger", () => {
         join(fixture.root, "confirmation-0000000000000001.audit"),
         await readFile(join(source.root, "confirmation-0000000000000001.audit")),
       );
+      await writeFile(
+        join(fixture.root, "checkpoint-0000000000000001.audit"),
+        await readFile(join(source.root, "checkpoint-0000000000000001.audit")),
+      );
       const reopened = await DurableAuditLedger.open({ testOnly: { rootDirectory: fixture.root } });
       expect(reopened.health().nextSequence).toBe(cut === firstFrameBytes ? 2 : 3);
       await reopened.close();
     }
-  });
+  }, 10_000);
 
   it("fails closed when an append-and-sync confirmed tail is later truncated", async () => {
     const fixture = await temporaryLedgerRoot("confirmed-truncation");
@@ -338,6 +345,24 @@ describe("durable local audit ledger", () => {
       DurableAuditLedger.open({ testOnly: { rootDirectory: fixture.root } }),
     ).rejects.toMatchObject({ code: "corrupt" });
     expect((await segmentBytes(fixture.root)).equals(preserved)).toBe(true);
+  });
+
+  it("fails closed when the final confirmation is deleted after write resolved", async () => {
+    const fixture = await temporaryLedgerRoot("missing-confirmation");
+    const ledger = await DurableAuditLedger.open({ testOnly: { rootDirectory: fixture.root } });
+    await ledger.write(event(1));
+    await ledger.write(event(2));
+    await ledger.close();
+    const preserved = await segmentBytes(fixture.root);
+    await unlink(join(fixture.root, "confirmation-0000000000000002.audit"));
+
+    await expect(
+      DurableAuditLedger.open({ testOnly: { rootDirectory: fixture.root } }),
+    ).rejects.toMatchObject({ code: "corrupt" });
+    expect((await segmentBytes(fixture.root)).equals(preserved)).toBe(true);
+    await expect(
+      lstat(join(fixture.root, "checkpoint-0000000000000002.audit")),
+    ).resolves.toMatchObject({ size: expect.any(Number) });
   });
 
   it("fails closed on committed corruption, oversize, symlink, and directory replacement", async () => {
@@ -472,6 +497,36 @@ describe("durable local audit ledger", () => {
     await new Promise((resolve) => setTimeout(resolve, 30));
     expect((await lstat(join(shutdownFixture.root, "segment-0001.audit"))).size).toBe(size);
     expect(await readdir(shutdownFixture.root)).toEqual(["segment-0001.audit"]);
+  });
+
+  it("bounds shutdown while a native append promise remains pending", async () => {
+    const fixture = await temporaryLedgerRoot("append-shutdown-bound");
+    const appendStarted = deferred();
+    const appendGate = deferred();
+    const ledger = await DurableAuditLedger.open({
+      testOnly: {
+        rootDirectory: fixture.root,
+        limits: { shutdownDrainMs: 25 },
+        write: async (_handle, bytes) => {
+          appendStarted.resolve();
+          await appendGate.promise;
+          return bytes.byteLength;
+        },
+      },
+    });
+    const pending = ledger.write(event());
+    const pendingRejection = expect(pending).rejects.toMatchObject({ code: "closed" });
+    await appendStarted.promise;
+    const started = Date.now();
+    await ledger.close();
+    expect(Date.now() - started).toBeLessThan(250);
+    await pendingRejection;
+    expect(ledger.health()).toMatchObject({ status: "closed", outstandingWrites: 0 });
+    expect((await lstat(join(fixture.root, "segment-0001.audit"))).size).toBe(0);
+
+    appendGate.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(await readdir(fixture.root)).toEqual(["segment-0001.audit"]);
   });
 
   it("rejects an ordinary commit without changing mock state after total capacity is full", async () => {

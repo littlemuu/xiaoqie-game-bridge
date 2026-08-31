@@ -33,16 +33,17 @@
   counters, tracked handler/audit settlement, and flood/late-shutdown regressions
 - Injectable audit sink, hashed identifiers, and recursive credential redaction
 - Product `DurableAuditLedger` with canonical version-1 frames, monotonic
-  SHA-256 chain, append/data-sync plus strict per-record confirmation-file sync,
-  fixed application-owned directory, strict object identity checks, and
-  minimal health counters
+  SHA-256 chain, append/data-sync plus strict per-record confirmation and
+  independent checkpoint-file syncs, fixed application-owned directory,
+  strict object identity checks, and minimal health counters
 - Conservative torn-tail recovery that preserves original bytes, appends one
   bounded recovery marker in a new segment, and remains idempotent on restart
 - Hard audit limits: 4 KiB record, 8 pending writes, 64 KiB segment, 8 segments,
-  2,048 confirmations, and 500 ms shutdown drain; no eviction, retry loop,
-  upload, or background job
+  2,048 confirmations, 2,048 checkpoints, and 500 ms shutdown drain; no
+  eviction, retry loop, upload, or background job
 - Worst-case physical-byte reservation before ordinary state changes; confirmed
-  tail loss fails closed, while only bytes lacking confirmation are recoverable
+  tail/evidence loss fails closed, while only bytes lacking both evidence files
+  are recoverable
 - No generic persistent metadata: undeclared paths, game state, inputs, outputs,
   and regex/blocklist evasions have no ledger field
 - Deterministic in-memory mock adapter with movement and block placement
@@ -118,8 +119,8 @@ Actual local results on 2026-08-31 with Node.js `v22.23.1` and npm `10.9.8`:
 - `npm ci` — passed; 73 packages installed, 74 audited, 0 vulnerabilities
 - `npm audit` — passed; 0 vulnerabilities
 - `npm run check` — passed
-- `npm test` — passed; 7 files and 89 tests. All prior 74 tests remain green,
-  plus 14 durable-ledger groups and one corrupt-product-startup regression
+- `npm test` — passed; 7 files and 91 tests. All prior 74 tests remain green,
+  plus 16 durable-ledger groups and one corrupt-product-startup regression
   covering deterministic records, recursive leakage resistance, strict serial
   chains, all final-frame byte truncation points, committed corruption,
   identity/symlink faults, recovery idempotence, hard capacity, atomic commit
@@ -153,9 +154,9 @@ root was path-checked and removed (`TEMP_EVIDENCE_CLEANED=True`). These inherite
 ACLs and Node mode requests are explicitly not claimed as a custom
 user-exclusive DACL or hostile same-user isolation.
 
-The checked-in workflow has two coherent jobs: Ubuntu executes the 74
+The checked-in workflow has two coherent jobs: Ubuntu executes the 76
 platform-neutral tests while marking 15 Windows-only built-child/operator cases
-skipped, and `windows-latest` executes all 89 tests including real named-pipe,
+skipped, and `windows-latest` executes all 91 tests including real named-pipe,
 CLI, and stdio-child evidence. Both jobs run check, test, demo, build, audit, and
 diff-check after `npm ci`.
 
@@ -199,7 +200,7 @@ configuration was accessed. GitHub-hosted CI status is recorded in the Draft PR.
   to bypass hardware caches or survive every physical power-loss model.
 - A shutdown deadline cannot cancel a native OS operation already pending, but
   the application stops awaiting/reusing the handle and forbids every later
-  append/confirmation continuation. The native operation's only later
+  append/confirmation/checkpoint continuation. The native operation's only later
   continuation closes the handle when it settles; process exit is the fallback.
 - A forced Windows process kill can leave a stale descriptor. Restart then
   fails closed and preserves it; normal EOF/error/close paths clean up, and no

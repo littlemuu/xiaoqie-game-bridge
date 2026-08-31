@@ -86,8 +86,8 @@ The defaults are intentionally finite:
 - 256 idempotency entries per session
 - 4 concurrent commit writes across the bridge
 - 4 KiB per audit record, 8 pending audit writes, 64 KiB per segment,
-  8 segments total, 2,048 confirmation markers, and a 500 ms ledger
-  shutdown-drain deadline
+  8 segments total, 2,048 confirmation markers, 2,048 independent checkpoints,
+  and a 500 ms ledger shutdown-drain deadline
 
 Configure the first three through `SessionManagerOptions` (`maxSessions`,
 `terminalRetentionMs`, and `maxRequestsPerSession`). Configure the write gate
@@ -168,20 +168,24 @@ canonical JSON payload, newline frame terminator, monotonic sequence, previous
 record digest, and its own SHA-256 digest. The ledger persists no generic event
 metadata; only the declared top-level event fields and strict recovery payload
 exist. After syncing the data frame, it exclusively creates and syncs a strict
-per-sequence confirmation marker. A successful `AuditSink.write()` means both
-operations resolved. This is the strongest acknowledgement used here, but it
-does not bypass OS or device caches and is not a guarantee for every power-loss
-model.
+per-sequence confirmation marker, then exclusively creates and syncs a matching
+checkpoint. A successful `AuditSink.write()` means all three operations
+resolved. The duplicate evidence makes deletion of either final auxiliary file
+detectable by the other. This is the strongest acknowledgement used here, but
+it does not bypass OS or device caches and is not a guarantee for every
+power-loss model.
 
-On startup, every owned segment, confirmation marker, frame, schema, sequence,
-and digest link is validated before operator or MCP commits are admitted. A
-partial or complete tail without a confirmation marker is provably
+On startup, every owned segment, confirmation, checkpoint, frame, schema,
+sequence, and digest link is validated before operator or MCP commits are
+admitted. The confirmation and checkpoint sets must be identical and contiguous.
+A partial or complete tail with neither form of evidence is provably
 unacknowledged: it is preserved in place, startup moves to the next fixed
-segment, and syncs one bounded recovery record plus confirmation. Reopening
-that history is idempotent. A missing/truncated frame that still has its synced
-confirmation is committed-history loss and fails closed. Unknown versions,
-other committed-region corruption, illegal sizes/order, unexpected objects,
-and identity changes also fail startup closed without rewriting evidence.
+segment, and syncs one bounded recovery record plus both evidence files.
+Reopening that history is idempotent. Missing/mismatched confirmation,
+checkpoint, or committed frame is committed-history loss and fails closed.
+Unknown versions, other committed-region corruption, illegal sizes/order,
+unexpected objects, and identity changes also fail startup closed without
+rewriting evidence.
 At the eight-segment hard limit, history is not evicted: new ordinary commits
 and resume fail closed. Emergency stop still closes the latch first and only
 then attempts audit, so audit rejection/full state can fail the command result
@@ -197,10 +201,11 @@ secret, and there is no MCP/CLI log reader or arbitrary file API.
 Reservations conservatively hold one maximum-size record of remaining physical
 segment capacity before a state-changing operation begins, including rotation
 fragmentation. On shutdown, the 500 ms deadline aborts application continuations
-waiting on append/sync. If an OS file operation itself remains pending, close
-returns without later confirmation, retry, or write. Its only later continuation
-closes the handle when the native operation settles; process exit is the fallback,
-and startup treats any unconfirmed bytes conservatively.
+waiting on native segment/evidence writes or syncs. If an OS file operation
+itself remains pending, close returns without later confirmation, checkpoint,
+retry, or write. Its only later continuation closes the handle when the native
+operation settles; process exit is the fallback, and startup treats any bytes
+without either evidence file conservatively.
 
 ## Local operator CLI (Windows)
 

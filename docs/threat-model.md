@@ -107,17 +107,18 @@ write a fixed message to stderr without embedding the received frame or error.
 The product sink is a fixed-directory, append-only, bounded local ledger rather
 than process memory. Each strict versioned frame carries a monotonic sequence,
 previous-record digest, and current digest over canonical bytes. Writes are
-serialized and do not acknowledge until the complete append/data sync plus an
-exclusive strict per-sequence confirmation-file sync resolve. Startup verifies
-the whole owned frame/confirmation chain before operator/MCP commit admission.
-A partial or complete tail without confirmation is provably unacknowledged and
-is retained/continued only through one bounded recovery marker in a new
-segment. A confirmation whose committed frame is missing or shortened, plus
-checksum/schema/order failures, unexpected objects, and object-identity changes,
-fails startup closed without repair.
+serialized and do not acknowledge until the complete append/data sync plus
+exclusive strict per-sequence confirmation and matching checkpoint file syncs
+resolve. Startup verifies identical contiguous evidence sets and the whole
+owned frame chain before operator/MCP commit admission. A partial or complete
+tail with neither evidence file is provably unacknowledged and is retained/
+continued only through one bounded recovery record in a new segment. Missing
+or mismatched evidence, a missing/shortened committed frame, checksum/schema/
+order failures, unexpected objects, and object-identity changes fail startup
+closed without repair.
 
 Limits are 4 KiB per record, 8 outstanding writes, 64 KiB per segment, 8
-segments, 2,048 confirmations, and 500 ms for ledger shutdown drain. A commit
+segments, 2,048 confirmations, 2,048 checkpoints, and 500 ms for ledger shutdown drain. A commit
 reservation holds a worst-case record's physical bytes before side effects,
 including rotation fragmentation. There is no eviction, deletion,
 retry loop, retention timer, upload, database, or remote log service. At the
@@ -139,12 +140,12 @@ rewrite both data and digests or remove a complete tail; this design is not
 tamper-proof. Likewise, Node/OS `sync()` acknowledgement does not bypass
 hardware caches or guarantee every physical power-loss model.
 
-When shutdown reaches its deadline, append/sync continuations reject and no
-later frame or confirmation write can run. Node cannot forcibly cancel an OS
-file operation already pending; the ledger stops awaiting/reusing that handle.
+When shutdown reaches its deadline, native segment/evidence write and sync
+continuations reject and no later frame, confirmation, or checkpoint write can
+run. Node cannot forcibly cancel an OS file operation already pending; the ledger stops awaiting/reusing that handle.
 When the operation settles, its only continuation closes the handle, with
-process exit as fallback; bytes lacking confirmation remain unacknowledged on
-restart.
+process exit as fallback; bytes lacking both evidence files remain
+unacknowledged on restart.
 
 ### Adapter exceeds its authority
 

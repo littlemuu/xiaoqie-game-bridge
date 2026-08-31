@@ -234,8 +234,8 @@ writes. State-changing session/game operations atomically reserve one queue
 slot and one worst-case 4 KiB frame of physical segment capacity before
 adapter/session side effects. Reservation simulates rotation and fragmentation,
 so concurrent callers cannot pass a stale byte-capacity check. A frame is at
-most 4 KiB, a segment at most 64 KiB, there are at most 8 segments, and at most
-2,048 fixed confirmation files. When a frame would cross a segment boundary, a
+most 4 KiB, a segment at most 64 KiB, there are at most 8 segments, at most
+2,048 fixed confirmation files, and 2,048 matching checkpoint files. When a frame would cross a segment boundary, a
 new fixed-name segment is exclusively created after identity checks. Once
 conservative physical capacity is unavailable, the ledger reports `full`,
 performs no eviction, and refuses ordinary commit/resume admission. The internal health snapshot is closed-world:
@@ -243,26 +243,27 @@ performs no eviction, and refuses ordinary commit/resume admission. The internal
 sequence counters. It is not exposed as an MCP log or file resource.
 
 `write()` first appends and syncs the full data frame. It then exclusively
-creates a strict `confirmation-NNNNNNNNNNNNNNNN.audit` file containing only
-version, sequence, digest, segment, and frame-end offset, and syncs that file.
-Only then does `write()` resolve. This distinguishes enqueue, data append,
-data sync, and persistent acknowledgement. It does not claim to flush
-controller or device caches outside the OS contract or survive every physical
-power-loss model. Append/sync/confirmation/object failures disable further
-writes in that instance.
+creates and syncs a strict `confirmation-NNNNNNNNNNNNNNNN.audit`, followed by a
+matching `checkpoint-NNNNNNNNNNNNNNNN.audit`; each contains only version,
+sequence, digest, segment, and frame-end offset. Only then does `write()`
+resolve. Either auxiliary file independently exposes deletion of the other.
+This distinguishes enqueue, data append, data sync, and persistent
+acknowledgement. It does not claim to flush controller or device caches outside
+the OS contract or survive every physical power-loss model. Append/sync/
+evidence/object failures disable further writes in that instance.
 
-Startup pairs frames with the contiguous strict confirmation set and replays
-only confirmed sequence/digest links before constructing operator or MCP commit
-surfaces. A final partial or complete frame without a confirmation is proven
-unacknowledged: its bytes and segment stay unchanged, the next available
-segment is exclusively created, and one synced recovery record/confirmation
-names only the bounded source segment numbers and last confirmed sequence. A
-later restart recognizes that marker and does not create another. If a
-confirmation exists but its frame is missing, shortened, moved, or mismatched,
-startup treats it as committed-history loss and fails closed. Unknown versions,
-invalid canonical bytes/sizes/schema, sequence or digest breaks, unexpected
-objects, and identity changes likewise fail closed; evidence is not repaired
-or rewritten.
+Startup requires identical contiguous confirmation/checkpoint sets, pairs both
+with every committed frame, and replays only those sequence/digest links before
+constructing operator or MCP commit surfaces. A final partial or complete frame
+with neither evidence file is proven unacknowledged: its bytes and segment stay
+unchanged, the next available segment is exclusively created, and one synced
+recovery record plus both evidence files name only the bounded source segments
+and last confirmed sequence. A later restart recognizes that record and does
+not create another. Missing or mismatched evidence, or a missing, shortened,
+moved, or mismatched committed frame, is committed-history loss and fails
+closed. Unknown versions, invalid canonical bytes/sizes/schema, sequence or
+digest breaks, unexpected objects, and identity changes likewise fail closed;
+evidence is not repaired or rewritten.
 
 The digest chain detects accidental corruption, internal truncation/torn
 writes, and ordering faults within the trusted same-user model. It has neither
@@ -271,12 +272,12 @@ against hostile same-user, administrator, or offline-disk rewriting, including
 a coordinated rewrite of records and digests.
 
 Shutdown first stops new ledger admission and drains the serial tail for at
-most 500 ms. Append and sync continuations race the same abort signal. When the
-deadline fires, tracked application promises reject promptly and no later
-confirmation, append, retry, or background retention action can run. A native
+most 500 ms. Native segment/evidence writes and sync continuations race the same
+abort signal. When the deadline fires, tracked application promises reject
+promptly and no later confirmation, checkpoint, append, retry, or background retention action can run. A native
 OS operation already pending cannot be forcibly cancelled by Node; close does
 not await or reuse that handle. When it settles, its only continuation closes
-the handle, with process exit as fallback; any bytes without a confirmation
+the handle, with process exit as fallback; bytes without either evidence file
 remain unacknowledged recovery input on restart.
 
 ## Bounded lifetime and control-plane behavior
