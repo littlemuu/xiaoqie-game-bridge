@@ -4,6 +4,7 @@ export interface SafetyStatus {
   stopped: boolean;
   inFlightWrites: number;
   maxInFlightWrites: number;
+  stopGeneration: number;
 }
 
 export type BeginWriteResult =
@@ -14,11 +15,18 @@ export interface SafetyLatchOptions {
   maxInFlightWrites?: number;
 }
 
+export type SafetyResumeFailureReason =
+  | "generation-mismatch"
+  | "not-stopped"
+  | "resume-pending"
+  | "stop-superseded"
+  | "writes-in-flight";
+
 export type SafetyResumeResult =
   | (SafetyStatus & { resumed: true })
   | (SafetyStatus & {
       resumed: false;
-      reason: "writes-in-flight" | "not-stopped";
+      reason: SafetyResumeFailureReason;
     });
 
 function requirePositiveInteger(value: number): void {
@@ -30,6 +38,7 @@ function requirePositiveInteger(value: number): void {
 export class SafetyLatch {
   #stopped = false;
   #inFlightWrites = 0;
+  #stopGeneration = 0;
   readonly #maxInFlightWrites: number;
 
   constructor(options: SafetyLatchOptions = {}) {
@@ -44,6 +53,9 @@ export class SafetyLatch {
 
   stop(): SafetyStatus & { stopped: true; alreadyStopped: boolean } {
     const alreadyStopped = this.#stopped;
+    if (!alreadyStopped) {
+      this.#stopGeneration += 1;
+    }
     this.#stopped = true;
     return { ...this.status(), stopped: true, alreadyStopped };
   }
@@ -53,15 +65,33 @@ export class SafetyLatch {
       stopped: this.#stopped,
       inFlightWrites: this.#inFlightWrites,
       maxInFlightWrites: this.#maxInFlightWrites,
+      stopGeneration: this.#stopGeneration,
     };
   }
 
-  resume(): SafetyResumeResult {
-    if (this.#inFlightWrites > 0) {
-      return { ...this.status(), resumed: false, reason: "writes-in-flight" };
-    }
+  resumeBlockReason(
+    expectedGeneration: number,
+  ): Exclude<SafetyResumeFailureReason, "resume-pending" | "stop-superseded"> | undefined {
     if (!this.#stopped) {
-      return { ...this.status(), resumed: false, reason: "not-stopped" };
+      return "not-stopped";
+    }
+    if (
+      !Number.isSafeInteger(expectedGeneration) ||
+      expectedGeneration < 1 ||
+      expectedGeneration !== this.#stopGeneration
+    ) {
+      return "generation-mismatch";
+    }
+    if (this.#inFlightWrites > 0) {
+      return "writes-in-flight";
+    }
+    return undefined;
+  }
+
+  resume(expectedGeneration: number): SafetyResumeResult {
+    const reason = this.resumeBlockReason(expectedGeneration);
+    if (reason !== undefined) {
+      return { ...this.status(), resumed: false, reason };
     }
     this.#stopped = false;
     return { ...this.status(), resumed: true };

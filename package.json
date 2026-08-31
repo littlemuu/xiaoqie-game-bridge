@@ -12,7 +12,8 @@
     "pretest": "npm run build",
     "test": "vitest run",
     "demo": "tsx src/demo/run.ts",
-    "mcp:stdio": "node dist/src/mcp/stdio-server.js"
+    "mcp:stdio": "node dist/src/mcp/stdio-server.js",
+    "operator": "node dist/src/operator/cli.js"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "2.0.0",

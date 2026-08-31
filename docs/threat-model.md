@@ -147,6 +147,41 @@ session close remain available. `safety.resume` is not a request action. Local
 resume is audited and denied while any write remains in flight; stop and denied
 resume are audited as well. Read-only status is intentionally not audited.
 
+The product operator channel is a separate Windows named pipe, not an MCP tool.
+Its per-launch 32-byte token is discovered only through the fixed Local AppData
+descriptor and compared at fixed length with a timing-safe primitive. The
+protocol cannot carry a bridge request, path, executable, endpoint override, or
+arbitrary action. A stale descriptor or listener collision prevents MCP
+startup rather than degrading to TCP or serving without the brake.
+
+This proves separation from the model/MCP request surface, not hostile same-user
+isolation. On the tested Windows host, `Get-Acl` shows the application directory
+and descriptor inherit the current profile's ordinary ACL entries; Node's
+requested `0700`/`0600` modes are not evidence of a Windows user-exclusive ACL.
+No custom DACL, integrity label, restricted token, or administrator boundary is
+installed. Therefore malicious code running as the same OS user, and any
+administrator, remains able to read or replace same-user runtime objects. The
+implementation accurately targets only the stated local same-user boundary.
+An ungraceful Windows process termination can leave a stale descriptor because
+regular files are not kernel-owned pipe objects. A subsequent product start
+fails closed and preserves it; it never guesses that an unmatched file is safe
+to delete. Normal MCP EOF, transport-error, and server-close paths are bounded
+and regression-tested to remove the exact launch object.
+
+A valid resume request is not allowed to open the latch before its asynchronous
+audit work and operator deadline succeed. The server aborts the bridge resume
+on deadline or client disconnect; audit rejection and late settlement leave
+`stopped=true`. Concurrent resume admission is singular and excess attempts are
+denied as capacity. A later stop aborts every older pending resume transaction,
+including a repeated stop that intentionally preserves `stopGeneration`. The
+awaited event is explicitly a durable authorization for one exact generation,
+not a claim that resume already completed. A success response is possible only
+after that authorization is acknowledged and the still-live transaction commits
+synchronously; no fire-and-forget success audit can be lost or remain pending.
+A late authorization settlement is therefore not a false completion outcome.
+This avoids a failure response paired with an already-open write gate or a
+successful stop later being undone by older work.
+
 The latch does not claim forced cancellation. An asynchronous action that
 passed `beginWrite()` and entered the worker may complete after stop or client
 disconnect; process termination is not proof a real game action rolled back.
@@ -167,6 +202,20 @@ transition is idempotent. Remote `safety.stop` remains an ordinary cached
 request, so a caller under request-cache pressure must use the local control
 plane. No unbounded tombstone or eviction path is introduced.
 
+The operator connection cap also bounds application work rather than merely
+counting accepted sessions. Overflow sockets are immediately destroyed and do
+not allocate encoded failure responses, read timers, close timers, or an
+application queue. Shutdown enumerates every admitted socket and clears its
+tracked timers; a 64-contender flood regression proves the counters never rise
+above the configured admission limit. Pending authenticated handlers are also
+tracked: disconnect aborts their work, shutdown performs a bounded wait, and
+destroyed/closing sockets are rejected before response encoding or timer
+allocation. A pending-audit disconnect/shutdown regression releases the audit
+late and proves all four public resource counters remain zero. Audit promises
+have a separate tracked count; shutdown waits for audit idle within its fixed
+deadline, and the regression proves the count remains visible until late
+settlement and then returns to zero.
+
 ## Residual risks before a real adapter
 
 - Sessions and the idempotency cache are process-local; a restart loses them.
@@ -182,6 +231,9 @@ plane. No unbounded tombstone or eviction path is introduced.
   transport exists.
 - Already-started adapter writes are not forcibly cancelled; real adapters may
   require cooperative cancellation semantics.
+- The operator launch token and stop generation are process-local. The token is
+  authentication only within the stated same-user boundary; the generation is
+  concurrency/replay protection, not authentication or a durable replay store.
 
 These are blockers for exposing a real game or remote endpoint, but they do not
 block the offline mock foundation.

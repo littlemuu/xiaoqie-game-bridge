@@ -1,43 +1,71 @@
 import { StdioServerTransport, serveStdio } from "@modelcontextprotocol/server/stdio";
-import { AdapterRegistry } from "../core/adapter-registry.js";
-import { GameBridge } from "../core/bridge.js";
-import { ProcessMockAdapter } from "../adapters/mock/process-mock-adapter.js";
+import { startLocalOperatorServer } from "../operator/server.js";
+import { createProductRuntime } from "../runtime/product-runtime.js";
 import {
   STDIO_MAX_BUFFER_BYTES,
   createGameBridgeMcpServer,
 } from "./server.js";
 
-const registry = new AdapterRegistry();
-const adapter = new ProcessMockAdapter();
-registry.register(adapter);
-const bridge = new GameBridge({ registry });
-const transport = new StdioServerTransport(process.stdin, process.stdout, {
-  maxBufferSize: STDIO_MAX_BUFFER_BYTES,
-});
-const handle = serveStdio(() => createGameBridgeMcpServer({ bridge }), {
-  transport,
-  onerror: () => {
-    process.stderr.write("Local MCP stdio transport error.\n");
-  },
-});
-
-let closing = false;
-async function close(): Promise<void> {
-  if (closing) {
+async function run(): Promise<void> {
+  const runtime = createProductRuntime();
+  let closing = false;
+  let closeRuntime: (() => Promise<void>) | undefined;
+  let operator;
+  try {
+    operator = await startLocalOperatorServer(runtime.control, {
+      onFatal: () => {
+        void closeRuntime?.();
+      },
+    });
+  } catch {
+    process.stderr.write("Local operator control startup failed.\n");
+    await runtime.close().catch(() => undefined);
+    process.exitCode = 1;
+    process.stdin.pause();
     return;
   }
-  closing = true;
-  try {
-    await handle.close();
-  } catch {
-    process.stderr.write("Local MCP stdio shutdown error.\n");
-  }
-  await adapter.close();
+  process.once("exit", () => operator.cleanupRuntimeObjectsForProcessExit());
+
+  const transport = new StdioServerTransport(process.stdin, process.stdout, {
+    maxBufferSize: STDIO_MAX_BUFFER_BYTES,
+  });
+  const handle = serveStdio(() => createGameBridgeMcpServer({ bridge: runtime.bridge }), {
+    transport,
+    onerror: () => {
+      process.stderr.write("Local MCP stdio transport error.\n");
+      void closeRuntime?.();
+    },
+  });
+
+  closeRuntime = async () => {
+    if (closing) return;
+    closing = true;
+    const handleClosing = handle.close().catch(() => {
+      process.stderr.write("Local MCP stdio shutdown error.\n");
+    });
+    await operator.close().catch(() => undefined);
+    await runtime.close().catch(() => undefined);
+    await Promise.race([
+      handleClosing,
+      new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, 500);
+        timer.unref();
+      }),
+    ]);
+  };
+
+  process.once("SIGINT", () => {
+    void closeRuntime?.();
+  });
+  process.once("SIGTERM", () => {
+    void closeRuntime?.();
+  });
+  process.stdin.once("end", () => {
+    void closeRuntime?.();
+  });
+  process.stdin.once("close", () => {
+    void closeRuntime?.();
+  });
 }
 
-process.once("SIGINT", () => {
-  void close();
-});
-process.stdin.once("end", () => {
-  void close();
-});
+await run();

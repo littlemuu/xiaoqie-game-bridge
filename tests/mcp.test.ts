@@ -406,7 +406,9 @@ describe("local MCP contract", () => {
     expect(gate.inFlight).toBe(0);
   });
 
-  it("round-trips through the built stdio child with the official client", async () => {
+  it.runIf(process.platform === "win32")(
+    "round-trips through the built stdio child with the official client",
+    async () => {
     const entrypoint = resolve(process.cwd(), "dist", "src", "mcp", "stdio-server.js");
     const transport = new StdioClientTransport({
       command: process.execPath,
@@ -483,9 +485,12 @@ describe("local MCP contract", () => {
       await transport.close();
     }
     expect(stderr).toBe("");
-  });
+    },
+  );
 
-  it("fails closed on an oversized stdio frame without leaking its payload", async () => {
+  it.runIf(process.platform === "win32")(
+    "fails closed on an oversized stdio frame without leaking its payload",
+    async () => {
     const entrypoint = resolve(process.cwd(), "dist", "src", "mcp", "stdio-server.js");
     const transport = new StdioClientTransport({
       command: process.execPath,
@@ -528,5 +533,6 @@ describe("local MCP contract", () => {
     expect(outcome).not.toContain(injectedSecret);
     expect(stderr).not.toContain(injectedSecret);
     expect(stderr).toBe("Local MCP stdio transport error.\n");
-  });
+    },
+  );
 });

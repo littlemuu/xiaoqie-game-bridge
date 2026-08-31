@@ -92,7 +92,43 @@ export interface BridgeOptions {
 export interface BridgeLocalControlPlane {
   stopSafety(): Promise<SafetyStatus & { stopped: true; alreadyStopped: boolean }>;
   getSafetyStatus(): SafetyStatus;
-  resumeSafety(): Promise<SafetyResumeResult>;
+  getOutstandingAuditWrites(): number;
+  waitForAuditIdle(): Promise<void>;
+  resumeSafety(
+    generation: number,
+    options?: { signal?: AbortSignal },
+  ): Promise<SafetyResumeResult>;
+}
+
+function abortable<T>(
+  promise: Promise<T>,
+  ...signals: Array<AbortSignal | undefined>
+): Promise<T> {
+  const activeSignals = signals.filter((signal) => signal !== undefined);
+  if (activeSignals.length === 0) return promise;
+  if (activeSignals.some((signal) => signal.aborted)) {
+    return Promise.reject(new Error("local-control-aborted"));
+  }
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => {
+      cleanup();
+      reject(new Error("local-control-aborted"));
+    };
+    const cleanup = () => {
+      for (const signal of activeSignals) signal.removeEventListener("abort", abort);
+    };
+    for (const signal of activeSignals) signal.addEventListener("abort", abort, { once: true });
+    promise.then(
+      (value) => {
+        cleanup();
+        resolve(value);
+      },
+      (error: unknown) => {
+        cleanup();
+        reject(error);
+      },
+    );
+  });
 }
 
 function stableStringify(value: unknown): string {
@@ -146,6 +182,11 @@ export class GameBridge {
   readonly #authorizer: SessionAuthorizer;
   readonly #clock: () => number;
   readonly #callerTagKey: Buffer;
+  readonly #auditWrites = new Set<Promise<void>>();
+  #localResumePending = false;
+  #localResumeInvalidation = 0;
+  #localResumeController: AbortController | undefined;
+  #localStopsPending = 0;
 
   constructor(options: BridgeOptions) {
     this.#registry = options.registry;
@@ -165,40 +206,135 @@ export class GameBridge {
   createLocalControlPlane(): BridgeLocalControlPlane {
     return Object.freeze({
       stopSafety: async () => {
-        const result = this.#safety.stop();
-        await this.#recordLocalSafety("safety.stop.local", "allow", {
-          alreadyStopped: result.alreadyStopped,
-          inFlightWrites: result.inFlightWrites,
-        });
-        return result;
+        this.#localStopsPending += 1;
+        try {
+          const result = this.#stopSafetyLatch();
+          await this.#recordLocalSafety("safety.stop.local", "allow", {
+            alreadyStopped: result.alreadyStopped,
+            inFlightWrites: result.inFlightWrites,
+            stopGeneration: result.stopGeneration,
+          });
+          return result;
+        } finally {
+          this.#localStopsPending -= 1;
+        }
       },
       getSafetyStatus: () => this.#safety.status(),
-      resumeSafety: async () => {
-        const result = this.#safety.resume();
-        await this.#recordLocalSafety(
-          "safety.resume.local",
-          result.resumed ? "allow" : "deny",
-          {
-            resumed: result.resumed,
-            inFlightWrites: result.inFlightWrites,
-            ...(!result.resumed ? { reason: result.reason } : {}),
-          },
-          !result.resumed && result.reason === "writes-in-flight"
-            ? "RESOURCE_CAPACITY"
-            : undefined,
-        );
-        return result;
+      getOutstandingAuditWrites: () => this.#auditWrites.size,
+      waitForAuditIdle: async () => {
+        while (this.#auditWrites.size > 0) {
+          await Promise.allSettled([...this.#auditWrites]);
+        }
+      },
+      resumeSafety: async (
+        generation: number,
+        options: { signal?: AbortSignal } = {},
+      ) => {
+        const blockReason = this.#safety.resumeBlockReason(generation);
+        if (
+          blockReason !== undefined ||
+          this.#localResumePending ||
+          this.#localStopsPending > 0
+        ) {
+          const result: SafetyResumeResult = {
+            ...this.#safety.status(),
+            resumed: false,
+            reason: blockReason ?? "resume-pending",
+          };
+          await abortable(
+            this.#recordLocalSafety(
+              "safety.resume.local",
+              "deny",
+              {
+                resumed: false,
+                inFlightWrites: result.inFlightWrites,
+                stopGeneration: result.stopGeneration,
+                reason: result.reason,
+              },
+              result.reason === "writes-in-flight" || result.reason === "resume-pending"
+                ? "RESOURCE_CAPACITY"
+                : undefined,
+            ),
+            options.signal,
+          );
+          return result;
+        }
+
+        this.#localResumePending = true;
+        const invalidation = this.#localResumeInvalidation;
+        const transactionController = new AbortController();
+        this.#localResumeController = transactionController;
+        try {
+          const pendingStatus = this.#safety.status();
+          try {
+            await abortable(
+              this.#recordLocalSafety("safety.resume.authorization.local", "allow", {
+                phase: "authorization",
+                authorizedGeneration: pendingStatus.stopGeneration,
+                inFlightWrites: pendingStatus.inFlightWrites,
+                stopGeneration: pendingStatus.stopGeneration,
+              }),
+              options.signal,
+              transactionController.signal,
+            );
+          } catch (error) {
+            if (
+              transactionController.signal.aborted &&
+              !options.signal?.aborted &&
+              invalidation !== this.#localResumeInvalidation
+            ) {
+              const result: SafetyResumeResult = {
+                ...this.#safety.status(),
+                resumed: false,
+                reason: "stop-superseded",
+              };
+              return result;
+            }
+            throw error;
+          }
+          if (options.signal?.aborted) {
+            throw new Error("local-control-aborted");
+          }
+          if (
+            transactionController.signal.aborted ||
+            invalidation !== this.#localResumeInvalidation
+          ) {
+            const result: SafetyResumeResult = {
+              ...this.#safety.status(),
+              resumed: false,
+              reason: "stop-superseded",
+            };
+            return result;
+          }
+          const result = this.#safety.resume(generation);
+          if (!result.resumed) return result;
+          return result;
+        } finally {
+          if (this.#localResumeController === transactionController) {
+            this.#localResumeController = undefined;
+          }
+          this.#localResumePending = false;
+        }
       },
     });
   }
 
+  #stopSafetyLatch(): SafetyStatus & { stopped: true; alreadyStopped: boolean } {
+    this.#localResumeInvalidation += 1;
+    this.#localResumeController?.abort();
+    return this.#safety.stop();
+  }
+
   async #recordLocalSafety(
-    action: "safety.stop.local" | "safety.resume.local",
+    action:
+      | "safety.stop.local"
+      | "safety.resume.authorization.local"
+      | "safety.resume.local",
     decision: "allow" | "deny",
     metadata: Record<string, unknown>,
     errorCode?: ErrorCode,
   ): Promise<void> {
-    await writeAudit(this.#audit, {
+    await this.#writeAudit({
       timestamp: new Date(this.#clock()).toISOString(),
       action,
       mode: "commit",
@@ -211,6 +347,16 @@ export class GameBridge {
         ...metadata,
       }),
     });
+  }
+
+  #writeAudit(event: AuditEvent): Promise<void> {
+    const pending = writeAudit(this.#audit, event);
+    this.#auditWrites.add(pending);
+    void pending.then(
+      () => this.#auditWrites.delete(pending),
+      () => this.#auditWrites.delete(pending),
+    );
+    return pending;
   }
 
   async handle(
@@ -616,7 +762,7 @@ export class GameBridge {
     if (request.mode === "dry-run") {
       return successResponse(request, { wouldStop: true, stopped: this.#safety.isStopped() });
     }
-    return successResponse(request, this.#safety.stop());
+    return successResponse(request, this.#stopSafetyLatch());
   }
 
   #boundAdapter(
@@ -678,6 +824,6 @@ export class GameBridge {
       idempotencyHit,
       ...(metadata === undefined ? {} : { metadata: redactSensitive(metadata) }),
     };
-    await writeAudit(this.#audit, event);
+    await this.#writeAudit(event);
   }
 }

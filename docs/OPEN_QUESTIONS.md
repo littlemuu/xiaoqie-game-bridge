@@ -3,26 +3,33 @@
 These choices are intentionally deferred and do not block the offline
 foundation:
 
-1. Which local user-controlled mechanism should own safety resume: a small tray
-   UI, a CLI attached to the host process, or an OS-specific control channel?
-2. Before a real adapter, which actual OS isolation should wrap the now-proven
+The local resume-owner question is resolved for this mock phase: a narrow CLI
+uses a per-launch authenticated Windows named pipe that is separate from MCP and
+controls the same product safety latch. The remaining choices are:
+
+1. Before a real adapter, which actual OS isolation should wrap the now-proven
    narrow process IPC: restricted token/job object, container, VM, or an
    adapter-specific sandbox?
-3. What durable audit destination and retention period should be used without
+2. What durable audit destination and retention period should be used without
    collecting game chat, credentials, or unnecessary personal data?
-4. Beyond the bounded stdio handler gate, which per-principal and per-action
+3. Beyond the bounded stdio handler gate, which per-principal and per-action
    rate limits would a future authenticated transport require, and which
    authentication methods should map to stable subjects without account
    confusion?
-5. Must the first real adapter support cooperative cancellation for in-flight
+4. Must the first real adapter support cooperative cancellation for in-flight
    actions, or should safety stop instead guarantee only that no new action can
    begin and surface the current in-flight count to the local user?
-6. Which filesystem, process, game API, save-backup, CPU, and memory permissions
+5. Which filesystem, process, game API, save-backup, CPU, and memory permissions
    should be separately granted to the first real adapter worker?
+6. Before any stronger local-adversary claim, should the operator descriptor
+   receive an explicit Windows DACL, a restricted-token broker, or a different
+   OS-owned rendezvous mechanism? Current inherited ACL evidence is not such a
+   proof.
 
 The next work order is intentionally not preselected. First review the
-mock-only stdio/MCP boundary and its cancellation, identity, capacity, and
-child-process evidence. That review does not authorize a real game, remote
+mock-only stdio/MCP and operator boundaries, including cancellation, identity,
+capacity, ACL, cleanup, and child-process evidence. That review does not
+authorize a real game, remote
 transport, MCP host configuration, or desktop integration.
 
 The core now has a strict future-remote owner seam, but it intentionally does
