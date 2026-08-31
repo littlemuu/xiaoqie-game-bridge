@@ -8,6 +8,7 @@ import {
   rename,
   rm,
   symlink,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -56,6 +57,10 @@ function event(index = 1): AuditEvent {
       endpoint: "https://review.invalid/private",
       note: "https://value-injection.invalid/private",
       sourcePath: "C:\\Users\\ReviewUser\\save.dat",
+      posixPath: "/tmp/private-save.dat",
+      worldState: "private-player-position",
+      adapterInput: "private-input",
+      adapterOutput: "private-output",
       pid: 424242,
       username: "ReviewUser",
       stack: "attacker stack trace",
@@ -124,6 +129,11 @@ describe("durable local audit ledger", () => {
     expect(text).not.toContain("ReviewUser");
     expect(text).not.toContain("424242");
     expect(text).not.toContain("private world state");
+    expect(text).not.toContain("private-save.dat");
+    expect(text).not.toContain("private-player-position");
+    expect(text).not.toContain("private-input");
+    expect(text).not.toContain("private-output");
+    expect(text).not.toContain("event-1");
     expect(text).not.toContain("mock-world");
     expect(text).not.toContain("session-secret-value");
     const [record] = decodeFrames(leftBytes);
@@ -264,6 +274,7 @@ describe("durable local audit ledger", () => {
     const complete = await segmentBytes(fixture.root);
     const firstFrameBytes = 9 + Number.parseInt(complete.subarray(0, 8).toString("ascii"), 16) + 1;
     const torn = complete.subarray(0, firstFrameBytes + 17);
+    await unlink(join(fixture.root, "confirmation-0000000000000002.audit"));
     await writeFile(join(fixture.root, "segment-0001.audit"), torn);
     const preserved = Buffer.from(torn);
 
@@ -279,6 +290,8 @@ describe("durable local audit ledger", () => {
     const restarted = await DurableAuditLedger.open({ testOnly: { rootDirectory: fixture.root } });
     await restarted.close();
     expect((await readdir(fixture.root)).sort()).toEqual([
+      "confirmation-0000000000000001.audit",
+      "confirmation-0000000000000002.audit",
       "segment-0001.audit",
       "segment-0002.audit",
     ]);
@@ -300,10 +313,31 @@ describe("durable local audit ledger", () => {
       const fixture = await temporaryLedgerRoot(`cut-${cut}`);
       await mkdir(fixture.root);
       await writeFile(join(fixture.root, "segment-0001.audit"), complete.subarray(0, cut));
+      await writeFile(
+        join(fixture.root, "confirmation-0000000000000001.audit"),
+        await readFile(join(source.root, "confirmation-0000000000000001.audit")),
+      );
       const reopened = await DurableAuditLedger.open({ testOnly: { rootDirectory: fixture.root } });
       expect(reopened.health().nextSequence).toBe(cut === firstFrameBytes ? 2 : 3);
       await reopened.close();
     }
+  });
+
+  it("fails closed when an append-and-sync confirmed tail is later truncated", async () => {
+    const fixture = await temporaryLedgerRoot("confirmed-truncation");
+    const ledger = await DurableAuditLedger.open({ testOnly: { rootDirectory: fixture.root } });
+    await ledger.write(event(1));
+    await ledger.write(event(2));
+    await ledger.close();
+    const complete = await segmentBytes(fixture.root);
+    const truncated = complete.subarray(0, complete.byteLength - 1);
+    await writeFile(join(fixture.root, "segment-0001.audit"), truncated);
+    const preserved = Buffer.from(truncated);
+
+    await expect(
+      DurableAuditLedger.open({ testOnly: { rootDirectory: fixture.root } }),
+    ).rejects.toMatchObject({ code: "corrupt" });
+    expect((await segmentBytes(fixture.root)).equals(preserved)).toBe(true);
   });
 
   it("fails closed on committed corruption, oversize, symlink, and directory replacement", async () => {
@@ -412,12 +446,12 @@ describe("durable local audit ledger", () => {
     await recordLedger.close();
 
     const shutdownFixture = await temporaryLedgerRoot("shutdown-bound");
-    const never = new Promise<void>(() => undefined);
+    const syncGate = deferred();
     const shutdownLedger = await DurableAuditLedger.open({
       testOnly: {
         rootDirectory: shutdownFixture.root,
         limits: { shutdownDrainMs: 25 },
-        beforeSync: () => never,
+        sync: () => syncGate.promise,
       },
     });
     const pending = shutdownLedger.write(event());
@@ -434,8 +468,10 @@ describe("durable local audit ledger", () => {
     });
     expect(shutdownLedger.health()).toMatchObject({ status: "closed", outstandingWrites: 0 });
     const size = (await lstat(join(shutdownFixture.root, "segment-0001.audit"))).size;
+    syncGate.resolve();
     await new Promise((resolve) => setTimeout(resolve, 30));
     expect((await lstat(join(shutdownFixture.root, "segment-0001.audit"))).size).toBe(size);
+    expect(await readdir(shutdownFixture.root)).toEqual(["segment-0001.audit"]);
   });
 
   it("rejects an ordinary commit without changing mock state after total capacity is full", async () => {
@@ -484,6 +520,63 @@ describe("durable local audit ledger", () => {
     );
     expect(committed).toMatchObject({ ok: false, error: { code: "RESOURCE_CAPACITY" } });
     await expect(adapter.observe()).resolves.toMatchObject({ player: { x: 0 } });
+    await ledger.close();
+  });
+
+  it("reserves worst-case segment bytes before a one-byte-short final-segment commit", async () => {
+    const sourceFixture = await temporaryLedgerRoot("near-full-source");
+    const sourceLedger = await DurableAuditLedger.open({
+      testOnly: { rootDirectory: sourceFixture.root },
+    });
+    const sourceBridge = bridgeWithLedger(sourceLedger).bridge;
+    const context = { transport: "local" } as const;
+    const openRequest = {
+      protocolVersion: "1.0" as const,
+      requestId: "near-full-open",
+      action: "session.open",
+      params: { adapterId: "mock-world", capabilities: ["game.act.move"] },
+      mode: "commit" as const,
+    };
+    expect(await sourceBridge.handle(openRequest, context)).toMatchObject({ ok: true });
+    await sourceLedger.close();
+    const openRecordBytes = (await lstat(join(sourceFixture.root, "segment-0001.audit"))).size;
+
+    const fixture = await temporaryLedgerRoot("near-full-target");
+    const ledger = await DurableAuditLedger.open({
+      testOnly: {
+        rootDirectory: fixture.root,
+        limits: {
+          maxRecordBytes: 1_024,
+          maxSegmentBytes: openRecordBytes + 1_023,
+          maxSegments: 1,
+        },
+      },
+    });
+    const { adapter, bridge } = bridgeWithLedger(ledger);
+    const opened = await bridge.handle(openRequest, context);
+    expect(opened.ok).toBe(true);
+    expect(ledger.health().status).toBe("ready");
+    const sessionId = opened.ok
+      ? (opened.result as { sessionId: string }).sessionId
+      : "unreachable";
+    const response = await bridge.handle(
+      {
+        protocolVersion: "1.0",
+        requestId: "near-full-commit",
+        sessionId,
+        action: "game.act",
+        params: {
+          adapterId: "mock-world",
+          gameAction: "move",
+          input: { dx: 1, dy: 0, dz: 0 },
+        },
+        mode: "commit",
+      },
+      context,
+    );
+    expect(response).toMatchObject({ ok: false, error: { code: "RESOURCE_CAPACITY" } });
+    await expect(adapter.observe()).resolves.toMatchObject({ player: { x: 0 } });
+    expect(ledger.health().status).toBe("full");
     await ledger.close();
   });
 

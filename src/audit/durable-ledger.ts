@@ -23,18 +23,16 @@ export const AUDIT_LEDGER_MAX_RECORD_BYTES = 4 * 1_024;
 export const AUDIT_LEDGER_MAX_PENDING_WRITES = 8;
 export const AUDIT_LEDGER_MAX_SEGMENT_BYTES = 64 * 1_024;
 export const AUDIT_LEDGER_MAX_SEGMENTS = 8;
+export const AUDIT_LEDGER_MAX_CONFIRMATIONS = 2_048;
 export const AUDIT_LEDGER_SHUTDOWN_DRAIN_MS = 500;
 
 const FRAME_PREFIX_BYTES = 9;
 const ZERO_DIGEST = "0".repeat(64);
 const SEGMENT_PATTERN = /^segment-(\d{4})\.audit$/;
+const CONFIRMATION_PATTERN = /^confirmation-(\d{16})\.audit$/;
 const TAG_PATTERN = /^[a-f0-9]{12}$/;
 const DIGEST_PATTERN = /^[a-f0-9]{64}$/;
-const SAFE_METADATA_KEY = /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/;
-const MAX_METADATA_NODES = 128;
-const MAX_METADATA_STRING_BYTES = 1_024;
-const SENSITIVE_VALUE =
-  /(?:bearer|password|passwd|secret|token|credential|api[-_]?key|(?:https?|wss?|tcp):\/\/|\\\\\.\\pipe\\|[A-Za-z]:\\|\/Users\/|\/home\/|stack\s*trace)/i;
+const MAX_CONFIRMATION_BYTES = 512;
 
 export type AuditLedgerStatus = "ready" | "degraded" | "full" | "corrupt" | "closed";
 export type AuditLedgerErrorCode =
@@ -85,10 +83,7 @@ interface PersistentAuditEvent {
   errorCode?: (typeof errorCodes)[number];
   safetyStopped: boolean;
   idempotencyHit: boolean;
-  metadata?: BoundedJson;
 }
-
-type BoundedJson = null | boolean | number | string | BoundedJson[] | { [key: string]: BoundedJson };
 
 type LedgerPayload =
   | { kind: "event"; event: PersistentAuditEvent }
@@ -107,12 +102,21 @@ export interface AuditLedgerRecord {
   digest: string;
 }
 
+interface AuditLedgerConfirmation {
+  formatVersion: typeof AUDIT_LEDGER_FORMAT_VERSION;
+  sequence: number;
+  digest: string;
+  segment: number;
+  frameEnd: number;
+}
+
 export interface DurableAuditLedgerOptions {
   testOnly?: {
     rootDirectory: string;
     limits?: Partial<AuditLedgerLimits>;
     beforeAppend?: () => void | Promise<void>;
     beforeSync?: () => void | Promise<void>;
+    sync?: (handle: FileHandle) => Promise<void>;
   };
 }
 
@@ -148,7 +152,15 @@ const persistentEventSchema = z
     errorCode: z.enum(errorCodes).optional(),
     safetyStopped: z.boolean(),
     idempotencyHit: z.boolean(),
-    metadata: z.unknown().optional(),
+  })
+  .strict();
+const confirmationSchema = z
+  .object({
+    formatVersion: z.literal(AUDIT_LEDGER_FORMAT_VERSION),
+    sequence: z.number().int().min(1).max(AUDIT_LEDGER_MAX_CONFIRMATIONS),
+    digest: z.string().regex(DIGEST_PATTERN),
+    segment: z.number().int().min(1).max(AUDIT_LEDGER_MAX_SEGMENTS),
+    frameEnd: z.number().int().min(1).max(AUDIT_LEDGER_MAX_SEGMENT_BYTES),
   })
   .strict();
 const recoveryPayloadSchema = z
@@ -198,51 +210,6 @@ function digestRecordBase(base: Omit<AuditLedgerRecord, "digest">): string {
   return createHash("sha256").update(stableStringify(base), "utf8").digest("hex");
 }
 
-interface MetadataBudget {
-  nodes: number;
-  stringBytes: number;
-}
-
-function sanitizeBoundedJson(
-  value: unknown,
-  depth = 0,
-  budget: MetadataBudget = { nodes: 0, stringBytes: 0 },
-): BoundedJson {
-  if (depth > 4) throw new AuditLedgerError("invalid-event");
-  budget.nodes += 1;
-  if (budget.nodes > MAX_METADATA_NODES) throw new AuditLedgerError("invalid-event");
-  if (value === null || typeof value === "boolean") return value;
-  if (typeof value === "number") {
-    if (!Number.isFinite(value) || !Number.isSafeInteger(value)) {
-      throw new AuditLedgerError("invalid-event");
-    }
-    return value;
-  }
-  if (typeof value === "string") {
-    if (value.length > 256 || SENSITIVE_VALUE.test(value)) return "[REDACTED]";
-    budget.stringBytes += Buffer.byteLength(value, "utf8");
-    if (budget.stringBytes > MAX_METADATA_STRING_BYTES) {
-      throw new AuditLedgerError("invalid-event");
-    }
-    return value;
-  }
-  if (Array.isArray(value)) {
-    if (value.length > 16) throw new AuditLedgerError("invalid-event");
-    return value.map((child) => sanitizeBoundedJson(child, depth + 1, budget));
-  }
-  if (typeof value === "object" && value !== null) {
-    const entries = Object.entries(value as Record<string, unknown>);
-    if (entries.length > 16) throw new AuditLedgerError("invalid-event");
-    const sanitized: Record<string, BoundedJson> = {};
-    for (const [key, child] of entries) {
-      if (!SAFE_METADATA_KEY.test(key)) throw new AuditLedgerError("invalid-event");
-      sanitized[key] = sanitizeBoundedJson(child, depth + 1, budget);
-    }
-    return sanitized;
-  }
-  throw new AuditLedgerError("invalid-event");
-}
-
 function persistentEvent(event: AuditEvent): PersistentAuditEvent {
   const redacted = redactSensitive(event) as AuditEvent;
   const candidate = {
@@ -260,9 +227,6 @@ function persistentEvent(event: AuditEvent): PersistentAuditEvent {
     ...(redacted.errorCode === undefined ? {} : { errorCode: redacted.errorCode }),
     safetyStopped: redacted.safetyStopped,
     idempotencyHit: redacted.idempotencyHit,
-    ...(redacted.metadata === undefined
-      ? {}
-      : { metadata: sanitizeBoundedJson(redacted.metadata) }),
   };
   const parsed = persistentEventSchema.safeParse(candidate);
   if (!parsed.success) throw new AuditLedgerError("invalid-event");
@@ -283,6 +247,10 @@ function identitiesMatch(left: FileIdentity, right: FileIdentity): boolean {
 
 function segmentName(index: number): string {
   return `segment-${index.toString().padStart(4, "0")}.audit`;
+}
+
+function confirmationName(sequence: number): string {
+  return `confirmation-${sequence.toString().padStart(16, "0")}.audit`;
 }
 
 export function durableAuditLedgerDirectory(): string {
@@ -308,7 +276,7 @@ function defaultLimits(testOnly: DurableAuditLedgerOptions["testOnly"]): AuditLe
 }
 
 interface ParsedSegment {
-  confirmedRecords: AuditLedgerRecord[];
+  records: Array<{ record: AuditLedgerRecord; frameEnd: number }>;
   tornTail: boolean;
 }
 
@@ -318,13 +286,15 @@ function parseSegment(
   expectedSequence: number,
   expectedPreviousDigest: string,
 ): ParsedSegment {
-  const records: AuditLedgerRecord[] = [];
+  const records: Array<{ record: AuditLedgerRecord; frameEnd: number }> = [];
   let offset = 0;
   let sequence = expectedSequence;
   let previousDigest = expectedPreviousDigest;
   while (offset < bytes.byteLength) {
     const remaining = bytes.byteLength - offset;
-    if (remaining < FRAME_PREFIX_BYTES) return { confirmedRecords: records, tornTail: true };
+    if (remaining < FRAME_PREFIX_BYTES) {
+      return { records, tornTail: true };
+    }
     const prefix = bytes.subarray(offset, offset + FRAME_PREFIX_BYTES).toString("ascii");
     if (!/^[a-f0-9]{8}:$/.test(prefix)) throw new AuditLedgerError("corrupt");
     const payloadBytes = Number.parseInt(prefix.slice(0, 8), 16);
@@ -332,7 +302,9 @@ function parseSegment(
       throw new AuditLedgerError("corrupt");
     }
     const frameBytes = FRAME_PREFIX_BYTES + payloadBytes + 1;
-    if (remaining < frameBytes) return { confirmedRecords: records, tornTail: true };
+    if (remaining < frameBytes) {
+      return { records, tornTail: true };
+    }
     if (bytes[offset + frameBytes - 1] !== 0x0a) throw new AuditLedgerError("corrupt");
     const encoded = bytes.subarray(offset + FRAME_PREFIX_BYTES, offset + frameBytes - 1);
     let raw: unknown;
@@ -344,17 +316,6 @@ function parseSegment(
     const parsed = ledgerRecordSchema.safeParse(raw);
     if (!parsed.success) throw new AuditLedgerError("corrupt");
     const record = parsed.data as AuditLedgerRecord;
-    if (record.payload.kind === "event" && record.payload.event.metadata !== undefined) {
-      let sanitized: BoundedJson;
-      try {
-        sanitized = sanitizeBoundedJson(record.payload.event.metadata);
-      } catch {
-        throw new AuditLedgerError("corrupt");
-      }
-      if (stableStringify(sanitized) !== stableStringify(record.payload.event.metadata)) {
-        throw new AuditLedgerError("corrupt");
-      }
-    }
     if (record.sequence !== sequence || record.previousDigest !== previousDigest) {
       throw new AuditLedgerError("corrupt");
     }
@@ -368,12 +329,12 @@ function parseSegment(
     if (encoded.toString("utf8") !== stableStringify(record)) {
       throw new AuditLedgerError("corrupt");
     }
-    records.push(record);
+    records.push({ record, frameEnd: offset + frameBytes });
     sequence += 1;
     previousDigest = record.digest;
     offset += frameBytes;
   }
-  return { confirmedRecords: records, tornTail: false };
+  return { records, tornTail: false };
 }
 
 export class DurableAuditLedger implements AuditSink {
@@ -389,6 +350,8 @@ export class DurableAuditLedger implements AuditSink {
   #nextSequence = 1;
   #previousDigest = ZERO_DIGEST;
   #outstandingWrites = 0;
+  #capacityReservations = 0;
+  readonly #nativeIoHandles = new Set<FileHandle>();
   readonly #reservationCancellations = new Set<() => void>();
   #tail: Promise<void> = Promise.resolve();
   #status: AuditLedgerStatus = "ready";
@@ -437,7 +400,8 @@ export class DurableAuditLedger implements AuditSink {
       !this.#closed &&
       !this.#writeDisabled &&
       (this.#status === "ready" || this.#status === "degraded") &&
-      this.#outstandingWrites < this.#limits.maxPendingWrites
+      this.#outstandingWrites < this.#limits.maxPendingWrites &&
+      this.#hasPhysicalCapacity(this.#capacityReservations + 1)
     );
   }
 
@@ -448,14 +412,25 @@ export class DurableAuditLedger implements AuditSink {
   }
 
   reserveWrite(): AuditWriteReservation | undefined {
-    if (!this.isWritable()) return undefined;
+    if (!this.isWritable()) {
+      if (
+        this.#capacityReservations === 0 &&
+        !this.#hasPhysicalCapacity(1) &&
+        (this.#status === "ready" || this.#status === "degraded")
+      ) {
+        this.#status = "full";
+      }
+      return undefined;
+    }
     this.#outstandingWrites += 1;
+    this.#capacityReservations += 1;
     let active = true;
     const cancel = () => {
       if (!active) return;
       active = false;
       this.#reservationCancellations.delete(cancel);
       this.#outstandingWrites -= 1;
+      this.#capacityReservations -= 1;
     };
     this.#reservationCancellations.add(cancel);
     return Object.freeze({
@@ -471,7 +446,11 @@ export class DurableAuditLedger implements AuditSink {
 
   #admissionError(): AuditLedgerError {
     if (!this.#acceptingWrites || this.#closed) return new AuditLedgerError("closed");
-    if (this.#status === "full" || this.#outstandingWrites >= this.#limits.maxPendingWrites) {
+    if (
+      this.#status === "full" ||
+      this.#outstandingWrites >= this.#limits.maxPendingWrites ||
+      !this.#hasPhysicalCapacity(this.#capacityReservations + 1)
+    ) {
       return new AuditLedgerError("capacity");
     }
     if (this.#writeDisabled) return new AuditLedgerError("io");
@@ -484,6 +463,7 @@ export class DurableAuditLedger implements AuditSink {
       payload = { kind: "event", event: persistentEvent(event) };
     } catch (error) {
       this.#outstandingWrites -= 1;
+      this.#capacityReservations -= 1;
       return Promise.reject(
         error instanceof AuditLedgerError ? error : new AuditLedgerError("invalid-event"),
       );
@@ -492,7 +472,25 @@ export class DurableAuditLedger implements AuditSink {
     this.#tail = operation.catch(() => undefined);
     return operation.finally(() => {
       this.#outstandingWrites -= 1;
+      this.#capacityReservations -= 1;
     });
+  }
+
+  #hasPhysicalCapacity(reservationCount: number): boolean {
+    if (this.#nextSequence + reservationCount - 1 > AUDIT_LEDGER_MAX_CONFIRMATIONS) {
+      return false;
+    }
+    let segment = this.#segmentCount;
+    let bytes = this.#segmentSize;
+    for (let index = 0; index < reservationCount; index += 1) {
+      if (bytes + this.#limits.maxRecordBytes > this.#limits.maxSegmentBytes) {
+        segment += 1;
+        bytes = 0;
+      }
+      if (segment > this.#limits.maxSegments) return false;
+      bytes += this.#limits.maxRecordBytes;
+    }
+    return true;
   }
 
   async close(): Promise<void> {
@@ -516,7 +514,10 @@ export class DurableAuditLedger implements AuditSink {
       await this.#tail.catch(() => undefined);
     }
     this.#closed = true;
-    await this.#segmentHandle?.close().catch(() => undefined);
+    const segmentHandle = this.#segmentHandle;
+    if (segmentHandle !== undefined && (drained || !this.#nativeIoHandles.has(segmentHandle))) {
+      await segmentHandle.close().catch(() => undefined);
+    }
     this.#segmentHandle = undefined;
     this.#status = "closed";
   }
@@ -525,27 +526,55 @@ export class DurableAuditLedger implements AuditSink {
     await this.#prepareDirectory();
     const entries = await readdir(this.#rootDirectory, { withFileTypes: true });
     const segments: number[] = [];
+    const confirmationSequences: number[] = [];
     for (const entry of entries) {
-      const match = SEGMENT_PATTERN.exec(entry.name);
-      if (match === null || !entry.isFile() || entry.isSymbolicLink()) {
+      if (!entry.isFile() || entry.isSymbolicLink()) {
         this.#status = "corrupt";
         throw new AuditLedgerError("corrupt");
       }
-      segments.push(Number.parseInt(match[1]!, 10));
+      const segmentMatch = SEGMENT_PATTERN.exec(entry.name);
+      if (segmentMatch !== null) {
+        segments.push(Number.parseInt(segmentMatch[1]!, 10));
+        continue;
+      }
+      const confirmationMatch = CONFIRMATION_PATTERN.exec(entry.name);
+      if (confirmationMatch !== null) {
+        confirmationSequences.push(Number.parseInt(confirmationMatch[1]!, 10));
+        continue;
+      }
+      this.#status = "corrupt";
+      throw new AuditLedgerError("corrupt");
     }
     segments.sort((left, right) => left - right);
+    confirmationSequences.sort((left, right) => left - right);
     if (segments.length > this.#limits.maxSegments) throw new AuditLedgerError("corrupt");
+    if (confirmationSequences.length > AUDIT_LEDGER_MAX_CONFIRMATIONS) {
+      throw new AuditLedgerError("corrupt");
+    }
     for (let index = 0; index < segments.length; index += 1) {
       if (segments[index] !== index + 1) throw new AuditLedgerError("corrupt");
     }
+    for (let index = 0; index < confirmationSequences.length; index += 1) {
+      if (confirmationSequences[index] !== index + 1) throw new AuditLedgerError("corrupt");
+    }
     if (segments.length === 0) {
+      if (confirmationSequences.length > 0) throw new AuditLedgerError("corrupt");
       await this.#createSegment(1);
       return;
+    }
+
+    const confirmations = new Map<number, AuditLedgerConfirmation>();
+    for (const confirmationSequence of confirmationSequences) {
+      confirmations.set(
+        confirmationSequence,
+        await this.#readVerifiedConfirmation(confirmationSequence),
+      );
     }
 
     let sequence = 1;
     let previousDigest = ZERO_DIGEST;
     const unresolvedTorn: number[] = [];
+    const validatedConfirmations = new Set<number>();
     let sawRecovery = false;
     for (const segment of segments) {
       const bytes = await this.#readVerifiedSegment(segment);
@@ -555,30 +584,57 @@ export class DurableAuditLedger implements AuditSink {
       } finally {
         bytes.fill(0);
       }
-      const expectedRecovery = unresolvedTorn.length > 0;
-      if (expectedRecovery && parsed.confirmedRecords.length > 0) {
-        const firstPayload = parsed.confirmedRecords[0]!.payload;
+      const expectedRecoverySources = [...unresolvedTorn];
+      const expectedRecovery = expectedRecoverySources.length > 0;
+      if (expectedRecovery && parsed.records.length > 0) {
+        const firstPayload = parsed.records[0]!.record.payload;
         if (
           firstPayload.kind !== "recovery" ||
-          stableStringify(firstPayload.sourceSegments) !== stableStringify(unresolvedTorn) ||
+          stableStringify(firstPayload.sourceSegments) !==
+            stableStringify(expectedRecoverySources) ||
           firstPayload.confirmedSequence !== sequence - 1
         ) {
           throw new AuditLedgerError("corrupt");
         }
-        unresolvedTorn.length = 0;
       }
-      for (let recordIndex = 0; recordIndex < parsed.confirmedRecords.length; recordIndex += 1) {
-        const record = parsed.confirmedRecords[recordIndex]!;
+      for (let recordIndex = 0; recordIndex < parsed.records.length; recordIndex += 1) {
+        const { record, frameEnd } = parsed.records[recordIndex]!;
         if (record.payload.kind === "recovery") {
           if (recordIndex !== 0 || !expectedRecovery) {
             throw new AuditLedgerError("corrupt");
           }
+        }
+        if (validatedConfirmations.has(record.sequence)) {
+          throw new AuditLedgerError("corrupt");
+        }
+        const confirmation = confirmations.get(record.sequence);
+        const confirmedHere = confirmation?.segment === segment;
+        if (!confirmedHere) {
+          if (confirmation !== undefined && confirmation.segment < segment) {
+            throw new AuditLedgerError("corrupt");
+          }
+          if (recordIndex !== parsed.records.length - 1) {
+            throw new AuditLedgerError("corrupt");
+          }
+          if (!unresolvedTorn.includes(segment)) unresolvedTorn.push(segment);
+          break;
+        }
+        if (confirmation.digest !== record.digest || confirmation.frameEnd !== frameEnd) {
+          throw new AuditLedgerError("corrupt");
+        }
+        validatedConfirmations.add(record.sequence);
+        if (record.payload.kind === "recovery") {
+          unresolvedTorn.length = 0;
           sawRecovery = true;
         }
         sequence = record.sequence + 1;
         previousDigest = record.digest;
       }
-      if (parsed.tornTail) unresolvedTorn.push(segment);
+      if (parsed.tornTail && !unresolvedTorn.includes(segment)) unresolvedTorn.push(segment);
+    }
+
+    if (validatedConfirmations.size !== confirmations.size) {
+      throw new AuditLedgerError("corrupt");
     }
 
     this.#nextSequence = sequence;
@@ -672,6 +728,55 @@ export class DurableAuditLedger implements AuditSink {
         throw new AuditLedgerError("object-identity");
       }
       return bytes;
+    } finally {
+      await handle.close().catch(() => undefined);
+    }
+  }
+
+  async #readVerifiedConfirmation(sequence: number): Promise<AuditLedgerConfirmation> {
+    await this.#verifyDirectoryIdentity();
+    const path = join(this.#rootDirectory, confirmationName(sequence));
+    const before = await lstat(path).catch(() => {
+      throw new AuditLedgerError("object-identity");
+    });
+    if (
+      !before.isFile() ||
+      before.isSymbolicLink() ||
+      before.size <= 0 ||
+      before.size > MAX_CONFIRMATION_BYTES
+    ) {
+      throw new AuditLedgerError("corrupt");
+    }
+    const handle = await open(path, "r").catch(() => {
+      throw new AuditLedgerError("io");
+    });
+    try {
+      const after = await handle.stat();
+      if (!after.isFile() || !identitiesMatch(identity(before), identity(after))) {
+        throw new AuditLedgerError("object-identity");
+      }
+      const bytes = await handle.readFile();
+      try {
+        if (bytes.byteLength !== after.size || bytes.at(-1) !== 0x0a) {
+          throw new AuditLedgerError("corrupt");
+        }
+        let raw: unknown;
+        try {
+          raw = JSON.parse(bytes.subarray(0, -1).toString("utf8"));
+        } catch {
+          throw new AuditLedgerError("corrupt");
+        }
+        const parsed = confirmationSchema.safeParse(raw);
+        if (!parsed.success || parsed.data.sequence !== sequence) {
+          throw new AuditLedgerError("corrupt");
+        }
+        if (`${stableStringify(parsed.data)}\n` !== bytes.toString("utf8")) {
+          throw new AuditLedgerError("corrupt");
+        }
+        return parsed.data;
+      } finally {
+        bytes.fill(0);
+      }
     } finally {
       await handle.close().catch(() => undefined);
     }
@@ -787,14 +892,23 @@ export class DurableAuditLedger implements AuditSink {
       if (written.bytesWritten !== frame.byteLength) throw new AuditLedgerError("io");
       await this.#runTestHook(this.#testOnly?.beforeSync);
       if (this.#shutdownController.signal.aborted) throw new AuditLedgerError("closed");
-      await handle.sync();
-      this.#segmentSize += frame.byteLength;
+      await this.#syncWithShutdown(handle);
+      if (this.#shutdownController.signal.aborted) throw new AuditLedgerError("closed");
+      const frameEnd = this.#segmentSize + frame.byteLength;
       const parsed = parseSegment(
         frame,
         this.#limits,
         this.#nextSequence,
         this.#previousDigest,
-      ).confirmedRecords[0]!;
+      ).records[0]!.record;
+      await this.#writeConfirmation({
+        formatVersion: AUDIT_LEDGER_FORMAT_VERSION,
+        sequence: parsed.sequence,
+        digest: parsed.digest,
+        segment: this.#currentSegment,
+        frameEnd,
+      });
+      this.#segmentSize = frameEnd;
       this.#nextSequence += 1;
       this.#previousDigest = parsed.digest;
     } catch (error) {
@@ -805,6 +919,67 @@ export class DurableAuditLedger implements AuditSink {
     } finally {
       frame.fill(0);
     }
+  }
+
+  async #writeConfirmation(confirmation: AuditLedgerConfirmation): Promise<void> {
+    if (confirmation.sequence > AUDIT_LEDGER_MAX_CONFIRMATIONS) {
+      this.#status = "full";
+      throw new AuditLedgerError("capacity");
+    }
+    await this.#verifyDirectoryIdentity();
+    const path = join(this.#rootDirectory, confirmationName(confirmation.sequence));
+    const handle = await open(path, "wx", 0o600).catch(() => {
+      throw new AuditLedgerError("object-identity");
+    });
+    let syncCompleted = false;
+    const bytes = Buffer.from(`${stableStringify(confirmation)}\n`, "utf8");
+    try {
+      if (bytes.byteLength > MAX_CONFIRMATION_BYTES) {
+        throw new AuditLedgerError("invalid-event");
+      }
+      const status = await handle.stat();
+      await this.#verifyDirectoryIdentity();
+      if (!status.isFile()) throw new AuditLedgerError("object-identity");
+      const written = await handle.write(bytes, 0, bytes.byteLength, null);
+      if (written.bytesWritten !== bytes.byteLength) throw new AuditLedgerError("io");
+      await this.#syncWithShutdown(handle);
+      syncCompleted = true;
+    } finally {
+      bytes.fill(0);
+      if (syncCompleted || !this.#shutdownController.signal.aborted) {
+        await handle.close().catch(() => undefined);
+      }
+    }
+  }
+
+  async #syncWithShutdown(handle: FileHandle): Promise<void> {
+    const signal = this.#shutdownController.signal;
+    if (signal.aborted) throw new AuditLedgerError("closed");
+    this.#nativeIoHandles.add(handle);
+    const nativeSync = Promise.resolve()
+      .then(() => (this.#testOnly?.sync ?? ((target: FileHandle) => target.sync()))(handle))
+      .finally(() => {
+        this.#nativeIoHandles.delete(handle);
+        if (this.#closed) void handle.close().catch(() => undefined);
+      });
+    await new Promise<void>((resolve, reject) => {
+      const abort = () => {
+        cleanup();
+        reject(new AuditLedgerError("closed"));
+      };
+      const cleanup = () => signal.removeEventListener("abort", abort);
+      signal.addEventListener("abort", abort, { once: true });
+      nativeSync.then(
+        () => {
+          cleanup();
+          resolve();
+        },
+        (error: unknown) => {
+          cleanup();
+          reject(error);
+        },
+      );
+    });
   }
 
   async #runTestHook(hook: (() => void | Promise<void>) | undefined): Promise<void> {

@@ -34,9 +34,10 @@ still reject undeclared fields inside `params`.
 Sessions are memory-only. Audit events store truncated SHA-256 tags instead of
 raw request/session identifiers. Attacker-controlled unknown actions and
 unregistered adapter IDs are also reduced to fixed categories plus hashed tags.
-Structured metadata recursively redacts keys such as token, password, secret,
-authorization, cookie, credential, API key, endpoint, path, PID, username,
-stack, and raw payload/request/record. Future
+The product ledger drops generic event metadata entirely; it cannot persist an
+undeclared path, game-state/input/output field, or blocklist-evasion value.
+The in-memory injectable sink still recursively redacts credential-shaped keys.
+Future
 transports must keep bearer credentials outside request params, authenticate
 before opening a session, encrypt transport traffic, and bound token lifetime.
 
@@ -106,15 +107,19 @@ write a fixed message to stderr without embedding the received frame or error.
 The product sink is a fixed-directory, append-only, bounded local ledger rather
 than process memory. Each strict versioned frame carries a monotonic sequence,
 previous-record digest, and current digest over canonical bytes. Writes are
-serialized and do not acknowledge until the complete append and
-`FileHandle.sync()` resolve. Startup verifies the whole owned chain before
-operator/MCP commit admission. A recognizable incomplete tail is retained and
-continued only through one bounded recovery marker in a new segment; committed
-checksum/schema/order failures, unexpected objects, and object-identity changes
-fail startup closed without repair.
+serialized and do not acknowledge until the complete append/data sync plus an
+exclusive strict per-sequence confirmation-file sync resolve. Startup verifies
+the whole owned frame/confirmation chain before operator/MCP commit admission.
+A partial or complete tail without confirmation is provably unacknowledged and
+is retained/continued only through one bounded recovery marker in a new
+segment. A confirmation whose committed frame is missing or shortened, plus
+checksum/schema/order failures, unexpected objects, and object-identity changes,
+fails startup closed without repair.
 
 Limits are 4 KiB per record, 8 outstanding writes, 64 KiB per segment, 8
-segments, and 500 ms for ledger shutdown drain. There is no eviction, deletion,
+segments, 2,048 confirmations, and 500 ms for ledger shutdown drain. A commit
+reservation holds a worst-case record's physical bytes before side effects,
+including rotation fragmentation. There is no eviction, deletion,
 retry loop, retention timer, upload, database, or remote log service. At the
 hard segment limit, ordinary commits and resume refuse before new side effects.
 Stop is intentionally asymmetric: it closes the latch synchronously before
@@ -133,6 +138,13 @@ anchor. Hostile same-user code, an administrator, or an offline disk editor can
 rewrite both data and digests or remove a complete tail; this design is not
 tamper-proof. Likewise, Node/OS `sync()` acknowledgement does not bypass
 hardware caches or guarantee every physical power-loss model.
+
+When shutdown reaches its deadline, append/sync continuations reject and no
+later frame or confirmation write can run. Node cannot forcibly cancel an OS
+file operation already pending; the ledger stops awaiting/reusing that handle.
+When the operation settles, its only continuation closes the handle, with
+process exit as fallback; bytes lacking confirmation remain unacknowledged on
+restart.
 
 ### Adapter exceeds its authority
 

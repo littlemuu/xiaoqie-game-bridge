@@ -223,37 +223,46 @@ The strict JSON record contains only `formatVersion`, monotonic `sequence`,
 Object keys use code-unit lexical order and SHA-256 covers the canonical record
 without its final digest. Persistent events accept only known action/error
 categories, already-safe 12-hex identifier tags, booleans, timestamp, mode,
-decision, and recursively bounded sanitized metadata. Raw requests, session
+and decision. Raw requests, session
 IDs, principals, owner keys, adapter input/output, observations, game state,
 chat, endpoint/path/PID/username/stack data, and credentials have no persistent
-field.
+field. Generic event metadata is deliberately dropped rather than filtered by
+key/value heuristics; recovery has its own strict closed-world payload.
 
 One serial promise tail owns append order. Admission is capped at 8 outstanding
-writes. State-changing session/game operations atomically reserve one ledger
-slot before adapter/session side effects, so concurrent callers cannot all pass
-a stale capacity check. A frame is at most 4 KiB, a segment at most 64 KiB, and there are at
-most 8 segments. When a frame would cross a segment boundary, a new fixed-name
-segment is exclusively created after identity checks. Once all segments are
-full, the ledger reports `full`, performs no eviction, and refuses ordinary
-commit/resume admission. The internal health snapshot is closed-world:
+writes. State-changing session/game operations atomically reserve one queue
+slot and one worst-case 4 KiB frame of physical segment capacity before
+adapter/session side effects. Reservation simulates rotation and fragmentation,
+so concurrent callers cannot pass a stale byte-capacity check. A frame is at
+most 4 KiB, a segment at most 64 KiB, there are at most 8 segments, and at most
+2,048 fixed confirmation files. When a frame would cross a segment boundary, a
+new fixed-name segment is exclusively created after identity checks. Once
+conservative physical capacity is unavailable, the ledger reports `full`,
+performs no eviction, and refuses ordinary commit/resume admission. The internal health snapshot is closed-world:
 `ready`, `degraded`, `full`, `corrupt`, or `closed`, plus outstanding/segment/
 sequence counters. It is not exposed as an MCP log or file resource.
 
-`write()` resolves only after the full frame append completes and
-`FileHandle.sync()` resolves. This distinguishes enqueue, append, and the
-selected Node/OS sync acknowledgement. It does not claim to flush controller
-or device caches outside the OS contract or survive every physical power-loss
-model. Append/sync/object failures disable further writes in that instance.
+`write()` first appends and syncs the full data frame. It then exclusively
+creates a strict `confirmation-NNNNNNNNNNNNNNNN.audit` file containing only
+version, sequence, digest, segment, and frame-end offset, and syncs that file.
+Only then does `write()` resolve. This distinguishes enqueue, data append,
+data sync, and persistent acknowledgement. It does not claim to flush
+controller or device caches outside the OS contract or survive every physical
+power-loss model. Append/sync/confirmation/object failures disable further
+writes in that instance.
 
-Startup parses all confirmed frames and replays the sequence/digest chain
-before constructing operator or MCP commit surfaces. A final incomplete frame
-is unconfirmed: its bytes and segment stay unchanged, the next available
-segment is exclusively created, and one synced recovery record names only the
-bounded source segment numbers and last confirmed sequence. A later restart
-recognizes that marker and does not create another. Unknown versions, invalid
-canonical bytes/sizes/schema, sequence or digest breaks, committed corruption,
-unexpected objects, and identity changes fail startup closed with a fixed
-diagnostic; evidence is not repaired or rewritten.
+Startup pairs frames with the contiguous strict confirmation set and replays
+only confirmed sequence/digest links before constructing operator or MCP commit
+surfaces. A final partial or complete frame without a confirmation is proven
+unacknowledged: its bytes and segment stay unchanged, the next available
+segment is exclusively created, and one synced recovery record/confirmation
+names only the bounded source segment numbers and last confirmed sequence. A
+later restart recognizes that marker and does not create another. If a
+confirmation exists but its frame is missing, shortened, moved, or mismatched,
+startup treats it as committed-history loss and fails closed. Unknown versions,
+invalid canonical bytes/sizes/schema, sequence or digest breaks, unexpected
+objects, and identity changes likewise fail closed; evidence is not repaired
+or rewritten.
 
 The digest chain detects accidental corruption, internal truncation/torn
 writes, and ordering faults within the trusted same-user model. It has neither
@@ -262,9 +271,13 @@ against hostile same-user, administrator, or offline-disk rewriting, including
 a coordinated rewrite of records and digests.
 
 Shutdown first stops new ledger admission and drains the serial tail for at
-most 500 ms. The deadline aborts test-mode pending append/sync fault hooks,
-settles tracked promises, closes the owned handle, leaves a possible partial
-tail for startup recovery, and performs no retry or background retention job.
+most 500 ms. Append and sync continuations race the same abort signal. When the
+deadline fires, tracked application promises reject promptly and no later
+confirmation, append, retry, or background retention action can run. A native
+OS operation already pending cannot be forcibly cancelled by Node; close does
+not await or reuse that handle. When it settles, its only continuation closes
+the handle, with process exit as fallback; any bytes without a confirmation
+remain unacknowledged recovery input on restart.
 
 ## Bounded lifetime and control-plane behavior
 

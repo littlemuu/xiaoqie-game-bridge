@@ -86,7 +86,8 @@ The defaults are intentionally finite:
 - 256 idempotency entries per session
 - 4 concurrent commit writes across the bridge
 - 4 KiB per audit record, 8 pending audit writes, 64 KiB per segment,
-  8 segments total, and a 500 ms ledger shutdown-drain deadline
+  8 segments total, 2,048 confirmation markers, and a 500 ms ledger
+  shutdown-drain deadline
 
 Configure the first three through `SessionManagerOptions` (`maxSessions`,
 `terminalRetentionMs`, and `maxRequestsPerSession`). Configure the write gate
@@ -164,17 +165,23 @@ ledger segments are not removed or truncated.
 
 Each closed-world version-1 record has an eight-hex-byte length prefix, a
 canonical JSON payload, newline frame terminator, monotonic sequence, previous
-record digest, and its own SHA-256 digest. A successful `AuditSink.write()`
-means the complete frame was appended and Node's `FileHandle.sync()` resolved.
-This is the strongest acknowledgement used here, but it does not bypass OS or
-device caches and is not a guarantee for every power-loss model.
+record digest, and its own SHA-256 digest. The ledger persists no generic event
+metadata; only the declared top-level event fields and strict recovery payload
+exist. After syncing the data frame, it exclusively creates and syncs a strict
+per-sequence confirmation marker. A successful `AuditSink.write()` means both
+operations resolved. This is the strongest acknowledgement used here, but it
+does not bypass OS or device caches and is not a guarantee for every power-loss
+model.
 
-On startup, every owned segment, frame, schema, sequence, and digest link is
-validated before operator or MCP commits are admitted. A recognizable partial
-final frame is preserved in place; startup moves to the next fixed segment and
-syncs one bounded recovery marker. Reopening that history is idempotent.
-Unknown versions, committed-region corruption, illegal sizes/order, unexpected
-objects, and identity changes fail startup closed without rewriting evidence.
+On startup, every owned segment, confirmation marker, frame, schema, sequence,
+and digest link is validated before operator or MCP commits are admitted. A
+partial or complete tail without a confirmation marker is provably
+unacknowledged: it is preserved in place, startup moves to the next fixed
+segment, and syncs one bounded recovery record plus confirmation. Reopening
+that history is idempotent. A missing/truncated frame that still has its synced
+confirmation is committed-history loss and fails closed. Unknown versions,
+other committed-region corruption, illegal sizes/order, unexpected objects,
+and identity changes also fail startup closed without rewriting evidence.
 At the eight-segment hard limit, history is not evicted: new ordinary commits
 and resume fail closed. Emergency stop still closes the latch first and only
 then attempts audit, so audit rejection/full state can fail the command result
@@ -186,6 +193,14 @@ key or external anchor it is not tamper-proof against hostile same-user code,
 administrators, or offline disk rewriting. The ledger contains no game state,
 observations, inputs/outputs, chat, account, save, screen, or persistent bearer
 secret, and there is no MCP/CLI log reader or arbitrary file API.
+
+Reservations conservatively hold one maximum-size record of remaining physical
+segment capacity before a state-changing operation begins, including rotation
+fragmentation. On shutdown, the 500 ms deadline aborts application continuations
+waiting on append/sync. If an OS file operation itself remains pending, close
+returns without later confirmation, retry, or write. Its only later continuation
+closes the handle when the native operation settles; process exit is the fallback,
+and startup treats any unconfirmed bytes conservatively.
 
 ## Local operator CLI (Windows)
 
