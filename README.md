@@ -4,7 +4,8 @@ An offline-first, default-deny foundation for narrowly scoped game adapters,
 with a client-spawned local stdio/MCP contract and a separate same-user Windows
 named-pipe operator channel. The product server runs only a deterministic mock
 world in a bounded child process: it does not start, inspect, or control any
-real game or desktop application.
+real game or desktop application. Its bridge/operator security events use a
+separate bounded local audit ledger; that ledger is not a game save.
 
 ## Requirements
 
@@ -41,8 +42,10 @@ latch, and proves that observation remains available while writes are denied.
 - A global safety latch blocks new commit writes. Each running-to-stopped edge
   increments a monotonic `stopGeneration`; resume requires that exact observed
   generation and zero in-flight writes.
-- Audit events contain hashed request/session tags and recursively redact common
-  credential fields. Session events may contain a short caller tag derived by
+- Product audit events survive clean restart in a fixed append-only local
+  ledger. They contain hashed request/session tags and recursively redact common
+  credential, path, endpoint, PID, username, stack, and raw-payload fields.
+  Session events may contain a short caller tag derived by
   HMAC with a process-memory-only random key, never the caller principal, full
   owner digest, or HMAC key.
 - The product server exposes no shell, generic process, filesystem, network,
@@ -82,6 +85,9 @@ The defaults are intentionally finite:
 - 5-minute terminal-session retention
 - 256 idempotency entries per session
 - 4 concurrent commit writes across the bridge
+- 4 KiB per audit record, 8 pending audit writes, 64 KiB per segment,
+  8 segments total, 2,048 confirmation markers, 2,048 independent checkpoints,
+  and a 500 ms ledger shutdown-drain deadline
 
 Configure the first three through `SessionManagerOptions` (`maxSessions`,
 `terminalRetentionMs`, and `maxRequestsPerSession`). Configure the write gate
@@ -100,8 +106,9 @@ locked out by request capacity.
 
 After `npm run build`, a local MCP client may spawn the server with Node at
 `dist/src/mcp/stdio-server.js`. `npm run mcp:stdio` invokes that same built
-entrypoint, which first creates the local operator named-pipe listener and then
-waits for MCP messages on stdin. It opens no TCP/HTTP port and creates no relay,
+entrypoint, which first opens and verifies the fixed local audit ledger, then
+creates the local operator named-pipe listener, and only then waits for MCP
+messages on stdin. Ledger or operator startup failure exits closed. It opens no TCP/HTTP port and creates no relay,
 tunnel, background service, or host configuration.
 
 The MCP surface registers exactly one tool, `game_bridge_request`. Its input and
@@ -144,6 +151,62 @@ forcibly cancel or roll back a write that already entered the core or worker. Th
 must close first, followed by the server/transport. The MCP surface exposes no
 operator identity or local safety status/resume surface, and `safety.resume`
 remains unknown to ordinary bridge requests.
+
+## Durable local audit ledger
+
+Production stores only the bridge/operator's bounded safety events under the
+fixed current-user application directory
+`AppData/Local/xiaoqie-game-bridge-audit/ledger`. No MCP request, bridge
+parameter, adapter, operator command, CLI option, or application-specific
+environment setting can select a path, file name, format, rotation rule, or
+capacity. The operator's ephemeral descriptor remains in the separate
+`xiaoqie-game-bridge` runtime directory and is still removed on normal exit;
+ledger segments are not removed or truncated.
+
+Each closed-world version-1 record has an eight-hex-byte length prefix, a
+canonical JSON payload, newline frame terminator, monotonic sequence, previous
+record digest, and its own SHA-256 digest. The ledger persists no generic event
+metadata; only the declared top-level event fields and strict recovery payload
+exist. After syncing the data frame, it exclusively creates and syncs a strict
+per-sequence confirmation marker, then exclusively creates and syncs a matching
+checkpoint. A successful `AuditSink.write()` means all three operations
+resolved. The duplicate evidence makes deletion of either final auxiliary file
+detectable by the other. This is the strongest acknowledgement used here, but
+it does not bypass OS or device caches and is not a guarantee for every
+power-loss model.
+
+On startup, every owned segment, confirmation, checkpoint, frame, schema,
+sequence, and digest link is validated before operator or MCP commits are
+admitted. The confirmation and checkpoint sets must be identical and contiguous.
+A partial or complete tail with neither form of evidence is provably
+unacknowledged: it is preserved in place, startup moves to the next fixed
+segment, and syncs one bounded recovery record plus both evidence files.
+Reopening that history is idempotent. Missing/mismatched confirmation,
+checkpoint, or committed frame is committed-history loss and fails closed.
+Unknown versions, other committed-region corruption, illegal sizes/order,
+unexpected objects, and identity changes also fail startup closed without
+rewriting evidence.
+At the eight-segment hard limit, history is not evicted: new ordinary commits
+and resume fail closed. Emergency stop still closes the latch first and only
+then attempts audit, so audit rejection/full state can fail the command result
+but cannot return the latch to running.
+
+The chain detects ordinary torn writes, internal truncation, reordering, and
+accidental corruption inside the trusted same-user boundary. With no protected
+key or external anchor it is not tamper-proof against hostile same-user code,
+administrators, or offline disk rewriting. The ledger contains no game state,
+observations, inputs/outputs, chat, account, save, screen, or persistent bearer
+secret, and there is no MCP/CLI log reader or arbitrary file API.
+
+Reservations conservatively hold one maximum-size record of remaining physical
+segment capacity before a state-changing operation begins, including rotation
+fragmentation. On shutdown, the 500 ms deadline aborts application continuations
+waiting on native segment/evidence writes or syncs. If an OS file operation
+itself remains pending, close returns without later confirmation, checkpoint,
+retry, or write. Its only later continuation closes the handle when the native
+operation settles. That cleanup keys directly off the abort signal, including
+the abort-to-closed transition window; process exit is the fallback, and
+startup treats any bytes without either evidence file conservatively.
 
 ## Local operator CLI (Windows)
 

@@ -32,6 +32,20 @@
 - Immediate-destroy overflow admission with explicit socket/timer/response
   counters, tracked handler/audit settlement, and flood/late-shutdown regressions
 - Injectable audit sink, hashed identifiers, and recursive credential redaction
+- Product `DurableAuditLedger` with canonical version-1 frames, monotonic
+  SHA-256 chain, append/data-sync plus strict per-record confirmation and
+  independent checkpoint-file syncs, fixed application-owned directory,
+  strict object identity checks, and minimal health counters
+- Conservative torn-tail recovery that preserves original bytes, appends one
+  bounded recovery marker in a new segment, and remains idempotent on restart
+- Hard audit limits: 4 KiB record, 8 pending writes, 64 KiB segment, 8 segments,
+  2,048 confirmations, 2,048 checkpoints, and 500 ms shutdown drain; no
+  eviction, retry loop, upload, or background job
+- Worst-case physical-byte reservation before ordinary state changes; confirmed
+  tail/evidence loss fails closed, while only bytes lacking both evidence files
+  are recoverable
+- No generic persistent metadata: undeclared paths, game state, inputs, outputs,
+  and regex/blocklist evasions have no ledger field
 - Deterministic in-memory mock adapter with movement and block placement
 - Fixed process-backed product mock with strict versioned pipe IPC, static
   identity, 64/32 KiB frame/message limits, eight pending calls, bounded
@@ -59,6 +73,10 @@
   capability, adapter, safety, or close-capacity bypass. A different caller
   cannot read completed responses or wait on in-flight work.
 - Sessions and idempotency state are intentionally not persisted.
+- Audit events are the only newly persisted state. They are not game saves and
+  contain neither mock/real game state nor adapter inputs/outputs. The ledger
+  path/segments/format/limits are fixed by product code and are not request,
+  MCP, CLI, adapter, or application-specific environment options.
 - Terminal retention is five minutes by default. Sweep is explicit and
   deterministic; session open invokes it, but no background timer exists.
 - Request entries are not evicted. At capacity, an existing ID replays, a new
@@ -92,6 +110,7 @@ npm run check
 npm test
 npm run demo
 npm run build
+npm audit
 git diff --check
 ```
 
@@ -100,17 +119,21 @@ Actual local results on 2026-08-31 with Node.js `v22.23.1` and npm `10.9.8`:
 - `npm ci` — passed; 73 packages installed, 74 audited, 0 vulnerabilities
 - `npm audit` — passed; 0 vulnerabilities
 - `npm run check` — passed
-- `npm test` — passed; 6 files and 74 tests. The original 5 files / 62 tests
-  remain green, plus 12 operator groups covering real Windows named pipes,
-  built CLI/stdio shared state, generations, in-flight and capacity pressure,
-  hostile frames/connections, startup collisions, and exact cleanup
+- `npm test` — passed; 7 files and 92 tests. All prior 74 tests remain green,
+  plus 17 durable-ledger groups and one corrupt-product-startup regression
+  covering deterministic records, recursive leakage resistance, strict serial
+  chains, all final-frame byte truncation points, committed corruption,
+  identity/symlink faults, recovery idempotence, hard capacity, atomic commit
+  reservation, bounded shutdown, and built-child restart
 - Real stdio contract — passed inside `npm test`; official
   `Client@2.0.0`/`StdioClientTransport` started the built Node entrypoint,
   completed initialize/list/calls, and closed client first then transport
 - Real operator contract — passed inside `npm test`; the built CLI observed and
   stopped the same runtime used by the official MCP client, blocked a new MCP
   commit while leaving observe/dry-run/session-close usable, resumed generation
-  1, and observed a later MCP stop. The built CLI produced fixed output and exit
+  1, and observed a later MCP stop. A second built product using the same
+  isolated test profile verified and continued the ledger, adding another
+  acknowledged stop/resume pair. The built CLI produced fixed output and exit
   codes; cleanup left no descriptor or reachable listener.
 - `npm run demo` — passed; one idempotency hit, one committed move, safety-stop
   denial, and safe observation were demonstrated
@@ -122,24 +145,29 @@ Installed versions were `@modelcontextprotocol/server@2.0.0`, dev-only
 version and no peer conflict. The verification runner used TypeScript `5.9.2`
 and Vitest `3.2.7`.
 
-Windows ACL evidence was sampled with `Get-Acl` against live runtime objects.
-Both directory and descriptor were owned by the current user, had 6 inherited
-allow rules, no broad Everyone/Authenticated Users/ordinary Users allow rule,
-and retained SYSTEM/Administrators entries. `AreAccessRulesProtected` was
-false, so this is explicitly not claimed as a custom user-exclusive DACL.
+Windows audit-file evidence was sampled from a real append-and-sync in a
+uniquely named temporary directory. The ledger object was a directory, its
+segment was a regular 386-byte file, both were owned by the current user, each
+had 11 inherited rules and zero broad Everyone/Authenticated Users/ordinary
+Users allow rule, and `AreAccessRulesProtected` was false. The exact temporary
+root was path-checked and removed (`TEMP_EVIDENCE_CLEANED=True`). These inherited
+ACLs and Node mode requests are explicitly not claimed as a custom
+user-exclusive DACL or hostile same-user isolation.
 
-The checked-in workflow has two coherent jobs: Ubuntu executes the 60
-platform-neutral tests while marking 14 Windows-only built-child/operator cases
-skipped, and `windows-latest` executes all 74 tests including real named-pipe,
+The checked-in workflow has two coherent jobs: Ubuntu executes the 77
+platform-neutral tests while marking 15 Windows-only built-child/operator cases
+skipped, and `windows-latest` executes all 92 tests including real named-pipe,
 CLI, and stdio-child evidence. Both jobs run check, test, demo, build, audit, and
 diff-check after `npm ci`.
 
-On this Windows managed host, Vitest, tsx, and the explicitly approved official
-stdio-client child test ran outside the process sandbox because child process
-creation receives `spawn EPERM` inside it. The only product child launched in
-tests was Node running this repository's built stdio entrypoint. No network,
-game, desktop application, account, save, or host configuration was accessed.
-GitHub-hosted CI status is recorded in the Draft PR.
+On this Windows managed host, the final commands used the existing fnm
+Node.js `v22.23.1` and npm `10.9.8` explicitly. Vitest, tsx, and approved built
+children ran outside the process sandbox because child creation receives
+`spawn EPERM` inside it. Every product/operator child used a unique temporary
+profile, and suite teardown removed it; the ACL fixture was also precisely
+removed. No network (except npm install/audit and later GitHub delivery), real
+game, desktop application, account, save, existing user file, or host
+configuration was accessed. GitHub-hosted CI status is recorded in the Draft PR.
 
 ## Known limits
 
@@ -152,7 +180,8 @@ GitHub-hosted CI status is recorded in the Draft PR.
   still has no remote identity provider, credential validation, or persistence.
 - Stdio is local process plumbing, not an authorization boundary suitable for a
   remote endpoint.
-- Audit and session state disappear on process exit.
+- Session, idempotency, safety-latch, and mock-game state still disappear on
+  process exit. Only the bounded sanitized audit ledger survives restart.
 - The mock process boundary is not an OS sandbox or authorization for a real adapter.
 - Safety stop blocks new writes but does not forcibly cancel an asynchronous
   adapter action already in flight; real adapters may need cooperative
@@ -164,6 +193,16 @@ GitHub-hosted CI status is recorded in the Draft PR.
 - Windows descriptor modes do not prove a custom user-exclusive DACL. The
   verified boundary remains trusted same-user code; administrator and hostile
   same-user code are residual risks.
+- The audit hash chain and inherited ACL detect/support ordinary same-user
+  operation but do not prove hostile-user tamper resistance. There is no
+  protected key, external anchor, automatic retention/deletion, or OS sandbox.
+- `FileHandle.sync()` is the selected persistence acknowledgement, not a claim
+  to bypass hardware caches or survive every physical power-loss model.
+- A shutdown deadline cannot cancel a native OS operation already pending, but
+  the application stops awaiting/reusing the handle and forbids every later
+  append/confirmation/checkpoint continuation. The native operation's only later
+  continuation closes the handle when it settles, keyed directly to the abort
+  signal even before the final closed-state assignment; process exit is fallback.
 - A forced Windows process kill can leave a stale descriptor. Restart then
   fails closed and preserves it; normal EOF/error/close paths clean up, and no
   automatic stale-file deletion is attempted without launch identity evidence.

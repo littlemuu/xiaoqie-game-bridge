@@ -23,6 +23,9 @@ separate local operator CLI
                     | strict authenticated Windows named-pipe frames
                     v
  operator server -> same bridge local control -> same safety latch + audit sink
+                                                        |
+                                                        v
+                         fixed bounded local audit segments (not game state)
 ```
 
 The client-spawned stdio process is the first protocol boundary. It creates no
@@ -48,6 +51,9 @@ not bypass the core.
   control-plane object created by the bridge.
 - `audit.ts` hashes request/session identifiers and recursively redacts common
   credential-shaped keys before an event reaches an injected sink.
+- `audit/durable-ledger.ts` owns the fixed product audit directory, canonical
+  versioned frame/record format, serial append-and-sync queue, segment limits,
+  startup verification, and conservative torn-tail recovery.
 - `bridge.ts` is the only orchestration path. It composes all checks before an
   adapter call and records both allowed and denied outcomes.
 - `mcp/server.ts` owns the pure, bridge-injected MCP server factory, its single
@@ -141,9 +147,10 @@ trusted and separately reviewable code.
    await that same promise; conflicting content is rejected.
 6. Reject adapter mismatches, missing capabilities, unknown game actions, and
    invalid action inputs.
-7. For commit writes, synchronously check stop/write capacity and increment the
-   global in-flight count in one `beginWrite()` operation. Dry-runs skip this
-   gate and remain non-mutating.
+7. For commit writes, reject known unavailable durable-audit capacity, then
+   synchronously check stop/write capacity and increment the global in-flight
+   count in one `beginWrite()` operation. Dry-runs skip the write gate and
+   remain non-mutating.
 8. Execute the adapter and release the in-flight count in `finally`, including
    known and unknown adapter failures.
 9. Replace the in-flight entry with the completed response and record a
@@ -192,6 +199,88 @@ not mapped to each other. A transport-level size/concurrency refusal never
 enters the session request cache, so a later retry with the same bridge ID may
 enter the core once capacity is available.
 
+## Durable audit format and lifecycle
+
+The product runtime replaces `MemoryAuditSink` with `DurableAuditLedger`.
+Tests and explicitly injected bridge fixtures may still use memory sinks. The
+ledger root is a trusted-code constant beneath the current user's Local
+AppData, separate from the operator descriptor runtime directory. Segment
+names are exactly `segment-NNNN.audit`; requests, MCP, CLI, adapters, and
+application-specific environment settings cannot supply a ledger path or file
+name. Initialization accepts only its own sequential regular segment files and
+checks directory/file type and stable object identity around opens. It never
+scans the user profile or deletes, truncates, replaces, or auto-rotates away
+history.
+
+Version 1 frames are:
+
+```text
+8 lowercase hexadecimal JSON-byte count | ':' | canonical JSON | '\n'
+```
+
+The strict JSON record contains only `formatVersion`, monotonic `sequence`,
+`previousDigest`, one closed-world event or recovery payload, and `digest`.
+Object keys use code-unit lexical order and SHA-256 covers the canonical record
+without its final digest. Persistent events accept only known action/error
+categories, already-safe 12-hex identifier tags, booleans, timestamp, mode,
+and decision. Raw requests, session
+IDs, principals, owner keys, adapter input/output, observations, game state,
+chat, endpoint/path/PID/username/stack data, and credentials have no persistent
+field. Generic event metadata is deliberately dropped rather than filtered by
+key/value heuristics; recovery has its own strict closed-world payload.
+
+One serial promise tail owns append order. Admission is capped at 8 outstanding
+writes. State-changing session/game operations atomically reserve one queue
+slot and one worst-case 4 KiB frame of physical segment capacity before
+adapter/session side effects. Reservation simulates rotation and fragmentation,
+so concurrent callers cannot pass a stale byte-capacity check. A frame is at
+most 4 KiB, a segment at most 64 KiB, there are at most 8 segments, at most
+2,048 fixed confirmation files, and 2,048 matching checkpoint files. When a frame would cross a segment boundary, a
+new fixed-name segment is exclusively created after identity checks. Once
+conservative physical capacity is unavailable, the ledger reports `full`,
+performs no eviction, and refuses ordinary commit/resume admission. The internal health snapshot is closed-world:
+`ready`, `degraded`, `full`, `corrupt`, or `closed`, plus outstanding/segment/
+sequence counters. It is not exposed as an MCP log or file resource.
+
+`write()` first appends and syncs the full data frame. It then exclusively
+creates and syncs a strict `confirmation-NNNNNNNNNNNNNNNN.audit`, followed by a
+matching `checkpoint-NNNNNNNNNNNNNNNN.audit`; each contains only version,
+sequence, digest, segment, and frame-end offset. Only then does `write()`
+resolve. Either auxiliary file independently exposes deletion of the other.
+This distinguishes enqueue, data append, data sync, and persistent
+acknowledgement. It does not claim to flush controller or device caches outside
+the OS contract or survive every physical power-loss model. Append/sync/
+evidence/object failures disable further writes in that instance.
+
+Startup requires identical contiguous confirmation/checkpoint sets, pairs both
+with every committed frame, and replays only those sequence/digest links before
+constructing operator or MCP commit surfaces. A final partial or complete frame
+with neither evidence file is proven unacknowledged: its bytes and segment stay
+unchanged, the next available segment is exclusively created, and one synced
+recovery record plus both evidence files name only the bounded source segments
+and last confirmed sequence. A later restart recognizes that record and does
+not create another. Missing or mismatched evidence, or a missing, shortened,
+moved, or mismatched committed frame, is committed-history loss and fails
+closed. Unknown versions, invalid canonical bytes/sizes/schema, sequence or
+digest breaks, unexpected objects, and identity changes likewise fail closed;
+evidence is not repaired or rewritten.
+
+The digest chain detects accidental corruption, internal truncation/torn
+writes, and ordering faults within the trusted same-user model. It has neither
+a protected key nor an external anchor, so it is not cryptographic proof
+against hostile same-user, administrator, or offline-disk rewriting, including
+a coordinated rewrite of records and digests.
+
+Shutdown first stops new ledger admission and drains the serial tail for at
+most 500 ms. Native segment/evidence writes and sync continuations race the same
+abort signal. When the deadline fires, tracked application promises reject
+promptly and no later confirmation, checkpoint, append, retry, or background retention action can run. A native
+OS operation already pending cannot be forcibly cancelled by Node; close does
+not await or reuse that handle. When it settles, its only continuation closes
+the handle whenever the shutdown signal is aborted, including before the final
+closed-state assignment, with process exit as fallback; bytes without either
+evidence file remain unacknowledged recovery input on restart.
+
 ## Bounded lifetime and control-plane behavior
 
 Defaults are 64 sessions, five minutes of terminal retention, 256 request
@@ -224,12 +313,13 @@ adapter write already past `beginWrite()` was forcibly cancelled.
 
 ## Operator startup, protocol, and shutdown
 
-`createProductRuntime()` is the single construction seam. The stdio entrypoint
-starts `LocalOperatorServer` with that runtime's control object before calling
-`serveStdio`; any runtime-directory, descriptor, or listener failure writes one
-fixed stderr category and returns without accepting MCP. Shutdown first starts
-closing MCP, then closes operator connections/listener and the adapter with
-bounded waits, and finally waits briefly for MCP transport completion. A
+Async `createProductRuntime()` is the single construction seam. It verifies or
+creates the durable ledger before returning a bridge/control object. The stdio
+entrypoint then starts `LocalOperatorServer` before calling `serveStdio`; any
+ledger, runtime-directory, descriptor, or listener failure writes one fixed
+stderr category and returns without accepting MCP. Shutdown first starts
+closing MCP, then closes operator connections/listener, ledger, and adapter
+with bounded waits, and finally waits briefly for MCP transport completion. A
 process-exit fallback performs the same identity-checked descriptor cleanup
 synchronously.
 

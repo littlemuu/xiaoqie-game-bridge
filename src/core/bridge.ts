@@ -5,6 +5,7 @@ import { AdapterRegistry } from "./adapter-registry.js";
 import {
   type AuditEvent,
   type AuditSink,
+  type AuditWriteReservation,
   MemoryAuditSink,
   redactSensitive,
   safeIdentifierTag,
@@ -349,14 +350,34 @@ export class GameBridge {
     });
   }
 
-  #writeAudit(event: AuditEvent): Promise<void> {
-    const pending = writeAudit(this.#audit, event);
+  #writeAudit(
+    event: AuditEvent,
+    reservation?: AuditWriteReservation,
+  ): Promise<void> {
+    const pending = writeAudit(reservation ?? this.#audit, event);
     this.#auditWrites.add(pending);
     void pending.then(
       () => this.#auditWrites.delete(pending),
       () => this.#auditWrites.delete(pending),
     );
     return pending;
+  }
+
+  #reserveAuditForStateChange(
+    request: RequestEnvelope,
+  ): AuditWriteReservation | null | undefined {
+    if (
+      request.mode !== "commit" ||
+      (request.action !== "session.open" &&
+        request.action !== "session.close" &&
+        request.action !== "game.act")
+    ) {
+      return undefined;
+    }
+    if (this.#audit.reserveWrite !== undefined) {
+      return this.#audit.reserveWrite() ?? null;
+    }
+    return this.#audit.isWritable?.() === false ? null : undefined;
   }
 
   async handle(
@@ -487,6 +508,14 @@ export class GameBridge {
       await this.#record(request, response, false, adapter.id, undefined, callerOwnerKey);
       return response;
     }
+    const auditReservation = this.#reserveAuditForStateChange(request);
+    if (auditReservation === null) {
+      return errorResponse(
+        request,
+        "RESOURCE_CAPACITY",
+        "Durable audit capacity is unavailable for state-changing actions.",
+      );
+    }
     let session: Session;
     try {
       session = this.#sessions.open(
@@ -508,7 +537,15 @@ export class GameBridge {
               "INTERNAL_ERROR",
               "The bridge could not open a session.",
             );
-      await this.#record(request, response, false, adapter.id, undefined, callerOwnerKey);
+      await this.#record(
+        request,
+        response,
+        false,
+        adapter.id,
+        undefined,
+        callerOwnerKey,
+        auditReservation,
+      );
       return response;
     }
     const response = successResponse(request, {
@@ -519,7 +556,7 @@ export class GameBridge {
     });
     await this.#record(request, response, false, adapter.id, {
       openedSessionTag: safeIdentifierTag(session.id),
-    }, callerOwnerKey);
+    }, callerOwnerKey, auditReservation);
     return response;
   }
 
@@ -611,10 +648,18 @@ export class GameBridge {
     }
 
     if (closeCapacityBypass) {
+      const auditReservation = this.#reserveAuditForStateChange(request);
+      if (auditReservation === null) {
+        return errorResponse(
+          request,
+          "RESOURCE_CAPACITY",
+          "Durable audit capacity is unavailable for state-changing actions.",
+        );
+      }
       const response = await this.#executeSessionOperation(request, session, operation);
       await this.#record(request, response, false, session.adapterId, {
         requestCapacityBypass: "session.close",
-      }, callerOwnerKey);
+      }, callerOwnerKey, auditReservation);
       return response;
     }
 
@@ -628,6 +673,22 @@ export class GameBridge {
       responsePromise,
     });
 
+    const auditReservation = this.#reserveAuditForStateChange(request);
+    if (auditReservation === null) {
+      const response = errorResponse(
+        request,
+        "RESOURCE_CAPACITY",
+        "Durable audit capacity is unavailable for state-changing actions.",
+      );
+      session.requests.set(request.requestId, {
+        fingerprint,
+        state: "completed",
+        response,
+      });
+      resolveInFlight(response);
+      return response;
+    }
+
     const response = await this.#executeSessionOperation(request, session, operation);
     session.requests.set(request.requestId, {
       fingerprint,
@@ -635,7 +696,15 @@ export class GameBridge {
       response,
     });
     resolveInFlight(response);
-    await this.#record(request, response, false, session.adapterId, undefined, callerOwnerKey);
+    await this.#record(
+      request,
+      response,
+      false,
+      session.adapterId,
+      undefined,
+      callerOwnerKey,
+      auditReservation,
+    );
     return response;
   }
 
@@ -797,33 +866,48 @@ export class GameBridge {
     adapterId?: string,
     metadata?: unknown,
     callerOwnerKey?: SessionOwnerKey,
+    auditReservation?: AuditWriteReservation,
   ): Promise<void> {
+    if (
+      !response.ok &&
+      response.error.code === "RESOURCE_CAPACITY" &&
+      auditReservation === undefined &&
+      this.#audit.isWritable?.() === false
+    ) {
+      return;
+    }
     const actionIsRegistered = isKnownBridgeAction(request.action);
     const adapterIsRegistered =
       adapterId !== undefined && this.#registry.get(adapterId) !== undefined;
-    const event: AuditEvent = {
-      timestamp: new Date(this.#clock()).toISOString(),
-      ...(callerOwnerKey === undefined
-        ? {}
-        : { callerTag: sessionCallerTag(callerOwnerKey, this.#callerTagKey) }),
-      requestIdTag: safeIdentifierTag(request.requestId)!,
-      ...(request.sessionId === undefined
-        ? {}
-        : { sessionIdTag: safeIdentifierTag(request.sessionId)! }),
-      ...(adapterId === undefined
-        ? {}
-        : adapterIsRegistered
-          ? { adapterId }
-          : { adapterIdTag: safeIdentifierTag(adapterId)! }),
-      action: actionIsRegistered ? request.action : "unregistered",
-      ...(actionIsRegistered ? {} : { actionTag: safeIdentifierTag(request.action)! }),
-      mode: request.mode,
-      decision: response.ok ? "allow" : "deny",
-      ...(!response.ok ? { errorCode: response.error.code } : {}),
-      safetyStopped: this.#safety.isStopped(),
-      idempotencyHit,
-      ...(metadata === undefined ? {} : { metadata: redactSensitive(metadata) }),
-    };
-    await this.#writeAudit(event);
+    let submitted = false;
+    try {
+      const event: AuditEvent = {
+        timestamp: new Date(this.#clock()).toISOString(),
+        ...(callerOwnerKey === undefined
+          ? {}
+          : { callerTag: sessionCallerTag(callerOwnerKey, this.#callerTagKey) }),
+        requestIdTag: safeIdentifierTag(request.requestId)!,
+        ...(request.sessionId === undefined
+          ? {}
+          : { sessionIdTag: safeIdentifierTag(request.sessionId)! }),
+        ...(adapterId === undefined
+          ? {}
+          : adapterIsRegistered
+            ? { adapterId }
+            : { adapterIdTag: safeIdentifierTag(adapterId)! }),
+        action: actionIsRegistered ? request.action : "unregistered",
+        ...(actionIsRegistered ? {} : { actionTag: safeIdentifierTag(request.action)! }),
+        mode: request.mode,
+        decision: response.ok ? "allow" : "deny",
+        ...(!response.ok ? { errorCode: response.error.code } : {}),
+        safetyStopped: this.#safety.isStopped(),
+        idempotencyHit,
+        ...(metadata === undefined ? {} : { metadata: redactSensitive(metadata) }),
+      };
+      submitted = true;
+      await this.#writeAudit(event, auditReservation);
+    } finally {
+      if (!submitted) auditReservation?.release();
+    }
   }
 }

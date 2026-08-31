@@ -1,4 +1,6 @@
-import { resolve } from "node:path";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { InMemoryTransport, type McpServer } from "@modelcontextprotocol/server";
@@ -87,6 +89,17 @@ interface Connection {
 }
 
 const openConnections: Connection[] = [];
+const temporaryProfiles = new Set<string>();
+
+async function isolatedChildEnvironment(): Promise<Record<string, string>> {
+  const profile = await mkdtemp(join(tmpdir(), "xiaoqie-product-profile-"));
+  temporaryProfiles.add(profile);
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined) env[key] = value;
+  }
+  return { ...env, HOME: profile, USERPROFILE: profile };
+}
 
 async function connectInMemory(server: McpServer): Promise<Connection> {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -112,6 +125,12 @@ async function connectInMemory(server: McpServer): Promise<Connection> {
 
 afterEach(async () => {
   await Promise.allSettled(openConnections.splice(0).map((connection) => connection.close()));
+  await Promise.all(
+    [...temporaryProfiles].map(async (profile) => {
+      await rm(profile, { recursive: true, force: true });
+      temporaryProfiles.delete(profile);
+    }),
+  );
 });
 
 function createMockBridge(options: { sessions?: SessionManager } = {}): GameBridge {
@@ -410,10 +429,12 @@ describe("local MCP contract", () => {
     "round-trips through the built stdio child with the official client",
     async () => {
     const entrypoint = resolve(process.cwd(), "dist", "src", "mcp", "stdio-server.js");
+    const env = await isolatedChildEnvironment();
     const transport = new StdioClientTransport({
       command: process.execPath,
       args: [entrypoint],
       cwd: process.cwd(),
+      env,
       stderr: "pipe",
       maxBufferSize: STDIO_MAX_BUFFER_BYTES,
     });
@@ -492,10 +513,12 @@ describe("local MCP contract", () => {
     "fails closed on an oversized stdio frame without leaking its payload",
     async () => {
     const entrypoint = resolve(process.cwd(), "dist", "src", "mcp", "stdio-server.js");
+    const env = await isolatedChildEnvironment();
     const transport = new StdioClientTransport({
       command: process.execPath,
       args: [entrypoint],
       cwd: process.cwd(),
+      env,
       stderr: "pipe",
       maxBufferSize: STDIO_MAX_BUFFER_BYTES,
     });
@@ -533,6 +556,41 @@ describe("local MCP contract", () => {
     expect(outcome).not.toContain(injectedSecret);
     expect(stderr).not.toContain(injectedSecret);
     expect(stderr).toBe("Local MCP stdio transport error.\n");
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
+    "fails product startup closed on corrupt committed audit bytes with a fixed error",
+    async () => {
+      const entrypoint = resolve(process.cwd(), "dist", "src", "mcp", "stdio-server.js");
+      const env = await isolatedChildEnvironment();
+      const ledgerDirectory = join(
+        env.USERPROFILE!,
+        "AppData",
+        "Local",
+        "xiaoqie-game-bridge-audit",
+        "ledger",
+      );
+      await mkdir(ledgerDirectory, { recursive: true });
+      const injected = "Bearer-corrupt-ledger-secret";
+      await writeFile(join(ledgerDirectory, "segment-0001.audit"), injected);
+      const transport = new StdioClientTransport({
+        command: process.execPath,
+        args: [entrypoint],
+        cwd: process.cwd(),
+        env,
+        stderr: "pipe",
+        maxBufferSize: STDIO_MAX_BUFFER_BYTES,
+      });
+      let stderr = "";
+      transport.stderr?.on("data", (chunk: Buffer) => (stderr += chunk.toString("utf8")));
+      const client = new Client({ name: "corrupt-ledger-test", version: "1.0.0" });
+      await expect(client.connect(transport)).rejects.toThrow("Connection closed");
+      await transport.close().catch(() => undefined);
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(stderr).toBe("Local audit ledger startup failed.\n");
+      expect(stderr).not.toContain(injected);
+      expect(stderr).not.toContain(ledgerDirectory);
     },
   );
 });

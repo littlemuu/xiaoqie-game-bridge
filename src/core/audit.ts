@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { BridgeMode, ErrorCode } from "./protocol.js";
 
 const sensitiveKeyPattern =
-  /(?:authorization|cookie|password|passwd|secret|token|credential|api[-_]?key|principal|subject|owner[-_]?(?:key|digest))/i;
+  /(?:authorization|cookie|password|passwd|secret|token|credential|api[-_]?key|principal|subject|owner[-_]?(?:key|digest)|endpoint|(?:^|[-_.])path|(?:^|[-_.])pid|user[-_]?name|stack|raw[-_]?(?:payload|request|record))/i;
 
 export function redactSensitive(value: unknown): unknown {
   if (Array.isArray(value)) {
@@ -45,6 +45,13 @@ export interface AuditEvent {
 
 export interface AuditSink {
   write(event: AuditEvent): void | Promise<void>;
+  isWritable?(): boolean;
+  reserveWrite?(): AuditWriteReservation | undefined;
+}
+
+export interface AuditWriteReservation {
+  write(event: AuditEvent): void | Promise<void>;
+  release(): void;
 }
 
 export class MemoryAuditSink implements AuditSink {
@@ -52,6 +59,10 @@ export class MemoryAuditSink implements AuditSink {
 
   write(event: AuditEvent): void {
     this.events.push(redactSensitive(event) as AuditEvent);
+  }
+
+  isWritable(): boolean {
+    return true;
   }
 }
 

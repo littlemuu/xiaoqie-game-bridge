@@ -1,11 +1,11 @@
 import { spawn } from "node:child_process";
-import { mkdir, readFile, rmdir, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
-import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   AdapterRegistry,
   GameBridge,
@@ -43,6 +43,46 @@ import {
 
 const servers: LocalOperatorServer[] = [];
 const adapters: ProcessMockAdapter[] = [];
+const temporaryProfiles = new Set<string>();
+let operatorSuiteProfile = "";
+let originalUserProfile: string | undefined;
+
+beforeAll(async () => {
+  operatorSuiteProfile = await mkdtemp(join(tmpdir(), "xiaoqie-operator-suite-"));
+  await mkdir(join(operatorSuiteProfile, "AppData", "Local"), { recursive: true });
+  originalUserProfile = process.env.USERPROFILE;
+  process.env.USERPROFILE = operatorSuiteProfile;
+  if (!operatorRuntimeDirectory().startsWith(operatorSuiteProfile)) {
+    throw new Error("operator suite profile isolation failed");
+  }
+});
+
+afterAll(async () => {
+  if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+  else process.env.USERPROFILE = originalUserProfile;
+  await rm(operatorSuiteProfile, { recursive: true, force: true });
+});
+
+async function isolatedProductProfile(): Promise<{
+  profile: string;
+  env: Record<string, string>;
+  descriptorPath: string;
+  runtimeDirectory: string;
+}> {
+  const profile = await mkdtemp(join(tmpdir(), "xiaoqie-product-profile-"));
+  temporaryProfiles.add(profile);
+  const runtimeDirectory = join(profile, "AppData", "Local", "xiaoqie-game-bridge");
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined) env[key] = value;
+  }
+  return {
+    profile,
+    env: { ...env, HOME: profile, USERPROFILE: profile },
+    descriptorPath: join(runtimeDirectory, "operator-runtime.json"),
+    runtimeDirectory,
+  };
+}
 
 interface Deferred<T> {
   promise: Promise<T>;
@@ -92,6 +132,12 @@ class ControlledResumeAuditSink implements AuditSink {
 afterEach(async () => {
   await Promise.allSettled(servers.splice(0).map((server) => server.close()));
   await Promise.allSettled(adapters.splice(0).map((adapter) => adapter.close()));
+  await Promise.all(
+    [...temporaryProfiles].map(async (profile) => {
+      await rm(profile, { recursive: true, force: true });
+      temporaryProfiles.delete(profile);
+    }),
+  );
 });
 
 function bridgeFixture() {
@@ -195,10 +241,11 @@ function expectBridgeError(response: BridgeResponse, code: string): void {
   if (!response.ok) expect(response.error.code).toBe(code);
 }
 
-async function runCli(args: string[]) {
+async function runCli(args: string[], env: NodeJS.ProcessEnv = process.env) {
   const entrypoint = resolve(process.cwd(), "dist", "src", "operator", "cli.js");
   const child = spawn(process.execPath, [entrypoint, ...args], {
     cwd: process.cwd(),
+    env,
     windowsHide: true,
   });
   let stdout = "";
@@ -683,19 +730,14 @@ describe.runIf(process.platform === "win32")("local operator control plane", () 
   });
 
   it("fails product startup closed on a stale descriptor and preserves that foreign file", async () => {
-    const directory = operatorRuntimeDirectory();
-    let directoryCreated = false;
-    try {
-      await mkdir(directory);
-      directoryCreated = true;
-    } catch {
-      // A clean, pre-existing application directory is allowed.
-    }
+    const isolated = await isolatedProductProfile();
+    await mkdir(isolated.runtimeDirectory, { recursive: true });
     const marker = "foreign-stale-descriptor";
-    await writeFile(operatorDescriptorPath(), marker, { flag: "wx" });
+    await writeFile(isolated.descriptorPath, marker, { flag: "wx" });
     const entrypoint = resolve(process.cwd(), "dist", "src", "mcp", "stdio-server.js");
     const child = spawn(process.execPath, [entrypoint], {
       cwd: process.cwd(),
+      env: isolated.env,
       windowsHide: true,
     });
     child.stdin.end();
@@ -710,9 +752,7 @@ describe.runIf(process.platform === "win32")("local operator control plane", () 
     expect(exitCode).toBe(1);
     expect(stdout).toBe("");
     expect(stderr).toBe("Local operator control startup failed.\n");
-    expect(await readFile(operatorDescriptorPath(), "utf8")).toBe(marker);
-    await unlink(operatorDescriptorPath());
-    if (directoryCreated) await rmdir(directory);
+    expect(await readFile(isolated.descriptorPath, "utf8")).toBe(marker);
   });
 
   it("fails closed on a named-pipe collision without publishing a descriptor", async () => {
@@ -756,14 +796,17 @@ describe.runIf(process.platform === "win32")("local operator control plane", () 
 
   it("uses the same built stdio runtime for MCP commits and operator CLI control", async () => {
     const entrypoint = resolve(process.cwd(), "dist", "src", "mcp", "stdio-server.js");
+    const isolated = await isolatedProductProfile();
     const transport = new StdioClientTransport({
       command: process.execPath,
       args: [entrypoint],
       cwd: process.cwd(),
+      env: isolated.env,
       stderr: "pipe",
       maxBufferSize: STDIO_MAX_BUFFER_BYTES,
     });
     let stderr = "";
+    let persistedSessionId = "";
     transport.stderr?.on("data", (chunk: Buffer) => (stderr += chunk.toString("utf8")));
     const client = new Client({ name: "operator-e2e", version: "1.0.0" });
     try {
@@ -771,7 +814,7 @@ describe.runIf(process.platform === "win32")("local operator control plane", () 
       expect((await client.listTools()).tools.map((tool) => tool.name)).toEqual([
         GAME_BRIDGE_TOOL_NAME,
       ]);
-      expect(await runCli(["status"])).toEqual({
+      expect(await runCli(["status"], isolated.env)).toEqual({
         exitCode: 0,
         stderr: "",
         stdout: "STATUS stopped=false inFlightWrites=0 maxInFlightWrites=4 generation=0\n",
@@ -786,7 +829,8 @@ describe.runIf(process.platform === "win32")("local operator control plane", () 
       );
       expect(opened.ok).toBe(true);
       const sessionId = (opened as { result: { sessionId: string } }).result.sessionId;
-      const stopCli = await runCli(["stop"]);
+      persistedSessionId = sessionId;
+      const stopCli = await runCli(["stop"], isolated.env);
       expect(stopCli).toEqual({
         exitCode: 0,
         stderr: "",
@@ -850,7 +894,7 @@ describe.runIf(process.platform === "win32")("local operator control plane", () 
         ),
       ).toMatchObject({ ok: true });
 
-      expect(await runCli(["resume", "--generation", "1"])).toEqual({
+      expect(await runCli(["resume", "--generation", "1"], isolated.env)).toEqual({
         exitCode: 0,
         stderr: "",
         stdout: "RESUMED stopped=false inFlightWrites=0 maxInFlightWrites=4 generation=1\n",
@@ -876,7 +920,7 @@ describe.runIf(process.platform === "win32")("local operator control plane", () 
           request("operator-mcp-stop", "safety.stop", {}, { sessionId }),
         ),
       ).toMatchObject({ ok: true });
-      expect(await runCli(["status"])).toMatchObject({
+      expect(await runCli(["status"], isolated.env)).toMatchObject({
         exitCode: 0,
         stderr: "",
         stdout: expect.stringContaining("stopped=true"),
@@ -900,11 +944,57 @@ describe.runIf(process.platform === "win32")("local operator control plane", () 
       await transport.close().catch(() => undefined);
     }
     expect(stderr).toBe("");
-    expect(await waitUntilMissing(operatorDescriptorPath())).toBe(true);
-    expect(await runCli(["status"])).toEqual({
+    expect(await waitUntilMissing(isolated.descriptorPath)).toBe(true);
+    expect(await runCli(["status"], isolated.env)).toEqual({
       exitCode: 3,
       stderr: "OPERATOR_ERROR code=NOT_RUNNING\n",
       stdout: "",
     });
+
+    const restartedTransport = new StdioClientTransport({
+      command: process.execPath,
+      args: [entrypoint],
+      cwd: process.cwd(),
+      env: isolated.env,
+      stderr: "pipe",
+      maxBufferSize: STDIO_MAX_BUFFER_BYTES,
+    });
+    let restartedStderr = "";
+    restartedTransport.stderr?.on(
+      "data",
+      (chunk: Buffer) => (restartedStderr += chunk.toString("utf8")),
+    );
+    const restartedClient = new Client({ name: "operator-restart-e2e", version: "1.0.0" });
+    try {
+      await restartedClient.connect(restartedTransport);
+      expect(await runCli(["stop"], isolated.env)).toMatchObject({
+        exitCode: 0,
+        stderr: "",
+      });
+      expect(await runCli(["resume", "--generation", "1"], isolated.env)).toMatchObject({
+        exitCode: 0,
+        stderr: "",
+      });
+    } finally {
+      await restartedClient.close().catch(() => undefined);
+      await restartedTransport.close().catch(() => undefined);
+    }
+    expect(restartedStderr).toBe("");
+    expect(await waitUntilMissing(isolated.descriptorPath)).toBe(true);
+
+    const ledgerDirectory = join(
+      isolated.profile,
+      "AppData",
+      "Local",
+      "xiaoqie-game-bridge-audit",
+      "ledger",
+    );
+    const ledgerFiles = (await readdir(ledgerDirectory)).sort();
+    const ledgerText = (
+      await Promise.all(ledgerFiles.map((file) => readFile(join(ledgerDirectory, file), "utf8")))
+    ).join("");
+    expect(ledgerText.match(/safety\.stop\.local/g)?.length).toBeGreaterThanOrEqual(2);
+    expect(ledgerText.match(/safety\.resume\.authorization\.local/g)?.length).toBeGreaterThanOrEqual(2);
+    expect(ledgerText).not.toContain(persistedSessionId);
   });
 });
