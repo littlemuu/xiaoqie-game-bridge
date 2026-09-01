@@ -196,10 +196,10 @@ export class ProcessMockAdapter implements GameAdapter {
         env: spec.env,
         shell: spec.shell,
         windowsHide: true,
-        // The fixed stdin pipe carries IPC and parent liveness. The native launcher
-        // monitors an exact duplicate without consuming bytes, then passes only the
-        // original stdin endpoint to the contained worker.
-        stdio: ["pipe", "pipe", "ignore"],
+        // stderr is a dedicated parent-liveness pipe. The launcher writes fixed
+        // pulses to an exact duplicate; the parent drains them, and the worker
+        // receives a new NUL stderr handle instead.
+        stdio: ["pipe", "pipe", "pipe"],
       });
     } catch {
       this.#fail("containment");
@@ -207,6 +207,7 @@ export class ProcessMockAdapter implements GameAdapter {
     }
     this.#child = child;
     child.stdout!.on("data", (chunk: Buffer) => this.#consume(chunk));
+    child.stderr!.on("data", () => undefined);
     child.once("error", () => this.#fail("containment"));
     child.once("close", (code) => this.#onProcessClose(code));
     return this.#startup;

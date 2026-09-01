@@ -173,16 +173,17 @@ real worker was the Job's sole suspended member, confirmed termination of the
 exact candidate handle, and re-queried one active/one listed member matching the
 original worker before resume. The real worker then attempted the forbidden
 child creation and reported its denial; trusted post-attempt accounting showed
-zero active/zero listed Job members. The parent-liveness regression closed the
-inherited stdin pipe through a real abnormal parent exit and confirmed the
-launcher ended. A complementary direct liveness-channel closure kept the test
-observer open while the launcher confirmed contained-worker termination through
+zero active/zero listed Job members. Both parent-liveness regressions buffer an
+unread partial IPC frame for a worker that never consumes stdin. A real abnormal
+parent exit proves the independent stderr liveness pipe still breaks and the
+launcher ends. A complementary direct liveness-channel closure keeps the test
+observer open while the launcher confirms contained-worker termination through
 its exact process handle. The product uses neither a process-table scan nor a
-parent-PID reopen. The fixed stdin pipe carries both IPC and liveness. The
-launcher validates the inherited Win32 pipe, monitors an exact non-inheritable
-duplicate without consuming bytes, and passes only the original endpoint to the
-worker. This uses the standard-handle contract shared by MSVCRT and UCRT rather
-than relying on extra CRT file descriptors.
+parent-PID reopen. The launcher validates the inherited stderr write endpoint,
+writes fixed one-byte pulses through an exact non-inheritable duplicate, and
+passes only stdin, stdout, and NUL stderr to the worker. This uses the Win32
+standard-handle contract shared by MSVCRT and UCRT rather than relying on extra
+CRT file descriptors or the state of the stdin buffer.
 
 GitHub-hosted Windows runners are elevated administrators, while the product
 intentionally rejects every elevated host. The Windows workflow therefore
@@ -202,16 +203,22 @@ root was path-checked and removed (`TEMP_EVIDENCE_CLEANED=True`). These inherite
 ACLs and Node mode requests are explicitly not claimed as a custom
 user-exclusive DACL or hostile same-user isolation.
 
-The checked-in workflow has two coherent jobs. Ubuntu is configured for 54
-platform-neutral passes and 57 explicit Windows-only skips, including one
-non-Windows fail-closed containment test; its demo returns a fixed skip result
-instead of using an unrestricted worker. `windows-latest` is configured for the
-full suite (locally 112 passed/1 skipped), including native containment, real
-named-pipe, CLI, and stdio-child evidence. Both jobs run check, test, demo,
-build, audit, and diff-check after `npm ci`.
+The checked-in workflow has two deliberately different jobs. Ubuntu currently
+runs 54 platform-neutral passes with 61 explicit Windows-only skips; its demo
+returns a fixed skip result instead of using an unrestricted worker. Elevated
+`windows-latest` runs check, confirms its administrator role, verifies only the
+product's silent exit-41 pre-worker rejection, then runs the MSVC/UCRT build,
+audit, and diff-check. It does not run or claim the non-elevated allow path,
+named-pipe/operator, process-adapter, MCP stdio, CLI, lifecycle, or demo suite.
+Those remain local non-elevated Windows evidence until a suitable dedicated
+runner exists. After this repair, the unchanged final Node 22 run passed all 8
+files with 113 passed/2 skipped in 28.44 s. Its first full run had only the
+existing durable-ledger truncation enumeration exceed 10 s (10.273 s); the
+isolated file passed 17/17 with that case at 7.998 s before the final full pass.
 
-On this Windows managed host, the final commands used the existing fnm
-Node.js `v22.23.1` and npm `10.9.8` explicitly. Vitest, tsx, and approved built
+On this Windows managed host, the final commands used an official
+SHA-256-verified temporary Node.js `v22.23.1` archive and npm `10.9.8`
+explicitly; the archive was removed after acceptance. Vitest, tsx, and approved built
 children ran outside the process sandbox because child creation receives
 `spawn EPERM` inside it. Every product/operator child used a unique temporary
 profile, and suite teardown removed it; the ACL fixture was also precisely

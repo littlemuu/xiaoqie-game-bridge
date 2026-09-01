@@ -30,7 +30,7 @@ const launcherParentPath = fileURLToPath(
 interface ProbeRun {
   code: number | null;
   messages: unknown[];
-  stderrBytes: number;
+  livenessPulses: number;
   launcherPid: number;
 }
 
@@ -56,7 +56,8 @@ async function runProbe(
   const launcherPid = child.pid!;
   const messages: unknown[] = [];
   let stdout = "";
-  let stderrBytes = 0;
+  let livenessPulses = 0;
+  let invalidLivenessPulse = false;
   child.stdout!.setEncoding("utf8");
   child.stdout!.on("data", (chunk: string) => {
     stdout += chunk;
@@ -70,7 +71,8 @@ async function runProbe(
     }
   });
   child.stderr!.on("data", (chunk: Buffer) => {
-    stderrBytes += chunk.byteLength;
+    livenessPulses += chunk.byteLength;
+    invalidLivenessPulse ||= chunk.some((byte) => byte !== 0);
   });
   const code = await new Promise<number | null>((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -86,7 +88,10 @@ async function runProbe(
       resolve(exitCode);
     });
   });
-  return { code, messages, stderrBytes, launcherPid };
+  if (livenessPulses === 0 || invalidLivenessPulse) {
+    throw new Error("Launcher liveness channel did not contain only fixed pulses.");
+  }
+  return { code, messages, livenessPulses, launcherPid };
 }
 
 function messageOfType(messages: unknown[], type: string): Record<string, unknown> | undefined {
@@ -100,8 +105,8 @@ function messageOfType(messages: unknown[], type: string): Record<string, unknow
 describe.runIf(isWindows && !expectElevatedHost)("real Windows worker containment", () => {
   it("attests the actual restricted token and Job before the first worker instruction", async () => {
     const run = await runProbe("probe-attestation");
-    expect(run.code, JSON.stringify({ messages: run.messages, stderrBytes: run.stderrBytes })).toBe(0);
-    expect(run.stderrBytes).toBe(0);
+    expect(run.code, JSON.stringify({ messages: run.messages, livenessPulses: run.livenessPulses }))
+      .toBe(0);
     expect(run.messages.map((message) => (message as { type?: string }).type)).toEqual([
       "containment-ready",
       "probe-entry",
@@ -127,7 +132,8 @@ describe.runIf(isWindows && !expectElevatedHost)("real Windows worker containmen
 
   it("uses the Job hard process limit to deny a second process", async () => {
     const run = await runProbe("probe-child");
-    expect(run.code, JSON.stringify({ messages: run.messages, stderrBytes: run.stderrBytes })).toBe(0);
+    expect(run.code, JSON.stringify({ messages: run.messages, livenessPulses: run.livenessPulses }))
+      .toBe(0);
     expect(messageOfType(run.messages, "probe-child-result")).toMatchObject({ denied: true });
     expect(messageOfType(run.messages, "containment-probe-result"), JSON.stringify(run.messages))
       .toMatchObject({
@@ -139,7 +145,6 @@ describe.runIf(isWindows && !expectElevatedHost)("real Windows worker containmen
       noEscapedLiveChild: true,
     });
     expect(messageOfType(run.messages, "containment-fault")).toBeUndefined();
-    expect(run.stderrBytes).toBe(0);
   });
 
   it("terminates the bounded allocation probe at the Job memory limit", async () => {
@@ -150,7 +155,6 @@ describe.runIf(isWindows && !expectElevatedHost)("real Windows worker containmen
     expect(messageOfType(run.messages, "containment-fault"), JSON.stringify(run.messages)).toMatchObject({
       category: "memory-limit",
     });
-    expect(run.stderrBytes).toBe(0);
     expect(() => process.kill(run.launcherPid, 0)).toThrow();
   });
 
@@ -162,7 +166,7 @@ describe.runIf(isWindows && !expectElevatedHost)("real Windows worker containmen
     expect(messageOfType(run.messages, "probe-cpu-result")).toMatchObject({ completed: true });
   });
 
-  it("breaks the exact inherited liveness pipe on real parent exit and leaves no launcher", async () => {
+  it("breaks the dedicated liveness pipe despite unread IPC on real parent exit", async () => {
     const parent = fork(launcherParentPath, [], {
       env: {},
       execPath: process.execPath,
@@ -199,7 +203,7 @@ describe.runIf(isWindows && !expectElevatedHost)("real Windows worker containmen
     expect(launcherAlive).toBe(false);
   });
 
-  it("uses the exact worker handle to confirm termination after parent-liveness loss", async () => {
+  it("uses the exact worker handle after liveness loss with unread IPC buffered", async () => {
     const testSpec = fixedWorkerLaunchSpec({
       testOnly: { faultMode: "hang", containmentFaultStage: "none" },
     });
@@ -216,9 +220,7 @@ describe.runIf(isWindows && !expectElevatedHost)("real Windows worker containmen
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";
-    let stderr = "";
     const stdoutMessages: unknown[] = [];
-    const stderrMessages: unknown[] = [];
     const ready = new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error("Liveness probe did not enter.")), 3_000);
       child.stdout!.setEncoding("utf8");
@@ -236,28 +238,34 @@ describe.runIf(isWindows && !expectElevatedHost)("real Windows worker containmen
         }
       });
     });
-    child.stderr!.setEncoding("utf8");
-    child.stderr!.on("data", (chunk: string) => {
-      stderr += chunk;
-      for (;;) {
-        const newline = stderr.indexOf("\n");
-        if (newline < 0) break;
-        stderrMessages.push(JSON.parse(stderr.slice(0, newline)));
-        stderr = stderr.slice(newline + 1);
-      }
-    });
+    child.stderr!.resume();
     await ready;
-    child.stdin!.destroy();
-    const code = await new Promise<number | null>((resolve) => child.once("close", resolve));
+    await new Promise<void>((resolve, reject) => {
+      child.stdin!.write(Buffer.from('{"unread-ipc":'), (error) => {
+        if (error) reject(error);
+        else resolve();
+      });
+    });
+    child.stderr!.destroy();
+    const code = await new Promise<number | null>((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error("Buffered parent-liveness probe exceeded deadline.")),
+        3_000,
+      );
+      child.once("close", (exitCode) => {
+        clearTimeout(timer);
+        resolve(exitCode);
+      });
+    });
     expect(code).toBe(48);
     expect(messageOfType(stdoutMessages, "probe-parent-ready")).toBeDefined();
-    expect(messageOfType(stderrMessages, "containment-probe-result")).toMatchObject({
+    expect(messageOfType(stdoutMessages, "containment-probe-result")).toMatchObject({
       category: "parent-liveness",
       workerTerminationConfirmed: true,
     });
   });
 
-  it("fails before worker entry when the inherited parent-liveness pipe is closed", async () => {
+  it("fails before worker entry when the parent-liveness stderr is not a pipe", async () => {
     const testSpec = fixedWorkerLaunchSpec({
       testOnly: { faultMode: "hang", containmentFaultStage: "none" },
     });
@@ -271,9 +279,8 @@ describe.runIf(isWindows && !expectElevatedHost)("real Windows worker containmen
       env: {},
       shell: false,
       windowsHide: true,
-      stdio: ["pipe", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "ignore"],
     });
-    child.stdin!.destroy();
     const messages: unknown[] = [];
     let stdout = "";
     child.stdout!.setEncoding("utf8");
@@ -292,7 +299,7 @@ describe.runIf(isWindows && !expectElevatedHost)("real Windows worker containmen
     expect(messageOfType(messages, "containment-ready")).toBeUndefined();
   });
 
-  it("fails closed when the inherited stdin liveness endpoint is not a pipe", async () => {
+  it("fails closed when the inherited IPC stdin endpoint is not a pipe", async () => {
     const testSpec = fixedWorkerLaunchSpec({
       testOnly: { faultMode: "hang", containmentFaultStage: "none" },
     });
@@ -308,6 +315,7 @@ describe.runIf(isWindows && !expectElevatedHost)("real Windows worker containmen
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
+    child.stderr!.resume();
     const messages: unknown[] = [];
     let stdout = "";
     child.stdout!.setEncoding("utf8");
@@ -321,7 +329,7 @@ describe.runIf(isWindows && !expectElevatedHost)("real Windows worker containmen
       }
     });
     const code = await new Promise<number | null>((resolve) => child.once("close", resolve));
-    expect(code).toBe(41);
+    expect(code).toBe(40);
     expect(messageOfType(messages, "probe-entry")).toBeUndefined();
     expect(messageOfType(messages, "containment-ready")).toBeUndefined();
   });
@@ -337,7 +345,6 @@ describe.runIf(isWindows && !expectElevatedHost)("real Windows worker containmen
     const run = await runProbe("probe-attestation", faultStage);
     expect(run.code).toBe(exitCode);
     expect(messageOfType(run.messages, "probe-entry")).toBeUndefined();
-    expect(run.stderrBytes).toBe(0);
     expect(() => process.kill(run.launcherPid, 0)).toThrow();
   });
 

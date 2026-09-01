@@ -382,32 +382,36 @@ bool ValidateJob(HANDLE job, HANDLE process) {
 
 HANDLE ParentLivenessPipe() {
   // Standard handles are a Win32 process contract across CRTs. Keep an exact,
-  // non-inheritable duplicate of the fixed stdin/IPC pipe for parent-liveness
-  // monitoring; the original is passed to the worker and then closed locally.
-  HANDLE standard_input = GetStdHandle(STD_INPUT_HANDLE);
-  if (standard_input == nullptr || standard_input == INVALID_HANDLE_VALUE ||
-      GetFileType(standard_input) != FILE_TYPE_PIPE) {
+  // non-inheritable duplicate of the dedicated stderr pipe write endpoint.
+  // Fixed one-byte writes detect closure of the parent read endpoint without
+  // consulting or consuming the unrelated stdin IPC buffer.
+  HANDLE standard_error = GetStdHandle(STD_ERROR_HANDLE);
+  if (standard_error == nullptr || standard_error == INVALID_HANDLE_VALUE ||
+      GetFileType(standard_error) != FILE_TYPE_PIPE) {
     return INVALID_HANDLE_VALUE;
   }
   DWORD flags = 0;
-  if (!GetNamedPipeInfo(standard_input, &flags, nullptr, nullptr, nullptr)) {
+  if (!GetNamedPipeInfo(standard_error, &flags, nullptr, nullptr, nullptr)) {
     return INVALID_HANDLE_VALUE;
   }
   HANDLE duplicate = INVALID_HANDLE_VALUE;
-  if (!DuplicateHandle(GetCurrentProcess(), standard_input, GetCurrentProcess(), &duplicate,
+  if (!DuplicateHandle(GetCurrentProcess(), standard_error, GetCurrentProcess(), &duplicate,
                        0, FALSE, DUPLICATE_SAME_ACCESS)) {
     return INVALID_HANDLE_VALUE;
   }
   return duplicate;
 }
 
-bool ParentLivenessPipeIsOpen(HANDLE handle) {
+bool PulseParentLiveness(HANDLE handle) {
   if (handle == nullptr || handle == INVALID_HANDLE_VALUE ||
       GetFileType(handle) != FILE_TYPE_PIPE) {
     return false;
   }
-  DWORD available = 0;
-  return PeekNamedPipe(handle, nullptr, 0, nullptr, &available, nullptr) != FALSE;
+  static constexpr BYTE kPulse = 0;
+  DWORD written = 0;
+  constexpr DWORD kPulseBytes = static_cast<DWORD>(sizeof(kPulse));
+  return WriteFile(handle, &kPulse, kPulseBytes, &written, nullptr) != FALSE &&
+         written == kPulseBytes;
 }
 
 bool BuildEnvironment(const std::wstring& mode, std::vector<wchar_t>* environment) {
@@ -620,7 +624,7 @@ int wmain(int argc, wchar_t** argv) {
   BOOL host_in_job = FALSE;
   if (!IsProcessInJob(GetCurrentProcess(), nullptr, &host_in_job)) return kExitHostPolicy;
   UniqueHandle parent_liveness(ParentLivenessPipe());
-  if (!ParentLivenessPipeIsOpen(parent_liveness.get())) return kExitHostPolicy;
+  if (!PulseParentLiveness(parent_liveness.get())) return kExitHostPolicy;
 
   UniqueHandle job(CreateJobObjectW(nullptr, nullptr));
   if (!job || fault_stage == FaultStage::kJob || !ConfigureJob(job.get())) return kExitJob;
@@ -774,7 +778,7 @@ int wmain(int argc, wchar_t** argv) {
 #ifdef XIAOQIE_CONTAINMENT_TEST_BUILD
       !process_limit_verified ||
 #endif
-      !ParentLivenessPipeIsOpen(parent_liveness.get()) ||
+      !PulseParentLiveness(parent_liveness.get()) ||
       !WriteAttestation(standard_output, integrity, host_in_job != FALSE)) {
     return kExitAttestation;
   }
@@ -788,7 +792,7 @@ int wmain(int argc, wchar_t** argv) {
   for (;;) {
     const DWORD wait_result = WaitForSingleObject(worker_process.get(), kParentLivenessPollMs);
     if (wait_result == WAIT_OBJECT_0) break;
-    if (wait_result == WAIT_TIMEOUT && ParentLivenessPipeIsOpen(parent_liveness.get())) {
+    if (wait_result == WAIT_TIMEOUT && PulseParentLiveness(parent_liveness.get())) {
       continue;
     }
     if (wait_result == WAIT_TIMEOUT &&
@@ -800,7 +804,7 @@ int wmain(int argc, wchar_t** argv) {
 #ifdef XIAOQIE_CONTAINMENT_TEST_BUILD
     if (EqualsIgnoreCase(worker_mode, L"probe-parent-liveness") &&
         worker_wait == WAIT_OBJECT_0) {
-      WriteParentLivenessProbeEvidence(GetStdHandle(STD_ERROR_HANDLE));
+      WriteParentLivenessProbeEvidence(standard_output);
     }
 #else
     (void)worker_wait;

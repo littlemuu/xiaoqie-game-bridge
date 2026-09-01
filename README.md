@@ -66,14 +66,16 @@ The Windows product stdio entrypoint registers `ProcessMockAdapter` only after a
 checked-in, source-built Win32 launcher has established containment for the one
 fixed built `mock-worker.js`. Trusted code fixes the launcher, `process.execPath`,
 entrypoint, argv, cwd, empty launcher environment, `shell: false`, hidden window,
-and pipe-only stdio. The fixed stdin pipe carries both adapter IPC and parent
-liveness. The launcher validates the inherited Win32 pipe, keeps an exact
-non-inheritable duplicate for `PeekNamedPipe` monitoring without consuming IPC
-bytes, and passes only the original endpoint to the worker. This standard-handle
-contract remains valid across MSVCRT and UCRT. The launcher never enumerates the
-process table or reopens a PID and closes the Job when the endpoint breaks. It
-supplies only `SystemRoot` and a fixed worker marker to the worker. Requests,
-MCP, CLI, adapters, and environment variables cannot select any of these values.
+and pipe-only stdio. Stdin carries adapter IPC; stderr is a dedicated reverse
+parent-liveness pipe. The launcher validates the inherited Win32 write endpoint,
+keeps an exact non-inheritable duplicate, and writes fixed one-byte pulses while
+the Node parent drains them. Parent read-end closure makes a pulse fail
+independently of unread stdin bytes. The worker receives a new NUL stderr handle,
+never the liveness channel. This standard-handle contract remains valid across
+MSVCRT and UCRT. The launcher never enumerates the process table or reopens a PID
+and closes the Job when the endpoint breaks. It supplies only `SystemRoot` and a
+fixed worker marker to the worker. Requests, MCP, CLI, adapters, and environment
+variables cannot select any of these values.
 Non-Windows product startup and any Windows containment failure fail closed;
 there is no direct-`spawn()` fallback.
 
@@ -288,6 +290,10 @@ late handlers cannot add response work after disconnect or shutdown. Every
 audit-sink promise is tracked; operator shutdown performs a bounded audit-idle
 wait, including authorization writes that outlive a disconnected request.
 
-CI has two explicit acceptance paths. Ubuntu runs the platform-neutral core and
-skips only Windows product-child/operator cases; `windows-latest` runs the full
-suite including real named pipes, the built CLI, and the built stdio child.
+Acceptance evidence has three explicit scopes. Ubuntu runs the platform-neutral
+suite and skips Windows product-child/operator cases. GitHub-hosted
+`windows-latest` is elevated, so it compiles both helpers with MSVC/UCRT and
+verifies the product's pre-worker elevated-host rejection only; it does not run
+or claim the non-elevated allow path. The complete Windows suite, real named
+pipes, built CLI, built stdio child, and demo are exercised locally under Node
+22 on a non-elevated Windows host pending a suitable dedicated runner.
