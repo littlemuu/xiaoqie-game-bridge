@@ -1,5 +1,27 @@
 # Threat model
 
+## Release-chain claims and non-claims
+
+Pinned action commits, a clean double build, checksums, an SBOM and GitHub
+attestation reduce accidental source/artifact ambiguity. The release workflow
+fails before publishing when its protected tag, evidence files, digests,
+attestation or upload verification is absent. Pull requests and ordinary pushes
+retain only read permissions and cannot enter that job.
+
+Tag builds separate untrusted dependency/project execution from release
+credentials. The read-only build job uploads the verified allowlist; only its
+dependent publish job receives write/OIDC permissions, downloads that exact
+artifact and runs the narrow built-in-only verifier before attestation/upload.
+All YAML `uses:` keys are enumerated and must match a closed unquoted local
+action or a full lowercase 40-hex external pin with a readable version comment.
+
+These controls do not prove a trustworthy runner, dependency safety, absence of
+compiler compromise, complete supply-chain security or runtime behavior. The
+unsigned local provenance statement is not presented as platform attestation.
+GitHub-hosted Windows remains elevated-only evidence, and Restricted Token plus
+Job containment still does not block all current-user-readable files or network
+access. Nothing here authorizes untrusted code or a real game.
+
 ## Assets and trust boundaries
 
 The protected assets are the user's future game process and saves, local

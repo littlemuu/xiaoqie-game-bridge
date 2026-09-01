@@ -11,12 +11,14 @@ permissions:
 jobs:
   platform-neutral:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          node-version: 22
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
           cache: npm
       - run: npm ci
       - run: npm run check
@@ -24,16 +26,28 @@ jobs:
       - run: npm run demo
       - run: npm run build
       - run: npm audit
+      - run: npm run release:workflow-policy
+      - run: npm run release:reproducible
+      - run: npm run release:build
+      - run: npm run release:verify
       - run: git diff --check
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rc1-canonical-release-evidence
+          path: release-out/*
+          if-no-files-found: error
+          retention-days: 7
 
   windows-operator:
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          node-version: 22
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
           cache: npm
       - run: npm ci
       - run: npm run check
@@ -46,10 +60,20 @@ jobs:
           if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
             throw "The hosted Windows runner was expected to be elevated."
           }
-      - name: Verify the product fails closed on the elevated host
-        run: npm test -- --run tests/windows-containment.test.ts
-        env:
-          XIAOQIE_EXPECT_ELEVATED_HOST: "1"
-      - run: npm run build
+      - name: Record the elevated-host fail-closed test result
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release-input | Out-Null
+          $env:XIAOQIE_EXPECT_ELEVATED_HOST = "1"
+          npm test -- --run tests/windows-containment.test.ts --reporter=json --outputFile=release-input/vitest.json
+      - run: npm run release:build
+      - name: Generate honest elevated Windows evidence
+        run: npm run windows:evidence -- --suite elevated-gate --test-results release-input/vitest.json --release-dir release-out
       - run: npm audit
       - run: git diff --check
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rc1-hosted-windows-evidence
+          path: windows-evidence-out/*
+          if-no-files-found: error
+          retention-days: 7

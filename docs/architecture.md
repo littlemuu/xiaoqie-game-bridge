@@ -1,5 +1,19 @@
 # Architecture
 
+## Release evidence boundary
+
+Release engineering is downstream of the bridge and cannot authorize an
+adapter action. The core remains the only protocol/session/owner/policy/
+capability/idempotency/safety/audit decision point. Release scripts read tracked
+source/build outputs, create normalized evidence, and have no runtime path into
+MCP, the operator pipe, audit ledger or mock worker.
+
+The normalized bundle contains reviewed runtime source/output plus the native
+helper source, never a compiled helper. Its external manifest, SBOM, checksum
+and unsigned provenance form an acyclic digest graph; GitHub attests only the
+final bundle digest in the protected tag workflow. Non-deterministic GitHub
+Release and attestation metadata stay outside the reproducibility claim.
+
 ## Boundary map
 
 ```text

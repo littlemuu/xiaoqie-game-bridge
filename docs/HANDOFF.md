@@ -2,6 +2,26 @@
 
 ## Completed
 
+- `0.1.0-rc.1` single-source release version with lock/manifest/SBOM checks
+- Deterministic, normalized source-build bundle with an exact file allowlist
+- SHA-256 list, CycloneDX 1.6 JSON SBOM, versioned release manifest and unsigned
+  in-toto/SLSA provenance subject bound to the bundle digest
+- Full-SHA-pinned Actions, read-only PR/push permissions and a protected,
+  annotated-tag-only minimal-write prerelease workflow
+- Two independent local clean-clone/offline builds with byte-identical digest
+  enforcement and exact temporary cleanup
+- Closed-world Windows JSON/Markdown evidence with explicit elevation, skip,
+  failure, unknown and containment/cleanup status
+- Checkout-derived provenance identity with expected commit/ref used only as
+  assertions, including annotated-tag peel and PR-ref resolution checks
+- Versioned exact full-suite inventory that prevents empty, partial, duplicate
+  or targeted Vitest output from becoming non-elevated Windows evidence
+- Separate read-only tag build and minimal credential-bearing publish jobs;
+  dependency installation and general project execution never receive release
+  write/OIDC credentials
+- Closed parsing of every workflow `uses:` key, including rejection of quoted,
+  expression, Docker, floating and otherwise unrecognized forms
+
 - Node.js 22 + TypeScript project with strict compiler settings
 - Versioned strict request/response protocol and stable error codes
 - Memory-only, adapter-bound sessions with configurable 15-minute default TTL
@@ -229,6 +249,11 @@ game, desktop application, account, save, existing user file, or host
 configuration was accessed. GitHub-hosted CI status is recorded in the Draft PR.
 
 ## Known limits
+
+- RC evidence is not a complete supply-chain proof. Local provenance is
+  unsigned; GitHub attestation exists only after a supported protected tag run.
+- The release manifest deliberately marks real non-elevated Windows evidence as
+  separately required; GitHub-hosted Windows cannot satisfy it.
 
 - No real game, save, account, launcher, or file is accessed. The only added
   process is the fixed built mock worker.

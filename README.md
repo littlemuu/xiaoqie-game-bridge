@@ -58,7 +58,24 @@ unrestricted worker fallback.
   client starts exactly the built stdio server in contract tests.
 
 See [architecture](docs/architecture.md), [threat model](docs/threat-model.md),
+[release process](docs/release.md), [support matrix](docs/support-matrix.md),
 [handoff](docs/HANDOFF.md), and [open questions](docs/OPEN_QUESTIONS.md).
+
+## v0.1.0-rc.1 candidate artifacts
+
+The repository version is sourced only from `package.json`; the lockfile,
+release CLI, normalized bundle, SBOM and manifest are checked against it. From a
+clean Node 22.23.1 checkout, `npm run release:reproducible` performs two local
+offline clean-clone builds and requires identical bundle bytes. Then
+`npm run release:build` and `npm run release:verify` create and validate the
+five-file bundle/checksum/SBOM/manifest/provenance allowlist.
+
+`package.json` remains `private: true`; this project is not published to npm.
+The local provenance statement is explicitly unsigned. A real GitHub artifact
+attestation is requested only by the protected annotated-tag workflow after
+merge. None of these artifacts upgrades the product beyond mock-only status or
+proves complete supply-chain security, a hostile-code sandbox, all-platform
+coverage, or safety for any real game.
 
 ## Isolated mock adapter process
 

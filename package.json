@@ -1,6 +1,6 @@
 {
   "name": "xiaoqie-game-bridge",
-  "version": "0.1.0",
+  "version": "0.1.0-rc.1",
   "private": true,
   "type": "module",
   "engines": {
@@ -13,6 +13,11 @@
     "pretest": "npm run build",
     "test": "vitest run",
     "demo": "tsx src/demo/run.ts",
+    "release:build": "node scripts/release.mjs build",
+    "release:verify": "node scripts/release.mjs verify",
+    "release:reproducible": "node scripts/reproducible-release.mjs",
+    "release:workflow-policy": "node scripts/workflow-policy.mjs",
+    "windows:evidence": "node scripts/windows-evidence.mjs",
     "mcp:stdio": "node dist/src/mcp/stdio-server.js",
     "operator": "node dist/src/operator/cli.js"
   },
