@@ -50,7 +50,7 @@ async function runProbe(
     env: {},
     shell: false,
     windowsHide: true,
-    stdio: ["pipe", "pipe", "pipe"],
+    stdio: ["pipe", "pipe", "pipe", "pipe"],
   });
   const launcherPid = child.pid!;
   const messages: unknown[] = [];
@@ -126,11 +126,18 @@ describe.runIf(isWindows)("real Windows worker containment", () => {
 
   it("uses the Job hard process limit to deny a second process", async () => {
     const run = await runProbe("probe-child");
-    expect(run.code, JSON.stringify({ messages: run.messages, stderrBytes: run.stderrBytes })).toBe(48);
-    expect(messageOfType(run.messages, "probe-child-result")).toBeUndefined();
-    expect(messageOfType(run.messages, "containment-fault"), JSON.stringify(run.messages)).toMatchObject({
+    expect(run.code, JSON.stringify({ messages: run.messages, stderrBytes: run.stderrBytes })).toBe(0);
+    expect(messageOfType(run.messages, "probe-child-result")).toMatchObject({ denied: true });
+    expect(messageOfType(run.messages, "containment-probe-result"), JSON.stringify(run.messages))
+      .toMatchObject({
       category: "process-limit",
+      quotaRejection: true,
+      candidateTerminationConfirmed: true,
+      postAttemptActiveProcesses: 0,
+      postAttemptLiveJobMembers: 0,
+      noEscapedLiveChild: true,
     });
+    expect(messageOfType(run.messages, "containment-fault")).toBeUndefined();
     expect(run.stderrBytes).toBe(0);
   });
 
@@ -154,7 +161,7 @@ describe.runIf(isWindows)("real Windows worker containment", () => {
     expect(messageOfType(run.messages, "probe-cpu-result")).toMatchObject({ completed: true });
   });
 
-  it("closes the Job after an abnormal parent exit and leaves no launcher", async () => {
+  it("breaks the exact inherited liveness pipe on real parent exit and leaves no launcher", async () => {
     const parent = fork(launcherParentPath, [], {
       env: {},
       execPath: process.execPath,
@@ -189,6 +196,99 @@ describe.runIf(isWindows)("real Windows worker containment", () => {
       }
     }
     expect(launcherAlive).toBe(false);
+  });
+
+  it("uses the exact worker handle to confirm termination after parent-liveness loss", async () => {
+    const testSpec = fixedWorkerLaunchSpec({
+      testOnly: { faultMode: "hang", containmentFaultStage: "none" },
+    });
+    const child = spawn(testSpec.executable, [
+      process.execPath,
+      probeWorkerPath,
+      "probe-parent-liveness",
+      "none",
+    ], {
+      cwd: dirname(probeWorkerPath),
+      env: {},
+      shell: false,
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    const stdoutMessages: unknown[] = [];
+    const stderrMessages: unknown[] = [];
+    const ready = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("Liveness probe did not enter.")), 3_000);
+      child.stdout!.setEncoding("utf8");
+      child.stdout!.on("data", (chunk: string) => {
+        stdout += chunk;
+        for (;;) {
+          const newline = stdout.indexOf("\n");
+          if (newline < 0) break;
+          const message = JSON.parse(stdout.slice(0, newline)) as Record<string, unknown>;
+          stdout = stdout.slice(newline + 1);
+          stdoutMessages.push(message);
+          if (message.type !== "probe-parent-ready") continue;
+          clearTimeout(timer);
+          resolve();
+        }
+      });
+    });
+    child.stderr!.setEncoding("utf8");
+    child.stderr!.on("data", (chunk: string) => {
+      stderr += chunk;
+      for (;;) {
+        const newline = stderr.indexOf("\n");
+        if (newline < 0) break;
+        stderrMessages.push(JSON.parse(stderr.slice(0, newline)));
+        stderr = stderr.slice(newline + 1);
+      }
+    });
+    await ready;
+    child.stdio[3]!.destroy();
+    const code = await new Promise<number | null>((resolve) => child.once("close", resolve));
+    expect(code).toBe(48);
+    expect(messageOfType(stdoutMessages, "probe-parent-ready")).toBeDefined();
+    expect(messageOfType(stderrMessages, "containment-probe-result")).toMatchObject({
+      category: "parent-liveness",
+      workerTerminationConfirmed: true,
+    });
+  });
+
+  it("fails before worker entry when the inherited parent-liveness pipe is closed", async () => {
+    const testSpec = fixedWorkerLaunchSpec({
+      testOnly: { faultMode: "hang", containmentFaultStage: "none" },
+    });
+    const child = spawn(testSpec.executable, [
+      process.execPath,
+      probeWorkerPath,
+      "probe-attestation",
+      "none",
+    ], {
+      cwd: dirname(probeWorkerPath),
+      env: {},
+      shell: false,
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "pipe", "pipe"],
+    });
+    child.stdio[3]!.destroy();
+    const messages: unknown[] = [];
+    let stdout = "";
+    child.stdout!.setEncoding("utf8");
+    child.stdout!.on("data", (chunk: string) => {
+      stdout += chunk;
+      for (;;) {
+        const newline = stdout.indexOf("\n");
+        if (newline < 0) break;
+        messages.push(JSON.parse(stdout.slice(0, newline)));
+        stdout = stdout.slice(newline + 1);
+      }
+    });
+    const code = await new Promise<number | null>((resolve) => child.once("close", resolve));
+    expect(code).toBe(41);
+    expect(messageOfType(messages, "probe-entry")).toBeUndefined();
+    expect(messageOfType(messages, "containment-ready")).toBeUndefined();
   });
 
   it.each([
@@ -233,7 +333,7 @@ describe.runIf(isWindows)("real Windows worker containment", () => {
       env: { HOSTILE_OVERRIDE: "ignored" },
       shell: false,
       windowsHide: true,
-      stdio: ["pipe", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe", "pipe"],
     });
     let stdoutBytes = 0;
     let stderrBytes = 0;

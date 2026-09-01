@@ -121,17 +121,18 @@ npm audit
 git diff --check
 ```
 
-Actual local results on 2026-08-31 with Node.js `v22.23.1` and npm `10.9.8`:
+Actual local results on 2026-09-01 with Node.js `v22.23.1` and npm `10.9.8`:
 
 - `npm ci` — passed; 73 packages installed, 74 audited, 0 vulnerabilities
 - `npm audit` — passed; 0 vulnerabilities
 - `npm run check` — passed
-- `npm test` — passed; 8 files, 110 tests passed and one non-Windows gate was
+- `npm test` — passed; 8 files, 112 tests passed and one non-Windows gate was
   skipped on Windows. All prior protocol, MCP, operator, audit, safety,
   idempotency and capacity regressions remain green. The new real Windows groups
-  cover kernel token/Job attestation before worker entry, child-process denial,
-  bounded memory and CPU probes, normal/abnormal parent cleanup, six injected
-  setup failures, closed-world argv, and fixed containment categories.
+  cover kernel token/Job attestation before worker entry, a trusted suspended
+  candidate process-limit proof, bounded memory and CPU probes, exact inherited
+  parent-liveness cleanup of both launcher and worker, six injected setup
+  failures, closed-world argv, and fixed containment categories.
 - Real stdio contract — passed inside `npm test`; official
   `Client@2.0.0`/`StdioClientTransport` started the built Node entrypoint,
   completed initialize/list/calls, and closed client first then transport
@@ -167,6 +168,18 @@ kill-on-close true; active-process limit 1; process memory 256 MiB; job memory
 path, command line, native error, stack, or secret was emitted by the product
 attestation/fault API.
 
+The test-only process-limit proof observed `ERROR_NOT_ENOUGH_QUOTA` while the
+real worker was the Job's sole suspended member, confirmed termination of the
+exact candidate handle, and re-queried one active/one listed member matching the
+original worker before resume. The real worker then attempted the forbidden
+child creation and reported its denial; trusted post-attempt accounting showed
+zero active/zero listed Job members. The parent-liveness regression closed the
+dedicated inherited pipe through a real abnormal parent exit and confirmed the
+launcher ended. A complementary direct liveness-channel closure kept the test
+observer open while the launcher confirmed contained-worker termination through
+its exact process handle. The product uses neither a process-table scan nor a
+parent-PID reopen.
+
 Windows audit-file evidence was sampled from a real append-and-sync in a
 uniquely named temporary directory. The ledger object was a directory, its
 segment was a regular 386-byte file, both were owned by the current user, each
@@ -180,7 +193,7 @@ The checked-in workflow has two coherent jobs. Ubuntu is configured for 54
 platform-neutral passes and 57 explicit Windows-only skips, including one
 non-Windows fail-closed containment test; its demo returns a fixed skip result
 instead of using an unrestricted worker. `windows-latest` is configured for the
-full suite (locally 110 passed/1 skipped), including native containment, real
+full suite (locally 112 passed/1 skipped), including native containment, real
 named-pipe, CLI, and stdio-child evidence. Both jobs run check, test, demo,
 build, audit, and diff-check after `npm ci`.
 

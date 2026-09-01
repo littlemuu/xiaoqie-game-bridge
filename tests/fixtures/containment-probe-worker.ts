@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 
 const mode = process.env.XIAOQIE_TEST_MODE;
 
@@ -12,13 +12,20 @@ switch (mode) {
   case "probe-attestation":
     process.exit(0);
     break;
-  case "probe-child": { // The Job's active-process limit must reject this kernel request.
-    const child = spawn(process.execPath, ["-e", "process.exit(0)"], {
-      env: {},
-      shell: false,
-      stdio: "ignore",
-      windowsHide: true,
-    });
+  case "probe-child": { // The real worker attempt must settle before trusted Job accounting.
+    let child: ChildProcess;
+    try {
+      child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 10_000)"], {
+        env: {},
+        shell: false,
+        stdio: "ignore",
+        windowsHide: true,
+      });
+    } catch {
+      write({ version: 1, type: "probe-child-result", denied: true });
+      process.exit(0);
+      break;
+    }
     const deadline = setTimeout(() => {
       child.kill();
       process.exit(9);
@@ -36,6 +43,10 @@ switch (mode) {
     });
     break;
   }
+  case "probe-parent-liveness":
+    write({ version: 1, type: "probe-parent-ready" });
+    setInterval(() => undefined, 1_000);
+    break;
   case "probe-memory": { // Bounded allocations; the 128 MiB process limit must terminate first.
     const allocations: Buffer[] = [];
     for (let index = 0; index < 32; index += 1) {

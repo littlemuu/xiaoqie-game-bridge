@@ -183,6 +183,20 @@ categories. Token/Job/create/assign/attest/resume failures all close handles and
 fail before a worker handshake; the pre-assignment failure path explicitly
 terminates the still-suspended process.
 
+Parent lifetime is bound to a dedicated inherited pipe endpoint rather than a
+process-table scan or PID lookup. The helper validates that closed-world pipe
+before attestation/resume, never passes it to the worker, and closes the Job when
+the endpoint breaks; PID reuse therefore cannot redirect the lifetime wait to an
+unrelated process. A real abnormal-exit regression proves both the launcher and
+the contained worker terminate; worker termination is confirmed by the
+launcher's exact process handle rather than a PID lookup. The process-limit
+regression likewise uses an exact suspended candidate handle: Job assignment
+must return the quota failure,
+the candidate's termination is confirmed, and the Job is re-queried to contain
+only the original worker before JavaScript resumes. The real worker then makes
+the forbidden child attempt; after its denial settles, trusted post-attempt
+accounting must show zero active/listed Job members.
+
 This does not make a malicious worker safe. Restricting SIDs intentionally
 preserve the source user and enabled non-privileged groups needed by the fixed
 Node and repository ACLs. There is no AppContainer, VM, container, custom file

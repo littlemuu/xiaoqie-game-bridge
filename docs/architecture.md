@@ -138,10 +138,15 @@ audit HMAC key crosses IPC. Dry-run remains explicit and non-mutating.
 The Node parent executes only the fixed native launcher. Its closed-world argv
 contains fixed `process.execPath` and the fixed built module path; cwd is derived
 from that module, the launcher environment is empty, shell is false, and stdio
-is pipe/pipe/ignored. The helper independently accepts only the product path
-shape (or a separately built test-only fixture shape), creates an explicit
-`SystemRoot` plus worker-marker environment, and passes only stdin, stdout, and
-a newly opened NUL stderr handle through `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`.
+is pipe/pipe/ignored/pipe. The fourth pipe is a dedicated parent-liveness
+channel. The helper validates the exact inherited descriptor, removes its
+inherit flag, and checks it before attestation/resume and while the worker runs.
+It performs no process-table enumeration or parent-PID reopen, so parent exit
+cannot be confused with PID reuse. The helper independently accepts only the
+product path shape (or a separately built test-only fixture shape), creates an
+explicit `SystemRoot` plus worker-marker environment, and passes only stdin,
+stdout, and a newly opened NUL stderr handle through
+`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`; the liveness pipe never reaches the worker.
 
 The security-critical startup order is: reject elevated/invalid host state;
 create and configure a dedicated Job; derive and kernel-validate a restricted
@@ -152,6 +157,21 @@ containment failure. Product runtime awaits both attestation and the exact
 worker identity before registering the adapter or exposing operator/MCP commit
 surfaces. Missing/incompatible nested-Job support fails closed and never uses
 `CREATE_BREAKAWAY_FROM_JOB`.
+
+The test-only process-limit proof is owned by the trusted launcher, not inferred
+from an ambiguous worker exit. While the real worker remains suspended as the
+Job's sole member, the launcher creates a second suspended restricted candidate,
+requires assignment to fail with `ERROR_NOT_ENOUGH_QUOTA`, terminates/waits that
+exact candidate handle if the kernel leaves it suspended, and re-queries the Job
+to prove one active member whose ID is the original worker. It then resumes the
+real worker, which performs its own forbidden child-process attempt and reports
+the denial. After the worker settles, the launcher re-queries zero active/listed
+Job members and only then emits the fixed trusted post-attempt evidence frame.
+Parent-loss testing uses two complementary regressions: a real abnormal parent
+exit proves the dedicated pipe breaks and the launcher ends, while a directly
+closed copy of that same liveness channel preserves the observer long enough for
+the launcher to confirm worker termination through its exact process handle. It
+does not use a worker PID observation as proof.
 
 The Job constants are one active process, 256 MiB per-process memory, 192 MiB
 job memory, 20% CPU hard cap, kill-on-close, and no breakaway flags. The token

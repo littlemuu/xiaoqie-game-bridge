@@ -196,7 +196,9 @@ export class ProcessMockAdapter implements GameAdapter {
         env: spec.env,
         shell: spec.shell,
         windowsHide: true,
-        stdio: ["pipe", "pipe", "ignore"],
+        // fd 3 is a dedicated closed-world parent-liveness pipe. The native launcher
+        // validates its inherited end and never passes it to the contained worker.
+        stdio: ["pipe", "pipe", "ignore", "pipe"],
       });
     } catch {
       this.#fail("containment");

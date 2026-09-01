@@ -3,7 +3,8 @@
 #endif
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <tlhelp32.h>
+
+#include <io.h>
 
 #include <algorithm>
 #include <array>
@@ -21,6 +22,8 @@ constexpr SIZE_T kJobMemoryLimitBytes = 192ULL * 1024ULL * 1024ULL;
 constexpr DWORD kActiveProcessLimit = 1;
 constexpr DWORD kCpuRate = 2000;  // 20.00%, in 1/100ths of a percent.
 constexpr DWORD kParentExitWaitMs = 2000;
+constexpr DWORD kParentLivenessPollMs = 25;
+constexpr int kParentLivenessFileDescriptor = 3;
 
 constexpr int kExitInvalidLaunch = 40;
 constexpr int kExitHostPolicy = 41;
@@ -180,7 +183,8 @@ bool BuildLaunchConfiguration(
       !EqualsIgnoreCase(*worker_mode, L"probe-attestation") &&
       !EqualsIgnoreCase(*worker_mode, L"probe-child") &&
       !EqualsIgnoreCase(*worker_mode, L"probe-memory") &&
-      !EqualsIgnoreCase(*worker_mode, L"probe-cpu")) {
+      !EqualsIgnoreCase(*worker_mode, L"probe-cpu") &&
+      !EqualsIgnoreCase(*worker_mode, L"probe-parent-liveness")) {
     return false;
   }
   *fault_stage = ParseFaultStage(argv[4]);
@@ -378,23 +382,30 @@ bool ValidateJob(HANDLE job, HANDLE process) {
   return true;
 }
 
-UniqueHandle OpenParentProcess() {
-  const DWORD current_pid = GetCurrentProcessId();
-  UniqueHandle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
-  if (!snapshot) return UniqueHandle();
-  PROCESSENTRY32W entry{};
-  entry.dwSize = static_cast<DWORD>(sizeof(entry));
-  DWORD parent_pid = 0;
-  if (Process32FirstW(snapshot.get(), &entry)) {
-    do {
-      if (entry.th32ProcessID == current_pid) {
-        parent_pid = entry.th32ParentProcessID;
-        break;
-      }
-    } while (Process32NextW(snapshot.get(), &entry));
+HANDLE ParentLivenessPipe() {
+  const intptr_t raw = _get_osfhandle(kParentLivenessFileDescriptor);
+  if (raw == -1) return INVALID_HANDLE_VALUE;
+  HANDLE handle = reinterpret_cast<HANDLE>(raw);
+  if (handle == nullptr || handle == INVALID_HANDLE_VALUE ||
+      GetFileType(handle) != FILE_TYPE_PIPE) {
+    return INVALID_HANDLE_VALUE;
   }
-  if (parent_pid == 0) return UniqueHandle();
-  return UniqueHandle(OpenProcess(SYNCHRONIZE, FALSE, parent_pid));
+  DWORD flags = 0;
+  if (!GetNamedPipeInfo(handle, &flags, nullptr, nullptr, nullptr) ||
+      !SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0)) {
+    return INVALID_HANDLE_VALUE;
+  }
+  return handle;
+}
+
+bool ParentLivenessPipeIsOpen(HANDLE handle) {
+  if (handle == nullptr || handle == INVALID_HANDLE_VALUE ||
+      GetFileType(handle) != FILE_TYPE_PIPE) {
+    return false;
+  }
+  DWORD available = 0;
+  return PeekNamedPipe(handle, nullptr, 0, nullptr, &available, nullptr) != FALSE &&
+         available == 0;
 }
 
 bool BuildEnvironment(const std::wstring& mode, std::vector<wchar_t>* environment) {
@@ -446,8 +457,7 @@ bool WriteAttestation(HANDLE output, const char* integrity, bool host_in_job) {
          written == static_cast<DWORD>(length);
 }
 
-bool WriteContainmentFaultIfPresent(HANDLE job, HANDLE output,
-                                    const std::wstring& worker_mode) {
+bool WriteContainmentFaultIfPresent(HANDLE job, HANDLE output) {
   const char* category = nullptr;
   JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
   if (QueryInformationJobObject(job, JobObjectExtendedLimitInformation, &limits,
@@ -463,18 +473,6 @@ bool WriteContainmentFaultIfPresent(HANDLE job, HANDLE output,
       (violation.ViolationLimitFlags & JOB_OBJECT_LIMIT_JOB_MEMORY) != 0) {
     category = "memory-limit";
   }
-  JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting{};
-#ifdef XIAOQIE_CONTAINMENT_TEST_BUILD
-  if (category == nullptr && EqualsIgnoreCase(worker_mode, L"probe-child") &&
-      QueryInformationJobObject(job, JobObjectBasicAccountingInformation, &accounting,
-                                sizeof(accounting), nullptr) &&
-      accounting.TotalProcesses > 1) {
-    category = "process-limit";
-  }
-#else
-  (void)worker_mode;
-  (void)accounting;
-#endif
   if (category == nullptr) return false;
   char message[128]{};
   const int length = std::snprintf(
@@ -486,6 +484,111 @@ bool WriteContainmentFaultIfPresent(HANDLE job, HANDLE output,
   return WriteFile(output, message, static_cast<DWORD>(length), &written, nullptr) != FALSE &&
          written == static_cast<DWORD>(length);
 }
+
+#ifdef XIAOQIE_CONTAINMENT_TEST_BUILD
+bool VerifyProcessLimitWithSuspendedCandidate(
+    HANDLE job, HANDLE restricted_token,
+    const std::wstring& node_path, const std::wstring& worker_path,
+    const std::wstring& working_directory, std::vector<wchar_t>* environment) {
+  if (environment == nullptr) return false;
+  std::wstring command_line = QuoteArgument(node_path) + L" " + QuoteArgument(worker_path);
+  std::vector<wchar_t> mutable_command(command_line.begin(), command_line.end());
+  mutable_command.push_back(L'\0');
+  STARTUPINFOW startup{};
+  startup.cb = static_cast<DWORD>(sizeof(startup));
+  PROCESS_INFORMATION candidate_info{};
+  if (!CreateProcessAsUserW(
+          restricted_token, node_path.c_str(), mutable_command.data(), nullptr, nullptr, FALSE,
+          CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+          environment->data(), working_directory.c_str(), &startup, &candidate_info)) {
+    return false;
+  }
+  UniqueHandle candidate_process(candidate_info.hProcess);
+  UniqueHandle candidate_thread(candidate_info.hThread);
+
+  const BOOL assigned = AssignProcessToJobObject(job, candidate_process.get());
+  const DWORD assignment_error = GetLastError();
+  if (assigned) {
+    TerminateProcess(candidate_process.get(), kExitWorker);
+    WaitForSingleObject(candidate_process.get(), kParentExitWaitMs);
+    return false;
+  }
+  if (assignment_error != ERROR_NOT_ENOUGH_QUOTA) {
+    TerminateProcess(candidate_process.get(), kExitWorker);
+    WaitForSingleObject(candidate_process.get(), kParentExitWaitMs);
+    return false;
+  }
+  if (WaitForSingleObject(candidate_process.get(), 0) != WAIT_OBJECT_0 &&
+      (!TerminateProcess(candidate_process.get(), kExitWorker) ||
+       WaitForSingleObject(candidate_process.get(), kParentExitWaitMs) != WAIT_OBJECT_0)) {
+    return false;
+  }
+  DWORD candidate_exit = STILL_ACTIVE;
+  if (!GetExitCodeProcess(candidate_process.get(), &candidate_exit) ||
+      candidate_exit == STILL_ACTIVE) {
+    return false;
+  }
+
+  return true;
+}
+
+bool VerifyProcessLimitAccounting(HANDLE job, HANDLE worker_process) {
+  JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting{};
+  std::array<BYTE, sizeof(JOBOBJECT_BASIC_PROCESS_ID_LIST) + sizeof(ULONG_PTR) * 2> list{};
+  auto* process_list = reinterpret_cast<JOBOBJECT_BASIC_PROCESS_ID_LIST*>(list.data());
+  return QueryInformationJobObject(job, JobObjectBasicAccountingInformation, &accounting,
+                                   sizeof(accounting), nullptr) != FALSE &&
+         QueryInformationJobObject(job, JobObjectBasicProcessIdList, process_list,
+                                   static_cast<DWORD>(list.size()), nullptr) != FALSE &&
+         accounting.ActiveProcesses == 1 &&
+         process_list->NumberOfAssignedProcesses == 1 &&
+         process_list->NumberOfProcessIdsInList == 1 &&
+         process_list->ProcessIdList[0] == static_cast<ULONG_PTR>(GetProcessId(worker_process));
+}
+
+bool VerifyProcessLimitPostAttempt(HANDLE job) {
+  JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+  JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting{};
+  std::array<BYTE, sizeof(JOBOBJECT_BASIC_PROCESS_ID_LIST) + sizeof(ULONG_PTR) * 2> list{};
+  auto* process_list = reinterpret_cast<JOBOBJECT_BASIC_PROCESS_ID_LIST*>(list.data());
+  return QueryInformationJobObject(job, JobObjectExtendedLimitInformation, &limits,
+                                   sizeof(limits), nullptr) != FALSE &&
+         QueryInformationJobObject(job, JobObjectBasicAccountingInformation, &accounting,
+                                   sizeof(accounting), nullptr) != FALSE &&
+         QueryInformationJobObject(job, JobObjectBasicProcessIdList, process_list,
+                                   static_cast<DWORD>(list.size()), nullptr) != FALSE &&
+         (limits.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_ACTIVE_PROCESS) != 0 &&
+         (limits.BasicLimitInformation.LimitFlags &
+          (JOB_OBJECT_LIMIT_BREAKAWAY_OK | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK)) == 0 &&
+         limits.BasicLimitInformation.ActiveProcessLimit == kActiveProcessLimit &&
+         accounting.ActiveProcesses == 0 &&
+         process_list->NumberOfAssignedProcesses == 0 &&
+         process_list->NumberOfProcessIdsInList == 0;
+}
+
+bool WriteProcessLimitProbeEvidence(HANDLE output) {
+  static constexpr char kMessage[] =
+      "{\"version\":1,\"type\":\"containment-probe-result\","
+      "\"category\":\"process-limit\",\"quotaRejection\":true,"
+      "\"candidateTerminationConfirmed\":true,\"postAttemptActiveProcesses\":0,"
+      "\"postAttemptLiveJobMembers\":0,\"noEscapedLiveChild\":true}\n";
+  DWORD written = 0;
+  return WriteFile(output, kMessage, static_cast<DWORD>(sizeof(kMessage) - 1), &written,
+                   nullptr) != FALSE &&
+         written == static_cast<DWORD>(sizeof(kMessage) - 1);
+}
+
+bool WriteParentLivenessProbeEvidence(HANDLE output) {
+  static constexpr char kMessage[] =
+      "{\"version\":1,\"type\":\"containment-probe-result\","
+      "\"category\":\"parent-liveness\",\"workerTerminationConfirmed\":true}\n";
+  DWORD written = 0;
+  return output != nullptr && output != INVALID_HANDLE_VALUE &&
+         WriteFile(output, kMessage, static_cast<DWORD>(sizeof(kMessage) - 1), &written,
+                   nullptr) != FALSE &&
+         written == static_cast<DWORD>(sizeof(kMessage) - 1);
+}
+#endif
 
 void TerminateSuspendedProcess(HANDLE process) {
   if (process == nullptr || process == INVALID_HANDLE_VALUE) return;
@@ -514,8 +617,8 @@ int wmain(int argc, wchar_t** argv) {
 
   BOOL host_in_job = FALSE;
   if (!IsProcessInJob(GetCurrentProcess(), nullptr, &host_in_job)) return kExitHostPolicy;
-  UniqueHandle parent = OpenParentProcess();
-  if (!parent) return kExitHostPolicy;
+  HANDLE parent_liveness = ParentLivenessPipe();
+  if (!ParentLivenessPipeIsOpen(parent_liveness)) return kExitHostPolicy;
 
   UniqueHandle job(CreateJobObjectW(nullptr, nullptr));
   if (!job || fault_stage == FaultStage::kJob || !ConfigureJob(job.get())) return kExitJob;
@@ -655,9 +758,21 @@ int wmain(int argc, wchar_t** argv) {
   if (!OpenProcessToken(worker_process.get(), TOKEN_QUERY, &raw_worker_token)) return kExitAttestation;
   worker_token.reset(raw_worker_token);
   const char* worker_integrity = nullptr;
+#ifdef XIAOQIE_CONTAINMENT_TEST_BUILD
+  const bool process_limit_verified =
+      !EqualsIgnoreCase(worker_mode, L"probe-child") ||
+      (VerifyProcessLimitWithSuspendedCandidate(
+           job.get(), restricted_token.get(), node_path, worker_path,
+           working_directory, &environment) &&
+       VerifyProcessLimitAccounting(job.get(), worker_process.get()));
+#endif
   if (!ValidateRestrictedToken(worker_token.get(), restricting_sids, disabled_sid_storage,
-                               &worker_integrity) ||
+                                &worker_integrity) ||
       std::strcmp(worker_integrity, integrity) != 0 ||
+#ifdef XIAOQIE_CONTAINMENT_TEST_BUILD
+      !process_limit_verified ||
+#endif
+      !ParentLivenessPipeIsOpen(parent_liveness) ||
       !WriteAttestation(standard_output, integrity, host_in_job != FALSE)) {
     return kExitAttestation;
   }
@@ -668,20 +783,36 @@ int wmain(int argc, wchar_t** argv) {
 
   CloseLocalStandardHandle(STD_INPUT_HANDLE, standard_input);
 
-  const std::array<HANDLE, 2> waits = {worker_process.get(), parent.get()};
-  const DWORD wait_result = WaitForMultipleObjects(static_cast<DWORD>(waits.size()), waits.data(),
-                                                    FALSE, INFINITE);
-  if (wait_result == WAIT_OBJECT_0 + 1) {
-    job.reset();
-    WaitForSingleObject(worker_process.get(), kParentExitWaitMs);
-    return kExitWorker;
+  for (;;) {
+    const DWORD wait_result = WaitForSingleObject(worker_process.get(), kParentLivenessPollMs);
+    if (wait_result == WAIT_OBJECT_0) break;
+    if (wait_result != WAIT_TIMEOUT || !ParentLivenessPipeIsOpen(parent_liveness)) {
+      job.reset();
+      const DWORD worker_wait = WaitForSingleObject(worker_process.get(), kParentExitWaitMs);
+#ifdef XIAOQIE_CONTAINMENT_TEST_BUILD
+      if (EqualsIgnoreCase(worker_mode, L"probe-parent-liveness") &&
+          worker_wait == WAIT_OBJECT_0) {
+        WriteParentLivenessProbeEvidence(GetStdHandle(STD_ERROR_HANDLE));
+      }
+#else
+      (void)worker_wait;
+#endif
+      return kExitWorker;
+    }
   }
-  if (wait_result != WAIT_OBJECT_0) return kExitWorker;
   DWORD worker_exit = 1;
   if (!GetExitCodeProcess(worker_process.get(), &worker_exit)) return kExitWorker;
   if (worker_exit != 0) {
-    WriteContainmentFaultIfPresent(job.get(), standard_output, worker_mode);
+    WriteContainmentFaultIfPresent(job.get(), standard_output);
   }
+#ifdef XIAOQIE_CONTAINMENT_TEST_BUILD
+  if (worker_exit == 0 && EqualsIgnoreCase(worker_mode, L"probe-child") &&
+      (!VerifyProcessLimitPostAttempt(job.get()) ||
+       !WriteProcessLimitProbeEvidence(standard_output))) {
+    job.reset();
+    return kExitWorker;
+  }
+#endif
   job.reset();
   return worker_exit == 0 ? 0 : kExitWorker;
 }
