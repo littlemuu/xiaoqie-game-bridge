@@ -178,7 +178,10 @@ dedicated inherited pipe through a real abnormal parent exit and confirmed the
 launcher ended. A complementary direct liveness-channel closure kept the test
 observer open while the launcher confirmed contained-worker termination through
 its exact process handle. The product uses neither a process-table scan nor a
-parent-PID reopen.
+parent-PID reopen. The launcher reads the liveness endpoint from Node/libuv's
+bounded Windows startup handle table and validates its open-pipe flags and
+kernel type, avoiding an MSVCRT-only assumption for extra file descriptors when
+the native helper is built with MSVC/UCRT.
 
 Windows audit-file evidence was sampled from a real append-and-sync in a
 uniquely named temporary directory. The ledger object was a directory, its

@@ -291,6 +291,40 @@ describe.runIf(isWindows)("real Windows worker containment", () => {
     expect(messageOfType(messages, "containment-ready")).toBeUndefined();
   });
 
+  it("fails closed when the native startup handle table has no liveness slot", async () => {
+    const testSpec = fixedWorkerLaunchSpec({
+      testOnly: { faultMode: "hang", containmentFaultStage: "none" },
+    });
+    const child = spawn(testSpec.executable, [
+      process.execPath,
+      probeWorkerPath,
+      "probe-attestation",
+      "none",
+    ], {
+      cwd: dirname(probeWorkerPath),
+      env: {},
+      shell: false,
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const messages: unknown[] = [];
+    let stdout = "";
+    child.stdout!.setEncoding("utf8");
+    child.stdout!.on("data", (chunk: string) => {
+      stdout += chunk;
+      for (;;) {
+        const newline = stdout.indexOf("\n");
+        if (newline < 0) break;
+        messages.push(JSON.parse(stdout.slice(0, newline)));
+        stdout = stdout.slice(newline + 1);
+      }
+    });
+    const code = await new Promise<number | null>((resolve) => child.once("close", resolve));
+    expect(code).toBe(41);
+    expect(messageOfType(messages, "probe-entry")).toBeUndefined();
+    expect(messageOfType(messages, "containment-ready")).toBeUndefined();
+  });
+
   it.each([
     ["job", 42],
     ["token", 43],

@@ -67,12 +67,14 @@ checked-in, source-built Win32 launcher has established containment for the one
 fixed built `mock-worker.js`. Trusted code fixes the launcher, `process.execPath`,
 entrypoint, argv, cwd, empty launcher environment, `shell: false`, hidden window,
 and pipe-only stdio. The fourth pipe is a dedicated parent-liveness channel:
-the launcher validates its exact inherited endpoint before attestation/resume,
-never enumerates the process table or reopens a PID, and closes the Job when
-that endpoint breaks. It is excluded from the worker's inherited-handle
-allowlist. The launcher supplies only `SystemRoot` and a fixed worker marker to
-the worker. Requests, MCP, CLI, adapters, and environment variables cannot
-select any of these values.
+the launcher reads its native endpoint from Node/libuv's bounded Windows startup
+handle table, validates its open-pipe flags and kernel type before
+attestation/resume, never enumerates the process table or reopens a PID, and
+closes the Job when that endpoint breaks. This remains valid when the launcher
+uses UCRT, where extra CRT file descriptors are not guaranteed. The pipe is
+excluded from the worker's inherited-handle allowlist. The launcher supplies
+only `SystemRoot` and a fixed worker marker to the worker. Requests, MCP, CLI,
+adapters, and environment variables cannot select any of these values.
 Non-Windows product startup and any Windows containment failure fail closed;
 there is no direct-`spawn()` fallback.
 

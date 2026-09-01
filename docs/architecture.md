@@ -141,6 +141,9 @@ from that module, the launcher environment is empty, shell is false, and stdio
 is pipe/pipe/ignored/pipe. The fourth pipe is a dedicated parent-liveness
 channel. The helper validates the exact inherited descriptor, removes its
 inherit flag, and checks it before attestation/resume and while the worker runs.
+It obtains the native endpoint from Node/libuv's bounded Windows startup handle
+table and validates both the open-pipe flags and kernel object type, rather than
+assuming UCRT maps extra stdio handles into its CRT descriptor table.
 It performs no process-table enumeration or parent-PID reopen, so parent exit
 cannot be confused with PID reuse. The helper independently accepts only the
 product path shape (or a separately built test-only fixture shape), creates an

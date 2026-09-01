@@ -383,9 +383,42 @@ bool ValidateJob(HANDLE job, HANDLE process) {
 }
 
 HANDLE ParentLivenessPipe() {
-  const intptr_t raw = _get_osfhandle(kParentLivenessFileDescriptor);
-  if (raw == -1) return INVALID_HANDLE_VALUE;
-  HANDLE handle = reinterpret_cast<HANDLE>(raw);
+  // libuv passes additional Windows stdio handles through STARTUPINFO's
+  // reserved buffer. Reading that native table is required here because UCRT
+  // does not expose descriptors above stderr through _get_osfhandle().
+  STARTUPINFOW startup{};
+  GetStartupInfoW(&startup);
+  if (startup.lpReserved2 == nullptr || startup.cbReserved2 < sizeof(unsigned int)) {
+    return INVALID_HANDLE_VALUE;
+  }
+
+  unsigned int descriptor_count = 0;
+  std::memcpy(&descriptor_count, startup.lpReserved2, sizeof(descriptor_count));
+  if (descriptor_count <= static_cast<unsigned int>(kParentLivenessFileDescriptor) ||
+      descriptor_count > 256) {
+    return INVALID_HANDLE_VALUE;
+  }
+
+  const size_t required_size = sizeof(unsigned int) + descriptor_count * sizeof(BYTE) +
+                               descriptor_count * sizeof(uintptr_t);
+  if (required_size > startup.cbReserved2) return INVALID_HANDLE_VALUE;
+
+  const BYTE* buffer = startup.lpReserved2;
+  constexpr BYTE kCrtOpenPipeFlags = 0x01 | 0x08;
+  const BYTE descriptor_flags =
+      buffer[sizeof(unsigned int) + kParentLivenessFileDescriptor];
+  if (descriptor_flags != kCrtOpenPipeFlags) return INVALID_HANDLE_VALUE;
+
+  const size_t handle_offset = sizeof(unsigned int) + descriptor_count * sizeof(BYTE) +
+                               kParentLivenessFileDescriptor * sizeof(HANDLE);
+  HANDLE handle = INVALID_HANDLE_VALUE;
+  std::memcpy(&handle, buffer + handle_offset, sizeof(handle));
+#if defined(XIAOQIE_CONTAINMENT_TEST_BUILD) && defined(__MINGW32__)
+  const intptr_t crt_raw = _get_osfhandle(kParentLivenessFileDescriptor);
+  if (crt_raw == -1 || reinterpret_cast<HANDLE>(crt_raw) != handle) {
+    return INVALID_HANDLE_VALUE;
+  }
+#endif
   if (handle == nullptr || handle == INVALID_HANDLE_VALUE ||
       GetFileType(handle) != FILE_TYPE_PIPE) {
     return INVALID_HANDLE_VALUE;
