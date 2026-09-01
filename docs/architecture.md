@@ -138,14 +138,16 @@ change the active permission surface. A session binds to one adapter, so a
 granted capability cannot be redirected to another adapter.
 
 Schemas are restricted by a positive allowlist of Zod nodes, checks, and exact
-definition fields that round-trip through JSON Schema. Refinements, transforms,
-codecs, overwrite/trim, coerce, user `when`, lazy/function schemas, defaults,
-custom JSON Schema emitters, non-finite or lossy JSON numbers, and every unknown
-node/check/option are rejected. Conversion uses a fresh empty metadata registry,
-so global Zod metadata cannot rewrite the emitted contract. Registration
-deep-freezes the JSON snapshot, rebuilds the active validator from an isolated
-clone, and exposes only a frozen `safeParse` wrapper; neither source closures nor
-validator internals remain mutable through the registered manifest.
+definition fields that round-trip through JSON Schema. Registration first
+captures a bounded, immutable, own-data-only declarative AST; accessors, holes,
+symbol/extra keys, proxy failures, custom `_zod.toJSONSchema` or
+`_zod.processJSONSchema` emitters, non-finite/lossy numbers, and unknown nodes,
+checks or options fail closed. The one Zod built-in lazy object-shape getter is
+identified by its locked implementation and read exactly once. A trusted schema
+is rebuilt from the captured AST and emitted with a fresh empty metadata registry,
+so neither a live definition graph nor global metadata can rewrite the contract.
+Registration deep-freezes the JSON snapshot, rebuilds the active validator from
+an isolated clone, and exposes only a frozen `safeParse` wrapper.
 
 The mock adapter is a proof of this boundary, not a placeholder shell: it has a
 deterministic state, validates movement and block placement, previews changes
@@ -177,8 +179,9 @@ revision、容量拒绝和幂等重放不递增。预算先预留；adapter 明�
 observation contract 固定标注 `effectKind: read`，并显式选择 `parallel`、
 `serial` 或 `resource-serial`；preview action 则通过 `effectKind` 和
 `writeConcurrency: none` 明确不进入写锁。effect × mode 合法矩阵不允许 non-write
-action 接收 commit：read/preview 只能 dry-run，write 才能在 health、safety、资源
-调度、revision 与预算门禁后 commit。纯只读 adapter 可以拥有零个 action，此时不
+action 接收 commit：read/preview 只能 dry-run，并且注册时必须声明 `none`，不能
+公开未兑现的 `resource-serial`；合法 non-write dry-run 可与 write 并发。write 才能
+在 health、safety、资源调度、revision 与预算门禁后 commit。纯只读 adapter 可以拥有零个 action，此时不
 要求 `execute` 或 revision provider。只有声明 revision-required action 时才要求
 `getStateRevision`。当前 mock 的 read/preview 可以并发且不得修改 world。
 

@@ -493,6 +493,43 @@ describe("Adapter Contract v2", () => {
       requiredCapabilities: [],
     };
     expect(() => new AdapterRegistry().register(publicAction)).toThrow(/capability/u);
+
+    const resourceScheduledPreview = new CommitSignalPreviewAdapter();
+    (resourceScheduledPreview.actions as Record<string, AdapterActionDefinition>).preview = {
+      ...resourceScheduledPreview.actions.preview!,
+      writeConcurrency: { kind: "resource-serial", resourceKey: "world" },
+    };
+    expect(() => new AdapterRegistry().register(resourceScheduledPreview)).toThrow(
+      /non-write.*scheduling/u,
+    );
+
+    let malformedAccessorReads = 0;
+    const accessorValues = ["game.act.write"];
+    Object.defineProperty(accessorValues, "0", {
+      enumerable: true,
+      configurable: true,
+      get: () => {
+        malformedAccessorReads += 1;
+        return "game.act.write";
+      },
+    });
+    const malformedArrays = [new Array<string>(1), accessorValues];
+    for (const malformed of malformedArrays) {
+      const capabilityAdapter = new ContractTestAdapter();
+      (capabilityAdapter.actions as Record<string, AdapterActionDefinition>).write = {
+        ...capabilityAdapter.actions.write!,
+        requiredCapabilities: malformed as unknown as readonly string[],
+      };
+      expect(() => new AdapterRegistry().register(capabilityAdapter)).toThrow(/string array/u);
+
+      const errorCodeAdapter = new ContractTestAdapter();
+      (errorCodeAdapter.actions as Record<string, AdapterActionDefinition>).write = {
+        ...errorCodeAdapter.actions.write!,
+        adapterErrorCodes: malformed as unknown as readonly string[],
+      };
+      expect(() => new AdapterRegistry().register(errorCodeAdapter)).toThrow(/string array/u);
+    }
+    expect(malformedAccessorReads).toBe(0);
   });
 
   it("isolates JSON snapshots from metadata and rejects custom or lossy emitters", () => {
@@ -536,6 +573,59 @@ describe("Adapter Contract v2", () => {
     };
     expect(() => new AdapterRegistry().register(emitterAdapter)).toThrow(/declarative/u);
 
+    const processEmitterSchema = z.string();
+    (processEmitterSchema as unknown as {
+      _zod: {
+        processJSONSchema: (_context: unknown, json: Record<string, unknown>) => void;
+      };
+    })._zod.processJSONSchema = (_context, json) => {
+      json.type = "number";
+    };
+    const processEmitterAdapter = new ContractTestAdapter();
+    (processEmitterAdapter.actions as Record<string, AdapterActionDefinition>).write = {
+      ...processEmitterAdapter.actions.write!,
+      inputSchema: processEmitterSchema,
+    };
+    expect(() => new AdapterRegistry().register(processEmitterAdapter)).toThrow(/declarative/u);
+
+    const parentSchema = z.string();
+    const childSchema = parentSchema.meta({ description: "child" });
+    (parentSchema as unknown as {
+      _zod: {
+        processJSONSchema: (_context: unknown, json: Record<string, unknown>) => void;
+      };
+    })._zod.processJSONSchema = (_context, json) => {
+      json.type = "number";
+    };
+    const parentEmitterAdapter = new ContractTestAdapter();
+    (parentEmitterAdapter.actions as Record<string, AdapterActionDefinition>).write = {
+      ...parentEmitterAdapter.actions.write!,
+      inputSchema: childSchema,
+    };
+    expect(() => new AdapterRegistry().register(parentEmitterAdapter)).toThrow(/declarative/u);
+
+    const statefulShapeSchema = z.object({ value: z.string() }).strict();
+    let shapeReads = 0;
+    Object.defineProperty(
+      (statefulShapeSchema as unknown as { _zod: { def: object } })._zod.def,
+      "shape",
+      {
+        enumerable: true,
+        configurable: true,
+        get: () => {
+          shapeReads += 1;
+          return shapeReads === 1 ? { value: z.string() } : { value: z.number() };
+        },
+      },
+    );
+    const statefulShapeAdapter = new ContractTestAdapter();
+    (statefulShapeAdapter.actions as Record<string, AdapterActionDefinition>).write = {
+      ...statefulShapeAdapter.actions.write!,
+      inputSchema: statefulShapeSchema,
+    };
+    expect(() => new AdapterRegistry().register(statefulShapeAdapter)).toThrow(/declarative/u);
+    expect(shapeReads).toBe(0);
+
     for (const value of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, -0]) {
       const literalAdapter = new ContractTestAdapter();
       (literalAdapter.actions as Record<string, AdapterActionDefinition>).write = {
@@ -550,6 +640,57 @@ describe("Adapter Contract v2", () => {
         inputSchema: z.enum({ INVALID: value }),
       };
       expect(() => new AdapterRegistry().register(enumAdapter)).toThrow(/declarative/u);
+    }
+  });
+
+  it("fails closed when a declarative schema graph proxy cannot be captured", () => {
+    const proxiedShapeSchema = z.object({ value: z.string() }).strict();
+    Object.defineProperty(
+      (proxiedShapeSchema as unknown as { _zod: { def: object } })._zod.def,
+      "shape",
+      {
+        enumerable: true,
+        configurable: true,
+        value: new Proxy(
+          { value: z.string() },
+          {
+            ownKeys: () => {
+              throw new Error("stateful-shape-proxy");
+            },
+          },
+        ),
+      },
+    );
+    const adapter = new ContractTestAdapter();
+    (adapter.actions as Record<string, AdapterActionDefinition>).write = {
+      ...adapter.actions.write!,
+      inputSchema: proxiedShapeSchema,
+    };
+    expect(() => new AdapterRegistry().register(adapter)).toThrow(/declarative/u);
+  });
+
+  it("rejects extra string-array keys in closed manifest collections", () => {
+    const decorations = [
+      (values: string[]) => Object.assign(values, { extra: true }),
+      (values: string[]) => {
+        Object.defineProperty(values, Symbol("extra"), { value: true });
+        return values;
+      },
+    ];
+    for (const decorate of decorations) {
+      const capabilityAdapter = new ContractTestAdapter();
+      (capabilityAdapter.actions as Record<string, AdapterActionDefinition>).write = {
+        ...capabilityAdapter.actions.write!,
+        requiredCapabilities: decorate(["game.act.write"]),
+      };
+      expect(() => new AdapterRegistry().register(capabilityAdapter)).toThrow(/string array/u);
+
+      const errorCodeAdapter = new ContractTestAdapter();
+      (errorCodeAdapter.actions as Record<string, AdapterActionDefinition>).write = {
+        ...errorCodeAdapter.actions.write!,
+        adapterErrorCodes: decorate(["DENIED"]),
+      };
+      expect(() => new AdapterRegistry().register(errorCodeAdapter)).toThrow(/string array/u);
     }
   });
 
@@ -775,6 +916,23 @@ describe("Adapter Contract v2", () => {
       "preview-commit-during-write",
     );
     expectError(preview, "ACTION_NOT_ALLOWED");
+    expect(scheduledAdapter.previewCommitMutations).toBe(0);
+    expect(scheduledHarness.sessions.find(scheduledSession)!.actionBudgetRemaining).toBe(
+      budgetBeforePreview,
+    );
+    const legalDryRunPreview = await scheduledHarness.bridge.handle(
+      request(
+        "preview-dry-run-during-write",
+        "game.act",
+        { adapterId: scheduledAdapter.id, gameAction: "preview", input: {} },
+        { sessionId: scheduledSession, mode: "dry-run" },
+      ),
+      local,
+    );
+    expect(legalDryRunPreview).toMatchObject({
+      ok: true,
+      result: { applied: false, stateRevision: 0 },
+    });
     expect(scheduledAdapter.previewCommitMutations).toBe(0);
     expect(scheduledHarness.sessions.find(scheduledSession)!.actionBudgetRemaining).toBe(
       budgetBeforePreview,

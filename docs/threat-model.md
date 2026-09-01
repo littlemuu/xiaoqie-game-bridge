@@ -216,11 +216,12 @@ reconciliation 能力。`bridge.describe` 只输出可序列化 JSON Schema 与�
 回显异常文本。
 
 注册按 Zod node/check/option 正向白名单只接受能无损转成 JSON Schema 的声明式
-子集。refinement、transform、codec、overwrite/trim、coerce、用户 `when`、自定义
-JSON Schema emitter、非有限或有损 JSON number 与任何未识别定义字段均被拒绝；
-转换使用独有的空 metadata registry，活动 validator 从深冻结 JSON 快照的隔离
-副本重建并隐藏，源 metadata、schema、闭包或公开对象的后续修改不能改变实际
-验证逻辑。
+子集。注册先以 descriptor 捕获有界、own-data-only 的不可变 AST；hole、accessor、
+symbol/extra key、Proxy 异常、自定义 `_zod.toJSONSchema` / `_zod.processJSONSchema`、
+非有限/有损 JSON number 与任何未识别定义均被拒绝。Zod 内建 object lazy-shape
+getter 按锁定实现身份读取恰好一次。可信 schema 从 AST 重建后才使用独有空
+metadata registry 发射；活动 validator 再从深冻结 JSON 快照的隔离副本重建并
+隐藏，因此源 definition graph、metadata、emitter 或后续修改不能改变验证逻辑。
 
 Capability grant 虽来自受信 provider，仍作为运行时边界严格捕获、校验、复制：
 对象和 scope 无额外字段或 accessor，TTL 是受请求/全局上限约束的正 safe
@@ -231,9 +232,13 @@ audit reservation 之前固定拒绝，因此 `NaN` expiry 不能形成不可回
 转换不能在 provider 等待窗口后提交 session。
 
 `game.act` 的 effect × mode 是闭合集合：read/preview action 只允许 dry-run，commit
-仅属于 write action。non-write commit 在 adapter dispatch 前固定拒绝，因而不能靠
+仅属于 write action；non-write 同时必须声明 `writeConcurrency: none`，不能在 catalog
+中声称运行时未执行的 `resource-serial`。non-write commit 在 adapter dispatch 前固定拒绝，因而不能靠
 `mode === "commit"` 绕过 write health、safety latch、resource scheduler、revision
 admission 或动作预算。
+
+manifest 的 required capability 与 adapter error code 数组使用 descriptor-based
+dense capture；hole、index accessor、symbol/extra key 在任何元素读取前固定拒绝。
 
 The parent still owns identity, session binding, capabilities, action schemas,
 policy, idempotency, safety, and audit. Static metadata must exactly match the

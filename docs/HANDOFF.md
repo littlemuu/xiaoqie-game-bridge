@@ -132,7 +132,11 @@
   Session-open commit health is checked again synchronously after an asynchronous
   grant settles and before audit reservation or insertion.
 - The effect/mode matrix rejects commit for read/preview actions before adapter
-  dispatch; only write actions can enter commit safety, scheduling and budgets.
+  dispatch. Non-write actions must declare `writeConcurrency: none`; only write
+  actions can claim resource scheduling or enter commit safety and budgets.
+- Schema registration captures an immutable own-data declarative AST before
+  rebuilding a trusted emitter input. Custom Zod emitters, live graph accessors,
+  proxy failures, and malformed manifest string arrays fail closed.
   Product shutdown separately bounds mutation settlement, closes the adapter,
   then always invokes the ledger's own bounded drain/abort even on adapter error.
 - Invalid output after a write is classified with a fixed output error and
@@ -206,15 +210,16 @@ Actual local results on 2026-09-01 with Node.js `v22.23.1` and npm `10.9.8`:
 - `npm ci` — passed; 73 packages installed, 74 audited, 0 vulnerabilities
 - `npm audit` — passed; 0 vulnerabilities
 - `npm run check` — passed
-- `npm test` — passed; 10 files, 151 tests passed and 2 explicitly inapplicable
-  Windows gates skipped (153 registered assertions) in 41.59 s. All prior
+- `npm test` — passed; 10 files, 153 tests passed and 2 explicitly inapplicable
+  Windows gates skipped (155 registered assertions) in 46.23 s. All prior
   protocol, MCP, operator, audit, safety, idempotency, capacity and containment
   regressions remain green. Adapter Contract v2 coverage now includes the Zod
-  positive allowlist with isolated metadata and finite numeric literals, async
-  grant final admission, the closed effect/mode matrix, malformed runtime grants
-  before side effects, separate mutation/audit shutdown phases, adapter-close
-  failure cleanup, immutable catalogs, revisions, budgets, output validation,
-  and outcome-unknown handling.
+  positive allowlist with own-data AST capture, trusted emitter reconstruction,
+  isolated metadata and finite numeric literals, dense manifest string arrays,
+  async grant final admission, the closed effect/mode/scheduling matrix,
+  malformed runtime grants before side effects, separate mutation/audit shutdown
+  phases, adapter-close failure cleanup, immutable catalogs, revisions, budgets,
+  output validation, and outcome-unknown handling.
 - Real stdio contract — passed inside `npm test`; official
   `Client@2.0.0`/`StdioClientTransport` started the built Node entrypoint,
   completed initialize/list/calls, and closed client first then transport
@@ -294,7 +299,7 @@ audit, and diff-check. It does not run or claim the non-elevated allow path,
 named-pipe/operator, process-adapter, MCP stdio, CLI, lifecycle, or demo suite.
 Those remain local non-elevated Windows evidence until a suitable dedicated
 runner exists. The final Node 22 run for Adapter Contract v2 passed all 10 files
-with 151 passed/2 explicitly inapplicable skips in 41.59 s; the exact inventory
+with 153 passed/2 explicitly inapplicable skips in 46.23 s; the exact inventory
 now includes `adapter-contract-v2.test.ts`, so partial or stale nine-file output
 cannot become non-elevated Windows evidence.
 
