@@ -1,21 +1,92 @@
 # xiaoqie-game-bridge
 
-An offline-first, default-deny foundation for narrowly scoped game adapters,
-with a client-spawned local stdio/MCP contract and a separate same-user Windows
-named-pipe operator channel. The product server runs only a deterministic mock
-world in a bounded child process: it does not start, inspect, or control any
-real game or desktop application. Its bridge/operator security events use a
-separate bounded local audit ledger; that ledger is not a game save.
+`xiaoqie-game-bridge` 是一套 **offline-first、default-deny、本地优先** 的游戏能力桥接基础设施。长期目标是让云端主脑通过范围明确、随时可停、可审计的本地 adapter 操作游戏，而不是获得通用电脑控制权。
 
-## Requirements
+**当前版本：** `0.1.0-rc.1`  
+**当前状态：** mock-only release candidate  
+**当前产品路径：** Windows 非提权本地进程  
+**当前真实游戏支持：** 无
+
+> 当前 RC 只运行一个确定性的内存 mock world。它不会启动、检查或控制 Minecraft、Steam、Stardew Valley、SMAPI、launcher、账号、存档、桌面或其他真实应用。
+
+## 当前定位
+
+项目已经建立的安全基线包括：
+
+- 严格、版本化、closed-world 的 bridge 请求与响应协议；
+- memory-only、adapter-bound、caller-owned 的 session；
+- capability、policy、dry-run、幂等缓存和有界并发写入；
+- 模型可触发、但不能自行解除的全局 safety latch；
+- 独立于 MCP 的本地 Windows named-pipe operator；
+- 固定目录、追加式、有界、可恢复的本地安全审计账本；
+- 固定 mock worker、严格 IPC、Windows Restricted Token + Job Object；
+- client-spawned local stdio MCP，且只注册一个 `game_bridge_request` tool；
+- 可复现的 `v0.1.0-rc.1` bundle、checksum、SBOM、manifest 与发布来源证据。
+
+这些能力构成安全地基，但不代表项目已经适合真实游戏。当前路线已经调整：**冻结发布、审计和 Windows containment 的继续扩张，优先修正 adapter 领域契约、可信授权、状态一致性、动作结果对账和运行恢复。**
+
+完整路线见 [`docs/ROADMAP.md`](docs/ROADMAP.md)。当前下一张工单是 [Issue #19：Adapter Contract v2、可信授权与运行健康基础](https://github.com/littlemuu/xiaoqie-game-bridge/issues/19)。
+
+## 当前不提供的能力
+
+项目目前明确不提供：
+
+- 任意 shell、PowerShell、通用进程执行或动态 executable/argv；
+- 任意文件系统、整盘读取、通用网络、键盘、鼠标或桌面自动化；
+- HTTP、WebSocket、SSE、TCP、relay、tunnel 或公网 endpoint；
+- OAuth、pairing、远程认证、账号系统或持久 session；
+- 真实游戏 API、mod、存档读写、launcher 控制或购买内容访问；
+- hostile-code sandbox、完整文件/网络隔离或 hostile same-user 防护；
+- 已开始动作的强制取消、回滚或跨进程 exactly-once 保证。
+
+## 架构概览
+
+```text
+本地 MCP client（拥有并拉起一个 child process）
+                     |
+                     | stdin/stdout 上的本地 MCP
+                     v
+           stdio 边界：一个 tool
+          64 KiB frame / 32 KiB envelope
+                     |
+                     | 固定 local context
+                     v
+                GameBridge core
+ protocol | session | owner | policy | capability
+ idempotency | safety | audit
+                     |
+                     | 严格、有界、版本化 adapter IPC
+                     v
+          ProcessMockAdapter
+                     |
+                     v
+  固定 Win32 launcher -> Restricted Token + Job
+                     |
+                     v
+           确定性内存 mock worker
+
+独立的本地 operator CLI
+                     |
+                     | authenticated Windows named pipe
+                     v
+       同一个 bridge / safety latch / audit sink
+```
+
+核心仍然是唯一裁决点。transport 负责确立 caller context；core 负责 session owner、policy、capability、幂等、safety 和 audit；adapter 只执行已经被批准的窄动作。
+
+## 五分钟验证
+
+### 环境要求
 
 - Node.js 22
-- npm 10 or newer
-- On Windows, either MSVC Build Tools with the Windows SDK or MinGW-w64 `g++`.
-  The build compiles the checked-in narrow Win32 helper from source; no EXE/DLL
-  is committed or downloaded at runtime.
+- npm 10 或更新版本
+- Windows 产品路径需要以下任一原生工具链：
+  - MSVC Build Tools + Windows SDK；或
+  - MinGW-w64 `g++`
 
-## Five-minute verification
+仓库只提交窄 Win32 helper 的源码。构建时从源码编译，不提交或运行时下载 EXE/DLL。
+
+### 验证命令
 
 ```bash
 npm ci
@@ -27,254 +98,65 @@ npm audit
 git diff --check
 ```
 
-On Windows, the demo opens an in-memory session, previews a movement, commits it once,
-replays the same request without a second side effect, triggers the safety
-latch, and proves that observation remains available while writes are denied.
-Other platforms print a fixed skip result because the product has no
-unrestricted worker fallback.
+发布证据验证：
 
-## Safety properties
+```bash
+npm run release:workflow-policy
+npm run release:reproducible
+npm run release:build
+npm run release:verify
+```
 
-- Unknown bridge actions and undeclared parameters are rejected.
-- Sessions are memory-only, adapter-bound, capability-limited, caller-bound,
-  and expire. A session opened by one trusted caller cannot be observed,
-  replayed, stopped, or closed by another caller.
-- Session count, per-session request history, and concurrent commit writes have
-  hard limits. Capacity exhaustion returns `RESOURCE_CAPACITY` before adapter
-  side effects.
-- Every mock-game mutation supports a non-mutating `dry-run` mode.
-- Reusing a request ID cannot repeat an operation; conflicting reuse is denied.
-- A global safety latch blocks new commit writes. Each running-to-stopped edge
-  increments a monotonic `stopGeneration`; resume requires that exact observed
-  generation and zero in-flight writes.
-- Product audit events survive clean restart in a fixed append-only local
-  ledger. They contain hashed request/session tags and recursively redact common
-  credential, path, endpoint, PID, username, stack, and raw-payload fields.
-  Session events may contain a short caller tag derived by
-  HMAC with a process-memory-only random key, never the caller principal, full
-  owner digest, or HMAC key.
-- The product server exposes no shell, generic process, filesystem, network,
-  keyboard, mouse, tunnel, or real-game capability. The dev-only official MCP
-  client starts exactly the built stdio server in contract tests.
+最新的实际版本、测试总数、平台 skip、Windows 内核证据和本地验收结果见 [`docs/HANDOFF.md`](docs/HANDOFF.md)。
 
-See [architecture](docs/architecture.md), [threat model](docs/threat-model.md),
-[release process](docs/release.md), [support matrix](docs/support-matrix.md),
-[handoff](docs/HANDOFF.md), and [open questions](docs/OPEN_QUESTIONS.md).
+## 当前 mock world
 
-## v0.1.0-rc.1 candidate artifacts
+mock adapter 只包含一个很小的内存世界：
 
-The repository version is sourced only from `package.json`; the lockfile,
-release CLI, normalized bundle, SBOM and manifest are checked against it. From a
-clean Node 22.23.1 checkout, `npm run release:reproducible` performs two local
-offline clean-clone builds and requires identical bundle bytes. Then
-`npm run release:build` and `npm run release:verify` create and validate the
-five-file bundle/checksum/SBOM/manifest/provenance allowlist.
+- 观察玩家位置与附近方块；
+- `move`；
+- `place_block`；
+- 方块仅允许 `stone`、`dirt`、`torch`；
+- 坐标范围很小且固定；
+- `dry-run` 返回预计变化但不修改状态；
+- `commit` 只在 session、owner、capability、policy 和 safety 全部允许时执行；
+- 相同 session 内重复使用相同 `requestId` 不会重复副作用。
 
-`package.json` remains `private: true`; this project is not published to npm.
-The local provenance statement is explicitly unsigned. A real GitHub artifact
-attestation is requested only by the protected annotated-tag workflow after
-merge. None of these artifacts upgrades the product beyond mock-only status or
-proves complete supply-chain security, a hostile-code sandbox, all-platform
-coverage, or safety for any real game.
+mock world、session、幂等缓存和 safety latch 都不会跨产品进程重启保留。只有有界、脱敏的安全审计账本会持久存在。
 
-## Isolated mock adapter process
+## Session、owner 与 capability
 
-The Windows product stdio entrypoint registers `ProcessMockAdapter` only after a
-checked-in, source-built Win32 launcher has established containment for the one
-fixed built `mock-worker.js`. Trusted code fixes the launcher, `process.execPath`,
-entrypoint, argv, cwd, empty launcher environment, `shell: false`, hidden window,
-and pipe-only stdio. Stdin carries adapter IPC; stderr is a dedicated reverse
-parent-liveness pipe. The launcher validates the inherited Win32 write endpoint,
-keeps an exact non-inheritable duplicate, and writes fixed one-byte pulses while
-the Node parent drains them. Parent read-end closure makes a pulse fail
-independently of unread stdin bytes. The worker receives a new NUL stderr handle,
-never the liveness channel. This standard-handle contract remains valid across
-MSVCRT and UCRT. The launcher never enumerates the process table or reopens a PID
-and closes the Job when the endpoint breaks. It supplies only `SystemRoot` and a
-fixed worker marker to the worker. Requests, MCP, CLI, adapters, and environment
-variables cannot select any of these values.
-Non-Windows product startup and any Windows containment failure fail closed;
-there is no direct-`spawn()` fallback.
+session：
 
-The launcher derives a real primary restricted token from the non-elevated
-caller, disables maximum privileges, makes administrator/operator groups
-disabled or deny-only, and uses the source user plus enabled non-privileged
-groups as the restricting-SID policy. It then creates the worker suspended,
-assigns it to a dedicated Job, queries both token and Job state, writes one
-closed-world attestation, and only then resumes JavaScript. The Job enforces
-kill-on-close, one active process, a 256 MiB process-memory limit, a 192 MiB
-job-memory limit, a 20% CPU hard cap, and no breakaway. The existing 2 s
-handshake/call, 1 s graceful-close, eight-call, 64 KiB frame, and 32 KiB message
-limits remain in force.
+- 只保存在内存；
+- 默认 TTL 15 分钟，最大 60 分钟；
+- 默认最多保留 64 个 session；
+- 绑定一个 adapter、一个不可变 owner key 和明确 capability 集合；
+- terminal session 默认保留 5 分钟，由显式 `sweep()` 清理；
+- 每个 session 默认最多保留 256 个 request 幂等条目；
+- active session 和 in-flight request 不会被静默驱逐。
 
-Adapter IPC is newline-delimited, versioned, strict JSON with a 64 KiB frame
-limit, 32 KiB logical-message limit, eight pending calls, two-second handshake
-and call deadlines, and a one-second graceful-close deadline. Parent-generated
-`call-N` identifiers are unrelated to MCP, bridge request, session, or caller
-identity. Malformed/unknown/oversized output, wrong or duplicate IDs, timeout,
-EOF, crash, and non-zero exit fail closed and settle pending calls with fixed
-sanitized bridge errors.
+owner 来自可信 transport context，不来自请求参数。当前 local stdio 注入精确的 `{ transport: "local" }`；未来 remote seam 只是一份严格接口，生产环境尚无 remote credential verification。
 
-The trusted helper verifies `TokenIsRestricted`, dangerous privileges, group
-policy, restricting SIDs, medium-or-lower integrity, Job membership, every
-resource limit, and the one-member count from kernel results. A bounded test
-probe also proves child-process denial, memory-limit settlement, CPU policy,
-failure before resume, exact parent-loss cleanup, and nested-Job behavior on the
-actual Windows host. The process-count probe is launcher-owned: it creates a
-second suspended restricted candidate, requires Job assignment to fail with the
-active-process quota, and confirms candidate termination while the original
-worker remains the Job's only live member. The real worker then attempts the
-same forbidden child creation; after its denial settles, the launcher queries
-zero live Job members before emitting the trusted post-attempt evidence.
-The abnormal-parent probe uses the launcher's exact worker process handle—not a
-PID lookup—to confirm Job-close termination.
-This is still not a hostile-code, filesystem, registry, or network sandbox.
-The worker remains trusted code and receives no caller identity or secret. No
-real adapter is authorized.
+需要特别说明：**当前代码只验证调用方请求的 capability 是否由 adapter 声明，尚未实现可信本地 grant profile。** 因此，真实 adapter 接入前必须先完成 Issue #19，使实际授权成为“请求能力、可信 profile、adapter manifest 与资源 scope 的交集”。
 
-## Capacity defaults and configuration
+## 幂等与并发
 
-The defaults are intentionally finite:
+- 相同 session、相同 `requestId`、相同请求内容会复用原结果或等待同一个 in-flight promise；
+- 相同 ID、不同内容返回 `REQUEST_ID_REUSED`；
+- 幂等证据只存在于当前产品进程；
+- 全局默认最多同时有 4 个 commit write；
+- MCP 默认最多同时有 8 个 handler；
+- adapter IPC 默认最多有 8 个 pending call；
+- 达到容量时在 adapter 副作用前拒绝，不建立无界等待队列。
 
-- 64 retained sessions
-- 5-minute terminal-session retention
-- 256 idempotency entries per session
-- 4 concurrent commit writes across the bridge
-- 4 KiB per audit record, 8 pending audit writes, 64 KiB per segment,
-  8 segments total, 2,048 confirmation markers, 2,048 independent checkpoints,
-  and a 500 ms ledger shutdown-drain deadline
+这些限制只能证明资源有界，不能证明真实游戏状态并发安全。新的路线要求同一游戏资源的写入默认串行，并引入 state revision 与 `expectedRevision`。
 
-Configure the first three through `SessionManagerOptions` (`maxSessions`,
-`terminalRetentionMs`, and `maxRequestsPerSession`). Configure the write gate
-with `new SafetyLatch({ maxInFlightWrites })`. `SessionManager.sweep()` uses the
-injected clock and creates no timer; `open()` also sweeps eligible terminal
-sessions before checking capacity. Active sessions and sessions with in-flight
-requests are never evicted.
+## Safety latch 与本地 operator
 
-When a request cache is full, an existing request ID still replays its original
-response, while a new ordinary request is rejected. `session.close` may bypass
-the full cache without adding an entry; closing is itself idempotent. Local
-`stopSafety()` does not use a session request cache and therefore cannot be
-locked out by request capacity.
+普通 bridge/MCP action 可以执行 `safety.stop`，但协议中不存在 `safety.resume`。
 
-## Local stdio/MCP contract
-
-After `npm run build`, a local MCP client may spawn the server with Node at
-`dist/src/mcp/stdio-server.js`. `npm run mcp:stdio` invokes that same built
-entrypoint, which first opens and verifies the fixed local audit ledger, then
-creates the local operator named-pipe listener, and only then waits for MCP
-messages on stdin. Ledger or operator startup failure exits closed. It opens no TCP/HTTP port and creates no relay,
-tunnel, background service, or host configuration.
-
-The MCP surface registers exactly one tool, `game_bridge_request`. Its input and
-structured output reuse `requestEnvelopeSchema` and `responseEnvelopeSchema`;
-there is no parallel protocol schema. The tool may carry a commit request, so
-its metadata is deliberately not read-only or inherently idempotent. It is
-closed-world and reaches only the in-memory mock adapter.
-
-The boundary fixes caller context to a frozen `{ transport: "local" }` inside
-trusted server code. Tool arguments cannot self-declare context, principal, or
-transport identity. MCP's JSON-RPC request ID and the envelope's bridge
-`requestId` are separate: the wrapper preserves the latter byte-for-byte,
-generates no replacement ID, and performs no automatic retry.
-
-At the core boundary, caller context is captured once from own data-property
-descriptors, strict-validated from those captured values, copied, and deeply
-frozen before the first asynchronous authorization step. Local
-context has exactly one field. A future remote transport must provide exactly
-`transport`, `principal.subject`, and `principal.method`; both principal fields
-are non-empty and bounded. Omitted, malformed, or extended context is
-untrusted. Remote transport and authentication are still deliberately absent.
-The local owner domain is process-local in effect because sessions are neither
-persisted nor shared between processes.
-
-Stdio has a 64 KiB frame-buffer limit. Valid tool arguments face a second,
-deterministically measured 32 KiB UTF-8 envelope limit, and at most eight tool
-handlers enter the bridge concurrently. Logical-size or handler-capacity
-refusals occur before core/adapter execution and return `RESOURCE_CAPACITY`;
-they are transport results, not entries in the core idempotency cache. Stdout is
-protocol-only. Transport diagnostics, when necessary, are fixed and sanitized
-on stderr.
-
-The logical limit is configurable through the factory's `maxEnvelopeBytes` and
-the handler limit through `maxConcurrentHandlers`; production uses the exported
-defaults. Tests may inject a `HandlerConcurrencyGate` directly to inspect permit
-release without introducing timers.
-
-Client cancellation or disconnect closes the transport but does not claim to
-forcibly cancel or roll back a write that already entered the core or worker. The client
-must close first, followed by the server/transport. The MCP surface exposes no
-operator identity or local safety status/resume surface, and `safety.resume`
-remains unknown to ordinary bridge requests.
-
-## Durable local audit ledger
-
-Production stores only the bridge/operator's bounded safety events under the
-fixed current-user application directory
-`AppData/Local/xiaoqie-game-bridge-audit/ledger`. No MCP request, bridge
-parameter, adapter, operator command, CLI option, or application-specific
-environment setting can select a path, file name, format, rotation rule, or
-capacity. The operator's ephemeral descriptor remains in the separate
-`xiaoqie-game-bridge` runtime directory and is still removed on normal exit;
-ledger segments are not removed or truncated.
-
-Each closed-world version-1 record has an eight-hex-byte length prefix, a
-canonical JSON payload, newline frame terminator, monotonic sequence, previous
-record digest, and its own SHA-256 digest. The ledger persists no generic event
-metadata; only the declared top-level event fields and strict recovery payload
-exist. After syncing the data frame, it exclusively creates and syncs a strict
-per-sequence confirmation marker, then exclusively creates and syncs a matching
-checkpoint. A successful `AuditSink.write()` means all three operations
-resolved. The duplicate evidence makes deletion of either final auxiliary file
-detectable by the other. This is the strongest acknowledgement used here, but
-it does not bypass OS or device caches and is not a guarantee for every
-power-loss model.
-
-On startup, every owned segment, confirmation, checkpoint, frame, schema,
-sequence, and digest link is validated before operator or MCP commits are
-admitted. The confirmation and checkpoint sets must be identical and contiguous.
-A partial or complete tail with neither form of evidence is provably
-unacknowledged: it is preserved in place, startup moves to the next fixed
-segment, and syncs one bounded recovery record plus both evidence files.
-Reopening that history is idempotent. Missing/mismatched confirmation,
-checkpoint, or committed frame is committed-history loss and fails closed.
-Unknown versions, other committed-region corruption, illegal sizes/order,
-unexpected objects, and identity changes also fail startup closed without
-rewriting evidence.
-At the eight-segment hard limit, history is not evicted: new ordinary commits
-and resume fail closed. Emergency stop still closes the latch first and only
-then attempts audit, so audit rejection/full state can fail the command result
-but cannot return the latch to running.
-
-The chain detects ordinary torn writes, internal truncation, reordering, and
-accidental corruption inside the trusted same-user boundary. With no protected
-key or external anchor it is not tamper-proof against hostile same-user code,
-administrators, or offline disk rewriting. The ledger contains no game state,
-observations, inputs/outputs, chat, account, save, screen, or persistent bearer
-secret, and there is no MCP/CLI log reader or arbitrary file API.
-
-Reservations conservatively hold one maximum-size record of remaining physical
-segment capacity before a state-changing operation begins, including rotation
-fragmentation. On shutdown, the 500 ms deadline aborts application continuations
-waiting on native segment/evidence writes or syncs. If an OS file operation
-itself remains pending, close returns without later confirmation, checkpoint,
-retry, or write. Its only later continuation closes the handle when the native
-operation settles. That cleanup keys directly off the abort signal, including
-the abort-to-closed transition window; process exit is the fallback, and
-startup treats any bytes without either evidence file conservatively.
-
-## Local operator CLI (Windows)
-
-The same product process publishes a per-launch descriptor under the fixed
-application directory in the current user's Local AppData and listens on a
-random Windows named pipe. MCP serving begins only after that control plane is
-ready; descriptor or listener failure exits closed before any MCP commit can be
-accepted. The descriptor contains a 32-byte CSPRNG launch token, is strict and
-bounded, and is removed only after file identity and digest still match the
-object created by that launch.
-
-After `npm run build`, use a second local terminal while the stdio product is
-running:
+产品运行时启动后，可在另一个本地终端使用：
 
 ```text
 npm run operator -- status
@@ -282,35 +164,150 @@ npm run operator -- stop
 npm run operator -- resume --generation 1
 ```
 
-The CLI accepts no endpoint, path, host, port, URL, executable, or environment
-override. It emits one fixed result and deterministic exit code. `status` is
-read-only and unaudited; stop and resume attempts use the same bridge audit
-sink as MCP. Stop bypasses sessions, the request cache, MCP
-handler permits, and adapter pending capacity. It blocks only new commits and
-does not claim to cancel or roll back an action already inside the adapter.
+operator：
 
-The channel separates operator authority from the MCP/model surface, but it is
-not remote authentication and does not defend against malicious code already
-running as the same OS user or as administrator. No TCP fallback exists.
+- 使用每次启动随机生成的 Windows named pipe 和 32 字节 token；
+- 与 MCP 共用同一个 bridge、safety latch 和 audit sink；
+- 不接受 host、port、URL、path、executable 或环境覆盖；
+- stop 独立于 session、request cache、MCP handler 和 adapter pending capacity；
+- resume 必须携带当前 stop generation；
+- 有 in-flight write、generation 不匹配、deadline、disconnect、后发 stop 或 audit 未确认时均拒绝恢复；
+- status 当前只暴露安全状态和非敏感计数，不读取审计内容。
 
-Resume is transactional with respect to the operator deadline: the latch stays
-stopped while an explicitly named authorization audit event is pending. That
-event durably authorizes one exact stop generation but does not claim the latch
-already opened; only after its sink acknowledgement, while the transaction is
-still live, does the bridge synchronously commit and return success. There is no
-fire-and-forget success outcome. Audit rejection, operator timeout, client
-disconnect, or a late authorization continuation cannot open the latch. Every
-later stop invalidates an older pending resume even when the repeated stop keeps
-the same public generation. Connections beyond the fixed admission limit are
-destroyed immediately without allocating a response frame or close timer, and
-late handlers cannot add response work after disconnect or shutdown. Every
-audit-sink promise is tracked; operator shutdown performs a bounded audit-idle
-wait, including authorization writes that outlive a disconnected request.
+现有限制：safety latch 状态不持久化，产品重启后会创建新的 running latch。真实 adapter 启动前必须决定“启动默认 stopped”或持久安全状态的恢复语义。
 
-Acceptance evidence has three explicit scopes. Ubuntu runs the platform-neutral
-suite and skips Windows product-child/operator cases. GitHub-hosted
-`windows-latest` is elevated, so it compiles both helpers with MSVC/UCRT and
-verifies the product's pre-worker elevated-host rejection only; it does not run
-or claim the non-elevated allow path. The complete Windows suite, real named
-pipes, built CLI, built stdio child, and demo are exercised locally under Node
-22 on a non-elevated Windows host pending a suitable dedicated runner.
+## 本地 MCP 契约
+
+构建后，本地 MCP client 可拉起：
+
+```text
+node dist/src/mcp/stdio-server.js
+```
+
+也可以运行：
+
+```bash
+npm run mcp:stdio
+```
+
+MCP surface：
+
+- 恰好一个 tool：`game_bridge_request`；
+- 不注册 resource、prompt、sampling、operator 或其他 tool；
+- tool 输入直接复用 bridge request envelope；
+- MCP JSON-RPC ID 与 bridge `requestId` 是两层不同标识；
+- wrapper 不替换 request ID、不自动重试；
+- stdout 只承载 MCP 协议，固定脱敏诊断写入 stderr；
+- bridge 输出会再次经过 schema、请求身份和脱敏验证；
+- client disconnect 不被描述成已经取消或回滚进入 core/worker 的动作。
+
+当前 MCP 仍使用一个通用 tool，action 的输入/输出 schema、效果类型和 dry-run 精确度还没有完整暴露给模型。这也是 Issue #19 的范围。
+
+## 持久审计账本
+
+产品只在固定的当前用户应用目录中保存 bridge/operator 的有限安全事件。它不是游戏存档，也不保存：
+
+- game state、观察结果或 adapter 输入/输出；
+- chat、屏幕、账号、存档或凭据；
+- 原始 request/session ID、principal、owner key；
+- endpoint、named pipe、PID、用户名、路径、stack 或 raw payload。
+
+当前硬上限：
+
+- 单记录 4 KiB；
+- 最多 8 个 pending write；
+- 单 segment 64 KiB；
+- 最多 8 个 segment；
+- 最多 2,048 个 confirmation；
+- 最多 2,048 个 checkpoint；
+- shutdown drain deadline 500 ms。
+
+账本使用 canonical frame、单调 sequence、SHA-256 链、data sync、confirmation 和独立 checkpoint 检测普通撕裂写、截断、乱序和意外损坏。它没有受保护密钥或外部锚点，不能抵御 hostile same-user、管理员或离线磁盘重写。
+
+达到硬容量后不会静默删除历史。新的普通 commit 和 resume 会 fail closed；emergency stop 仍先同步关闸，再尝试写 audit。
+
+## Windows worker containment
+
+产品只启动固定的源码构建 Win32 launcher；launcher 再用固定 `process.execPath`、固定 built worker、固定 argv/cwd/minimal environment 启动 mock worker。
+
+已建立的 Windows 约束包括：
+
+- Restricted Token；
+- suspended create → Job assignment/query → attestation → resume；
+- kill-on-close；
+- active-process limit 1；
+- process memory 256 MiB；
+- job memory 192 MiB；
+- CPU hard cap 20%；
+- no breakaway；
+- 精确 handle allowlist；
+- 独立 parent-liveness pipe；
+- containment 失败时无 unrestricted `spawn()` fallback。
+
+这些约束限制权限、进程树、资源和生命周期，但不是文件系统、registry 或网络 sandbox。真实 adapter 仍需根据实际游戏 API 单独决定 AppContainer、ACL、broker、容器或其他权限边界。
+
+## 发布与支持矩阵
+
+`package.json` 保持 `private: true`，本项目不发布 npm package。
+
+`v0.1.0-rc.1` 的发布链可生成：
+
+- 规范化源码构建 bundle；
+- SHA-256 checksum；
+- CycloneDX SBOM；
+- release manifest；
+- unsigned local provenance；
+- 受保护 annotated tag 流程中的 GitHub artifact attestation。
+
+这些证据用于减少 source/artifact 歧义，不证明 runner、编译器、依赖或完整供应链可信，也不证明真实游戏安全。
+
+平台范围：
+
+- Ubuntu：运行平台中立套件；Windows 产品 child/operator 用例明确 skip；
+- GitHub-hosted Windows：runner 为 elevated，只验证产品正确拒绝 elevated host，并编译 MSVC/UCRT helper；
+- 完整 happy path：需要真实非提权 Windows 主机；当前证据来自本地验收，尚无合适的 dedicated hosted runner。
+
+详见：
+
+- [`docs/support-matrix.md`](docs/support-matrix.md)
+- [`docs/release.md`](docs/release.md)
+- [`docs/release-notes-v0.1.0-rc.1.md`](docs/release-notes-v0.1.0-rc.1.md)
+
+## 新路线
+
+项目接下来严格按以下顺序推进：
+
+1. **Adapter Contract v2、可信 grant、revision、资源级写入串行化与运行健康**；
+2. **operation journal、`OUTCOME_UNKNOWN` 与 reconciliation**；
+3. **首个真实 adapter 的只读 vertical slice**；
+4. **一个具备 revision、journal、对账和恢复证据的最小写动作**；
+5. **完成上述证据后，再评估远程传输和更强 OS 权限边界**。
+
+在只读真实 adapter 完成前，release、ledger、containment 和 remote transport 均保持冻结。
+
+完整阶段门禁、设计原则和当前阻塞见 [`docs/ROADMAP.md`](docs/ROADMAP.md)。
+
+## 当前关键限制
+
+- capability 尚无可信本地 grant profile；
+- adapter contract 尚缺通用 output schema、effect kind、revision、资源级并发和 adapter error namespace；
+- session/idempotency 只在活进程内成立；
+- dispatch 后 timeout/worker exit 的动作结果尚不能对账；
+- safety latch 不跨重启持久；
+- operator health 尚不能完整表达 runtime/adapter/audit fault；
+- audit 与未来 operation journal 尚未分层；
+- stale descriptor、audit full/corrupt 尚缺受支持的 operator 恢复流程；
+- observation 尚缺真实游戏所需的分页、freshness、revision 和不可信文本标记；
+- Restricted Token + Job Object 尚未由任何真实 adapter 权限需求验证。
+
+## 文档索引
+
+- [`docs/ROADMAP.md`](docs/ROADMAP.md)：新的项目路线、阶段门禁与冻结边界
+- [`docs/architecture.md`](docs/architecture.md)：当前架构与责任边界
+- [`docs/threat-model.md`](docs/threat-model.md)：威胁、控制与残余风险
+- [`docs/HANDOFF.md`](docs/HANDOFF.md)：当前实现、实际验收证据与已知限制
+- [`docs/OPEN_QUESTIONS.md`](docs/OPEN_QUESTIONS.md)：仍需未来工单决定的问题
+- [`docs/release.md`](docs/release.md)：RC 构建、复现、发布与回滚
+- [`docs/support-matrix.md`](docs/support-matrix.md)：平台支持与证据范围
+
+任何真实游戏、远程 transport、主机配置、OS 权限扩大或持久动作状态，都必须通过独立工单和人工批准。
