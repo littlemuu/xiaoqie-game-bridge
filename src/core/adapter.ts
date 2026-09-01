@@ -184,6 +184,25 @@ function schemaDefinition(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
+function rejectsLosslessJsonNumber(value: unknown): boolean {
+  return typeof value === "number" && (!Number.isFinite(value) || Object.is(value, -0));
+}
+
+function requireNoCustomJsonSchemaEmitter(value: object, label: string): void {
+  const seen = new WeakSet<object>();
+  let current: unknown = value;
+  while (current !== null && typeof current === "object" && !seen.has(current)) {
+    seen.add(current);
+    const internal = (current as {
+      _zod?: { parent?: unknown; toJSONSchema?: unknown };
+    })._zod;
+    if (typeof internal?.toJSONSchema === "function") {
+      throw new TypeError(`${label} must use the declarative schema subset.`);
+    }
+    current = internal?.parent;
+  }
+}
+
 function requireDeclarativeCheck(value: unknown, label: string): void {
   const definition = schemaDefinition(value);
   if (definition === undefined || typeof definition.check !== "string") {
@@ -256,6 +275,7 @@ function requireDeclarativeSchema(value: object, label: string): void {
       return;
     }
     seen.add(schema);
+    requireNoCustomJsonSchemaEmitter(schema, label);
     const definition = schemaDefinition(schema);
     if (definition === undefined || typeof definition.type !== "string") {
       throw new TypeError(`${label} must use the declarative schema subset.`);
@@ -288,10 +308,11 @@ function requireDeclarativeSchema(value: object, label: string): void {
           definition.values.length < 1 ||
           definition.values.some(
             (entry) =>
-              entry !== null &&
-              typeof entry !== "string" &&
-              typeof entry !== "number" &&
-              typeof entry !== "boolean",
+              (entry !== null &&
+                typeof entry !== "string" &&
+                typeof entry !== "number" &&
+                typeof entry !== "boolean") ||
+              rejectsLosslessJsonNumber(entry),
           )
         ) {
           throw new TypeError(`${label} must use the declarative schema subset.`);
@@ -304,7 +325,9 @@ function requireDeclarativeSchema(value: object, label: string): void {
           typeof definition.entries !== "object" ||
           Array.isArray(definition.entries) ||
           Object.values(definition.entries).some(
-            (entry) => typeof entry !== "string" && typeof entry !== "number",
+            (entry) =>
+              (typeof entry !== "string" && typeof entry !== "number") ||
+              rejectsLosslessJsonNumber(entry),
           )
         ) {
           throw new TypeError(`${label} must use the declarative schema subset.`);
@@ -368,7 +391,9 @@ function schemaSnapshot(value: unknown, label: string): AdapterSchema {
   try {
     requireDeclarativeSchema(value, label);
     const jsonSchema = deepFreezeJson(
-      JSON.parse(JSON.stringify(z.toJSONSchema(value))) as unknown,
+      JSON.parse(
+        JSON.stringify(z.toJSONSchema(value, { metadata: z.registry() })),
+      ) as unknown,
     );
     const validator = z.fromJSONSchema(
       structuredClone(jsonSchema) as Parameters<typeof z.fromJSONSchema>[0],

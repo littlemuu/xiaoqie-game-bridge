@@ -216,15 +216,24 @@ reconciliation 能力。`bridge.describe` 只输出可序列化 JSON Schema 与�
 回显异常文本。
 
 注册按 Zod node/check/option 正向白名单只接受能无损转成 JSON Schema 的声明式
-子集。refinement、transform、codec、overwrite/trim、coerce、用户 `when` 与任何
-未识别定义字段均被拒绝；活动 validator 从深冻结 JSON 快照的隔离副本重建并
-隐藏，源 schema、闭包或公开对象的后续修改不能改变实际验证逻辑。
+子集。refinement、transform、codec、overwrite/trim、coerce、用户 `when`、自定义
+JSON Schema emitter、非有限或有损 JSON number 与任何未识别定义字段均被拒绝；
+转换使用独有的空 metadata registry，活动 validator 从深冻结 JSON 快照的隔离
+副本重建并隐藏，源 metadata、schema、闭包或公开对象的后续修改不能改变实际
+验证逻辑。
 
 Capability grant 虽来自受信 provider，仍作为运行时边界严格捕获、校验、复制：
 对象和 scope 无额外字段或 accessor，TTL 是受请求/全局上限约束的正 safe
 integer，capability 是请求与 manifest 的去重子集，scope kind 属于 adapter
 namespace，budget key 只引用 manifest write action。非法 grant 在 session 插入和
 audit reservation 之前固定拒绝，因此 `NaN` expiry 不能形成不可回收 session。
+异步 grant 返回后还会立即重检 runtime/adapter/audit health；quiescing 或 faulted
+转换不能在 provider 等待窗口后提交 session。
+
+`game.act` 的 effect × mode 是闭合集合：read/preview action 只允许 dry-run，commit
+仅属于 write action。non-write commit 在 adapter dispatch 前固定拒绝，因而不能靠
+`mode === "commit"` 绕过 write health、safety latch、resource scheduler、revision
+admission 或动作预算。
 
 The parent still owns identity, session binding, capabilities, action schemas,
 policy, idempotency, safety, and audit. Static metadata must exactly match the

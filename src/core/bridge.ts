@@ -662,6 +662,23 @@ export class GameBridge {
       await this.#record(request, response, false, adapter.id, undefined, callerOwnerKey);
       return response;
     }
+    const finalHealth = this.getHealthStatus();
+    if (
+      finalHealth.runtime.status !== "ready" ||
+      finalHealth.adapter.status !== "ready" ||
+      finalHealth.audit.status === "full" ||
+      finalHealth.audit.status === "corrupt" ||
+      finalHealth.audit.status === "closed"
+    ) {
+      const response = errorResponse(
+        request,
+        "RUNTIME_UNAVAILABLE",
+        "Runtime health no longer permits a new session.",
+        { operationPhase: "pre-dispatch" },
+      );
+      await this.#record(request, response, false, adapter.id, undefined, callerOwnerKey);
+      return response;
+    }
     const auditReservation = this.#reserveAuditForStateChange(request);
     if (auditReservation === null) {
       return errorResponse(
@@ -1004,6 +1021,14 @@ export class GameBridge {
         request,
         "ACTION_NOT_ALLOWED",
         "The adapter contract does not support dry-run for this action.",
+        { operationPhase: "pre-dispatch" },
+      );
+    }
+    if (request.mode === "commit" && definition.effectKind !== "write") {
+      return errorResponse(
+        request,
+        "ACTION_NOT_ALLOWED",
+        "Non-write actions cannot be invoked with commit mode.",
         { operationPhase: "pre-dispatch" },
       );
     }

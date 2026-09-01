@@ -140,10 +140,12 @@ granted capability cannot be redirected to another adapter.
 Schemas are restricted by a positive allowlist of Zod nodes, checks, and exact
 definition fields that round-trip through JSON Schema. Refinements, transforms,
 codecs, overwrite/trim, coerce, user `when`, lazy/function schemas, defaults,
-and every unknown node/check/option are rejected. Registration deep-freezes the
-JSON snapshot, rebuilds the active validator from an isolated clone, and exposes
-only a frozen `safeParse` wrapper; neither source closures nor validator
-internals remain mutable through the registered manifest.
+custom JSON Schema emitters, non-finite or lossy JSON numbers, and every unknown
+node/check/option are rejected. Conversion uses a fresh empty metadata registry,
+so global Zod metadata cannot rewrite the emitted contract. Registration
+deep-freezes the JSON snapshot, rebuilds the active validator from an isolated
+clone, and exposes only a frozen `safeParse` wrapper; neither source closures nor
+validator internals remain mutable through the registered manifest.
 
 The mock adapter is a proof of this boundary, not a placeholder shell: it has a
 deterministic state, validates movement and block placement, previews changes
@@ -159,7 +161,9 @@ session 的绑定，不参与 grant 推导，也不作为资源标识。
 Provider 返回值在任何 session 或 audit-reservation 副作用前经过 closed-world
 运行时快照：TTL 是受请求与全局上限约束的正 safe integer，capabilities 是请求与
 manifest 的去重子集，scope kind 必须位于 adapter 自身 namespace，resource ID
-有界且无额外字段，per-action budget 只能引用 manifest 中的 write action。
+有界且无额外字段，per-action budget 只能引用 manifest 中的 write action。异步
+provider 返回并完成快照后，commit admission 会在无后续 `await` 的临界段再次检查
+runtime、adapter 与 audit health，才允许 audit reservation 和 session insertion。
 
 mock observation 与 dry-run preview 返回当前 `stateRevision`。声明
 `requiresExpectedRevision` 的 commit 必须提供 `expectedRevision`；core 在持有
@@ -172,9 +176,11 @@ revision、容量拒绝和幂等重放不递增。预算先预留；adapter 明�
 
 observation contract 固定标注 `effectKind: read`，并显式选择 `parallel`、
 `serial` 或 `resource-serial`；preview action 则通过 `effectKind` 和
-`writeConcurrency: none` 明确不进入写锁。纯只读 adapter 可以拥有零个 action，
-此时不要求 `execute` 或 revision provider。只有声明 revision-required action 时
-才要求 `getStateRevision`。当前 mock 的 read/preview 可以并发且不得修改 world。
+`writeConcurrency: none` 明确不进入写锁。effect × mode 合法矩阵不允许 non-write
+action 接收 commit：read/preview 只能 dry-run，write 才能在 health、safety、资源
+调度、revision 与预算门禁后 commit。纯只读 adapter 可以拥有零个 action，此时不
+要求 `execute` 或 revision provider。只有声明 revision-required action 时才要求
+`getStateRevision`。当前 mock 的 read/preview 可以并发且不得修改 world。
 
 ## Adapter process lifecycle
 
@@ -308,8 +314,10 @@ testing low-entropy subject/method candidates with the public owner derivation.
 `dry-run` mode it only describes the session that would be opened. A committed
 session is created only after the adapter manifest, injected authorizer, and
 trusted grant provider approve it. `SessionManager.open` requires the caller
-owner key and exact grant explicitly. Dry-run creates neither session nor owner
-state.
+owner key and exact grant explicitly. After an asynchronous grant settles, a
+final synchronous health admission prevents quiescing or faulted state from
+racing audit reservation and session insertion. Dry-run creates neither session
+nor owner state.
 
 普通 observation/dry-run 的审计写入失败不会把已经验证的安全结果静默改成
 内部错误；健康状态转为 `degraded` 并保持可观察。commit 仍需在副作用前获得

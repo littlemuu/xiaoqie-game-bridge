@@ -175,6 +175,35 @@ class ContractTestAdapter implements GameAdapter {
   }
 }
 
+class CommitSignalPreviewAdapter extends ContractTestAdapter {
+  previewCommitMutations = 0;
+
+  constructor(behavior: ContractBehavior = "success") {
+    super(behavior);
+    (this.actions as Record<string, AdapterActionDefinition>).preview = {
+      description: "Preview without accepting a commit signal.",
+      inputSchema: contractInputSchema,
+      outputSchema: contractOutputSchema,
+      effectKind: "preview",
+      dryRunSemantics: "exact",
+      requiredCapabilities: ["game.act.preview"],
+      maxResultBytes: 128,
+      writeConcurrency: { kind: "none" },
+      adapterErrorCodes: [],
+      requiresExpectedRevision: false,
+      reconciliation: "unsupported",
+    };
+  }
+
+  override async execute(action: string, input: unknown, mode: BridgeMode): Promise<unknown> {
+    if (action === "preview") {
+      if (mode === "commit") this.previewCommitMutations += 1;
+      return { applied: false, stateRevision: this.revision };
+    }
+    return super.execute(action, input, mode);
+  }
+}
+
 class ReadOnlySerialAdapter implements GameAdapter {
   readonly id = "read-only-test";
   readonly displayName = "Pure read-only serial adapter";
@@ -251,6 +280,7 @@ function contractHarness(
   adapter: ContractTestAdapter,
   options: {
     auditSink?: AuditSink;
+    grantProvider?: CapabilityGrantProvider;
     maxInFlightWrites?: number;
     totalBudget?: number;
     perActionBudget?: number;
@@ -264,12 +294,14 @@ function contractHarness(
     registry,
     sessions,
     auditSink: audit,
-    grantProvider: testGrantProvider({
-      ...(options.totalBudget === undefined ? {} : { total: options.totalBudget }),
-      ...(options.perActionBudget === undefined
-        ? {}
-        : { perAction: options.perActionBudget }),
-    }),
+    grantProvider:
+      options.grantProvider ??
+      testGrantProvider({
+        ...(options.totalBudget === undefined ? {} : { total: options.totalBudget }),
+        ...(options.perActionBudget === undefined
+          ? {}
+          : { perAction: options.perActionBudget }),
+      }),
     safetyLatch: new SafetyLatch({
       maxInFlightWrites: options.maxInFlightWrites ?? 4,
     }),
@@ -463,6 +495,64 @@ describe("Adapter Contract v2", () => {
     expect(() => new AdapterRegistry().register(publicAction)).toThrow(/capability/u);
   });
 
+  it("isolates JSON snapshots from metadata and rejects custom or lossy emitters", () => {
+    const defaultSchema = z.string().meta({ default: "injected" });
+    const defaultAdapter = new ContractTestAdapter();
+    (defaultAdapter.actions as Record<string, AdapterActionDefinition>).write = {
+      ...defaultAdapter.actions.write!,
+      inputSchema: defaultSchema,
+    };
+    const defaultRegistry = new AdapterRegistry();
+    defaultRegistry.register(defaultAdapter);
+    const defaultSnapshot = defaultRegistry.get(defaultAdapter.id)!.actions.write!.inputSchema;
+    expect(defaultSchema.safeParse(undefined).success).toBe(false);
+    expect(defaultSnapshot.safeParse(undefined).success).toBe(false);
+    expect((defaultSnapshot as { jsonSchema?: unknown }).jsonSchema).not.toHaveProperty("default");
+
+    const keywordSchema = z.string().meta({ type: "number", minLength: 100 });
+    const keywordAdapter = new ContractTestAdapter();
+    (keywordAdapter.actions as Record<string, AdapterActionDefinition>).write = {
+      ...keywordAdapter.actions.write!,
+      inputSchema: keywordSchema,
+    };
+    const keywordRegistry = new AdapterRegistry();
+    keywordRegistry.register(keywordAdapter);
+    const keywordSnapshot = keywordRegistry.get(keywordAdapter.id)!.actions.write!.inputSchema;
+    expect(keywordSchema.safeParse("x").success).toBe(true);
+    expect(keywordSnapshot.safeParse("x").success).toBe(true);
+    expect(keywordSnapshot.safeParse(1).success).toBe(false);
+    expect((keywordSnapshot as { jsonSchema?: unknown }).jsonSchema).toMatchObject({
+      type: "string",
+    });
+
+    const emitterSchema = z.string();
+    (emitterSchema as unknown as {
+      _zod: { toJSONSchema?: () => unknown };
+    })._zod.toJSONSchema = () => ({ type: "number" });
+    const emitterAdapter = new ContractTestAdapter();
+    (emitterAdapter.actions as Record<string, AdapterActionDefinition>).write = {
+      ...emitterAdapter.actions.write!,
+      inputSchema: emitterSchema,
+    };
+    expect(() => new AdapterRegistry().register(emitterAdapter)).toThrow(/declarative/u);
+
+    for (const value of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, -0]) {
+      const literalAdapter = new ContractTestAdapter();
+      (literalAdapter.actions as Record<string, AdapterActionDefinition>).write = {
+        ...literalAdapter.actions.write!,
+        inputSchema: z.literal(value),
+      };
+      expect(() => new AdapterRegistry().register(literalAdapter)).toThrow(/declarative/u);
+
+      const enumAdapter = new ContractTestAdapter();
+      (enumAdapter.actions as Record<string, AdapterActionDefinition>).write = {
+        ...enumAdapter.actions.write!,
+        inputSchema: z.enum({ INVALID: value }),
+      };
+      expect(() => new AdapterRegistry().register(enumAdapter)).toThrow(/declarative/u);
+    }
+  });
+
   it("registers a zero-action adapter without a revision provider and enforces serial reads", async () => {
     const adapter = new ReadOnlySerialAdapter();
     const registry = new AdapterRegistry();
@@ -593,6 +683,104 @@ describe("Adapter Contract v2", () => {
       expect(sessions.size).toBe(0);
       expect(audit.reservations).toBe(0);
     }
+  });
+
+  it("rechecks committed session admission after an asynchronous grant settles", async () => {
+    for (const finalState of ["quiescing", "adapter-faulted"] as const) {
+      const adapter = new ContractTestAdapter();
+      const grantEntered = deferred();
+      const releaseGrant = deferred();
+      const baseProvider = testGrantProvider();
+      const grantProvider: CapabilityGrantProvider = {
+        async grant(grantRequest) {
+          grantEntered.resolve();
+          await releaseGrant.promise;
+          return baseProvider.grant(grantRequest);
+        },
+      };
+      const audit = new ReservationCountingAuditSink();
+      const { bridge, sessions } = contractHarness(adapter, { auditSink: audit, grantProvider });
+      const opening = bridge.handle(
+        request(`deferred-grant-${finalState}`, "session.open", {
+          adapterId: adapter.id,
+          capabilities: ["game.observe"],
+        }),
+        local,
+      );
+      await grantEntered.promise;
+      if (finalState === "quiescing") bridge.beginQuiescing();
+      else adapter.healthState = "faulted";
+      releaseGrant.resolve();
+
+      const response = await opening;
+      expectError(response, "RUNTIME_UNAVAILABLE");
+      expect(response.ok ? undefined : response.error.operationPhase).toBe("pre-dispatch");
+      expect(sessions.size).toBe(0);
+      expect(audit.reservations).toBe(0);
+    }
+  });
+
+  it("rejects commit mode for preview actions before mutation, scheduling, or budget use", async () => {
+    const commitPreview = async (
+      bridge: GameBridge,
+      sessionId: string,
+      requestId: string,
+    ): Promise<BridgeResponse> =>
+      bridge.handle(
+        request(
+          requestId,
+          "game.act",
+          { adapterId: "contract-test", gameAction: "preview", input: {} },
+          { sessionId, mode: "commit" },
+        ),
+        local,
+      );
+
+    for (const state of ["ready", "stopped", "quiescing"] as const) {
+      const adapter = new CommitSignalPreviewAdapter();
+      const { bridge, sessions } = contractHarness(adapter, {
+        totalBudget: 2,
+        perActionBudget: 2,
+      });
+      const sessionId = await open(bridge, adapter.id, ["game.act.preview"]);
+      if (state === "stopped") await bridge.createLocalControlPlane().stopSafety();
+      if (state === "quiescing") bridge.beginQuiescing();
+      const budgetBefore = sessions.find(sessionId)!.actionBudgetRemaining;
+      const response = await commitPreview(bridge, sessionId, `preview-commit-${state}`);
+      expectError(response, "ACTION_NOT_ALLOWED");
+      expect(response.ok ? undefined : response.error.operationPhase).toBe("pre-dispatch");
+      expect(adapter.previewCommitMutations).toBe(0);
+      expect(sessions.find(sessionId)!.actionBudgetRemaining).toBe(budgetBefore);
+    }
+
+    const scheduledAdapter = new CommitSignalPreviewAdapter("wait");
+    const scheduledHarness = contractHarness(scheduledAdapter, {
+      totalBudget: 2,
+      perActionBudget: 2,
+    });
+    const scheduledSession = await open(scheduledHarness.bridge, scheduledAdapter.id, [
+      "game.act.preview",
+      "game.act.write",
+    ]);
+    const write = scheduledHarness.bridge.handle(
+      writeRequest("occupy-write-scheduler", scheduledSession),
+      local,
+    );
+    await scheduledAdapter.entered.promise;
+    const budgetBeforePreview = scheduledHarness.sessions.find(scheduledSession)!
+      .actionBudgetRemaining;
+    const preview = await commitPreview(
+      scheduledHarness.bridge,
+      scheduledSession,
+      "preview-commit-during-write",
+    );
+    expectError(preview, "ACTION_NOT_ALLOWED");
+    expect(scheduledAdapter.previewCommitMutations).toBe(0);
+    expect(scheduledHarness.sessions.find(scheduledSession)!.actionBudgetRemaining).toBe(
+      budgetBeforePreview,
+    );
+    scheduledAdapter.release.resolve();
+    expect(await write).toMatchObject({ ok: true });
   });
 
   it("returns revisions and charges only dispatched commit attempts once", async () => {
