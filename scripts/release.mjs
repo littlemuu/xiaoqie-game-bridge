@@ -13,7 +13,7 @@ const expectedRef = option("--expected-ref");
 
 try {
   if (command === "build") {
-    const result = buildRelease({ outputDirectory, commit: expectedCommit, ref: expectedRef });
+    const result = buildRelease({ outputDirectory, expectedCommit, expectedRef });
     const verified = verifyRelease({ outputDirectory: result.outputDirectory, expectedCommit, expectedRef });
     process.stdout.write(`${JSON.stringify({
       schema: "xiaoqie.release-result/v1",

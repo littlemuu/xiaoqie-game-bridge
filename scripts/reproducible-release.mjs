@@ -43,7 +43,7 @@ try {
     run(temporaryRoot, "git", ["clone", "--quiet", "--no-local", "--no-hardlinks", root, checkout]);
     git(checkout, ["checkout", "--quiet", "--detach", commit]);
     run(checkout, process.execPath, [npmCli, "ci", "--offline", "--ignore-scripts", "--no-audit", "--no-fund"], environment);
-    run(checkout, process.execPath, ["scripts/release.mjs", "build", "--expected-commit", commit, "--expected-ref", ref], environment);
+    run(checkout, process.execPath, ["scripts/release.mjs", "build", "--expected-commit", commit, "--expected-ref", `detached/${commit}`], environment);
     manifests.push(manifest(checkout));
   }
   const [first, second] = manifests;

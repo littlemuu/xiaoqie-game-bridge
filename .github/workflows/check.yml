@@ -68,7 +68,7 @@ jobs:
           npm test -- --run tests/windows-containment.test.ts --reporter=json --outputFile=release-input/vitest.json
       - run: npm run release:build
       - name: Generate honest elevated Windows evidence
-        run: npm run windows:evidence -- --test-results release-input/vitest.json --release-dir release-out
+        run: npm run windows:evidence -- --suite elevated-gate --test-results release-input/vitest.json --release-dir release-out
       - run: npm audit
       - run: git diff --check
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

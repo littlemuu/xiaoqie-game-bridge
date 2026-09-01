@@ -241,13 +241,40 @@ function packageComponents(lock) {
 }
 
 function sourceIdentity(root, options) {
-  const commit = options.commit ?? process.env.GITHUB_SHA ?? git(root, ["rev-parse", "HEAD"]);
-  if (!/^[0-9a-f]{40}$/u.test(commit)) throw new Error("Build commit must be a full lowercase Git SHA.");
-  const ref = options.ref ?? process.env.GITHUB_REF ?? (() => {
-    try { return git(root, ["symbolic-ref", "-q", "HEAD"]); } catch { return `detached/${commit}`; }
+  const commit = git(root, ["rev-parse", "HEAD"]);
+  if (!/^[0-9a-f]{40}$/u.test(commit)) throw new Error("Checkout HEAD must be a full lowercase Git SHA.");
+  const expectedCommit = options.expectedCommit ?? process.env.GITHUB_SHA;
+  if (expectedCommit !== undefined) {
+    if (!/^[0-9a-f]{40}$/u.test(expectedCommit)) throw new Error("Expected build commit must be a full lowercase Git SHA.");
+    if (expectedCommit !== commit) throw new Error("Expected build commit does not match checkout HEAD.");
+  }
+
+  const expectedRef = options.expectedRef ?? process.env.GITHUB_REF;
+  const symbolicRef = (() => {
+    try { return git(root, ["symbolic-ref", "-q", "HEAD"]); } catch { return undefined; }
   })();
-  if (!/^(?:refs\/(?:heads|tags)\/[A-Za-z0-9._/-]+|refs\/pull\/[1-9][0-9]*\/merge|detached\/[0-9a-f]{40})$/u.test(ref)) {
-    throw new Error("Build ref is outside the closed release source format.");
+  let ref;
+  if (expectedRef === undefined) {
+    ref = symbolicRef ?? `detached/${commit}`;
+  } else {
+    if (!/^(?:refs\/(?:heads|tags)\/[A-Za-z0-9._/-]+|refs\/pull\/[1-9][0-9]*\/merge|detached\/[0-9a-f]{40})$/u.test(expectedRef)) {
+      throw new Error("Expected build ref is outside the closed release source format.");
+    }
+    if (expectedRef.startsWith("refs/heads/")) {
+      if (symbolicRef !== expectedRef) throw new Error("Expected branch ref does not match the checkout symbolic ref.");
+    } else if (expectedRef.startsWith("refs/tags/")) {
+      if (git(root, ["cat-file", "-t", expectedRef]) !== "tag") throw new Error("Expected release tag is not an annotated tag object.");
+      if (git(root, ["rev-parse", `${expectedRef}^{commit}`]) !== commit) throw new Error("Expected release tag does not peel to checkout HEAD.");
+    } else if (expectedRef.startsWith("refs/pull/")) {
+      const remoteRef = expectedRef.replace("refs/pull/", "refs/remotes/pull/");
+      const resolves = [expectedRef, remoteRef].some((candidate) => {
+        try { return git(root, ["rev-parse", `${candidate}^{commit}`]) === commit; } catch { return false; }
+      });
+      if (!resolves) throw new Error("Expected pull-request ref does not resolve to checkout HEAD.");
+    } else if (expectedRef !== `detached/${commit}`) {
+      throw new Error("Expected detached ref does not match checkout HEAD.");
+    }
+    ref = expectedRef;
   }
   return { repository: REPOSITORY, ref, commit, baseCommit: BASE_COMMIT };
 }
@@ -279,8 +306,8 @@ export function buildRelease(options = {}) {
     throw new Error("Package and lockfile versions disagree.");
   }
   if (typeof packageJson.version !== "string" || !/^\d+\.\d+\.\d+-rc\.\d+$/u.test(packageJson.version)) throw new Error("Release version must be an RC semantic version.");
-  if (!options.skipCompile) runNpm(root, ["run", "build"], { inherit: true });
   const source = sourceIdentity(root, options);
+  if (!options.skipCompile) runNpm(root, ["run", "build"], { inherit: true });
   const npmVersion = runNpm(root, ["--version"]);
   const files = collectBundleFiles(root);
   const prefix = `${packageJson.name}-${packageJson.version}`;

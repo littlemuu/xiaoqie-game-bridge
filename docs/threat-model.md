@@ -8,6 +8,13 @@ fails before publishing when its protected tag, evidence files, digests,
 attestation or upload verification is absent. Pull requests and ordinary pushes
 retain only read permissions and cannot enter that job.
 
+Tag builds separate untrusted dependency/project execution from release
+credentials. The read-only build job uploads the verified allowlist; only its
+dependent publish job receives write/OIDC permissions, downloads that exact
+artifact and runs the narrow built-in-only verifier before attestation/upload.
+All YAML `uses:` keys are enumerated and must match a closed unquoted local
+action or a full lowercase 40-hex external pin with a readable version comment.
+
 These controls do not prove a trustworthy runner, dependency safety, absence of
 compiler compromise, complete supply-chain security or runtime behavior. The
 unsigned local provenance statement is not presented as platform attestation.

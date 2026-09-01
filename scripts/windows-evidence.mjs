@@ -8,6 +8,28 @@ import { WINDOWS_EVIDENCE_SCHEMA, sha256 } from "./release-lib.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const SAFE_OUTPUT_NAME = /^[A-Za-z0-9._-]+$/u;
+export const TEST_INVENTORY_SCHEMA = "xiaoqie.vitest-inventory/v1";
+export const FULL_SUITE_FILES = Object.freeze([
+  "bridge.test.ts",
+  "durable-audit-ledger.test.ts",
+  "hardening.test.ts",
+  "mcp.test.ts",
+  "operator.test.ts",
+  "owner-binding.test.ts",
+  "process-adapter.test.ts",
+  "release.test.ts",
+  "windows-containment.test.ts",
+]);
+const ELEVATED_GATE_FILES = Object.freeze(["windows-containment.test.ts"]);
+const REQUIRED_FULL_CATEGORIES = Object.freeze([
+  "bridge-core",
+  "durable-audit",
+  "mcp-product-boundary",
+  "operator",
+  "process-adapter",
+  "release-engineering",
+  "windows-containment",
+]);
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -38,8 +60,40 @@ function categoryForAssertion(assertion) {
   return "platform-neutral-or-unknown";
 }
 
-export function summarizeVitest(value) {
+function fileCategory(name) {
+  if (name === "bridge.test.ts" || name === "hardening.test.ts" || name === "owner-binding.test.ts") return "bridge-core";
+  if (name === "durable-audit-ledger.test.ts") return "durable-audit";
+  if (name === "mcp.test.ts") return "mcp-product-boundary";
+  if (name === "operator.test.ts") return "operator";
+  if (name === "process-adapter.test.ts") return "process-adapter";
+  if (name === "release.test.ts") return "release-engineering";
+  if (name === "windows-containment.test.ts") return "windows-containment";
+  return undefined;
+}
+
+export function summarizeVitest(value, suiteKind = "full") {
   if (typeof value !== "object" || value === null || !Array.isArray(value.testResults)) throw new Error("Vitest JSON report is malformed.");
+  if (!new Set(["full", "elevated-gate"]).has(suiteKind)) throw new Error("Windows evidence suite kind is not closed-world.");
+  const expectedFiles = suiteKind === "full" ? FULL_SUITE_FILES : ELEVATED_GATE_FILES;
+  const expectedSet = new Set(expectedFiles);
+  const fileCounts = new Map();
+  let unexpectedFileCount = 0;
+  for (const result of value.testResults) {
+    const rawName = typeof result?.name === "string" ? result.name.replaceAll("\\", "/").split("/").at(-1) : undefined;
+    if (rawName === undefined || !expectedSet.has(rawName)) {
+      unexpectedFileCount += 1;
+      continue;
+    }
+    fileCounts.set(rawName, (fileCounts.get(rawName) ?? 0) + 1);
+  }
+  const presentExpectedFiles = expectedFiles.filter((name) => fileCounts.has(name));
+  const missingFiles = expectedFiles.filter((name) => !fileCounts.has(name));
+  const duplicateFileCount = [...fileCounts.values()].reduce((sum, count) => sum + Math.max(0, count - 1), 0);
+  const presentCategories = [...new Set(presentExpectedFiles.map(fileCategory).filter(Boolean))].sort();
+  const missingRequiredCategories = suiteKind === "full"
+    ? REQUIRED_FULL_CATEGORIES.filter((category) => !presentCategories.includes(category))
+    : [];
+  const inventoryComplete = missingFiles.length === 0 && unexpectedFileCount === 0 && duplicateFileCount === 0 && value.testResults.length === expectedFiles.length;
   const assertions = value.testResults.flatMap((result) => Array.isArray(result.assertionResults) ? result.assertionResults : []);
   const counts = { total: assertions.length, passed: 0, failed: 0, skipped: 0, unknown: 0 };
   const skippedCategories = new Map();
@@ -56,8 +110,35 @@ export function summarizeVitest(value) {
   return {
     ...counts,
     allRegisteredTestsPassed: counts.total > 0 && counts.failed === 0 && counts.skipped === 0 && counts.unknown === 0,
+    inventory: {
+      schema: TEST_INVENTORY_SCHEMA,
+      kind: suiteKind,
+      expectedFiles: [...expectedFiles],
+      presentExpectedFiles,
+      missingFiles,
+      unexpectedFileCount,
+      duplicateFileCount,
+      requiredCategories: suiteKind === "full" ? [...REQUIRED_FULL_CATEGORIES] : ["elevated-host-gate"],
+      presentCategories,
+      missingRequiredCategories,
+      complete: inventoryComplete && missingRequiredCategories.length === 0,
+    },
     skippedCategories: [...skippedCategories.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([category, count]) => ({ category, count })),
   };
+}
+
+export function evidenceStatusFor({ platform, elevated, clean, vitest, containmentVerified }) {
+  if (platform !== "win32") return "not-windows";
+  if (!clean || vitest.failed > 0 || vitest.unknown > 0 || vitest.total === 0 || vitest.passed === 0) return "unverified";
+  if (elevated === true) {
+    return vitest.inventory.kind === "elevated-gate" && vitest.inventory.complete
+      ? "elevated-fail-closed-only"
+      : "unverified";
+  }
+  if (elevated !== false || !containmentVerified || vitest.inventory.kind !== "full" || !vitest.inventory.complete) return "unverified";
+  const onlyInapplicableSkips = vitest.skippedCategories.every((entry) => entry.category === "inapplicable-platform-gate");
+  if (vitest.skipped === 0) return "verified";
+  return onlyInapplicableSkips ? "verified-with-explicit-inapplicable-skips" : "unverified";
 }
 
 function isElevatedWindows() {
@@ -118,7 +199,7 @@ function releaseDigest(directory) {
 }
 
 export function generateWindowsEvidence(options) {
-  const vitest = summarizeVitest(JSON.parse(readFileSync(resolve(options.testResults), "utf8")));
+  const vitest = summarizeVitest(JSON.parse(readFileSync(resolve(options.testResults), "utf8")), options.suiteKind);
   const commit = run("git", ["rev-parse", "HEAD"]);
   const clean = run("git", ["status", "--porcelain=v1", "--untracked-files=all"]) === "";
   const npmCli = process.env.npm_execpath;
@@ -136,14 +217,13 @@ export function generateWindowsEvidence(options) {
   if (process.platform === "win32" && elevated === false) containment = containmentProbe();
   const bundle = releaseDigest(resolve(options.releaseDirectory));
   if (bundle.sourceCommit !== commit) throw new Error("Bundle source commit does not match the evidence commit.");
-  const onlyInapplicableSkips = vitest.skippedCategories.every((entry) => entry.category === "inapplicable-platform-gate");
-  const evidenceStatus = process.platform !== "win32" ? "not-windows"
-    : !clean ? "unverified"
-      : elevated === true && vitest.passed > 0 && vitest.failed === 0 && vitest.unknown === 0 ? "elevated-fail-closed-only"
-        : elevated === true ? "unverified"
-      : vitest.failed > 0 || vitest.unknown > 0 ? "unverified"
-        : vitest.skipped === 0 ? "verified"
-          : onlyInapplicableSkips ? "verified-with-explicit-inapplicable-skips" : "unverified";
+  const evidenceStatus = evidenceStatusFor({
+    platform: process.platform,
+    elevated,
+    clean,
+    vitest,
+    containmentVerified: containment.restrictedToken === "verified" && containment.jobMembership === "verified",
+  });
   const evidence = {
     schema: WINDOWS_EVIDENCE_SCHEMA,
     version: bundle.version,
@@ -180,9 +260,10 @@ if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(
   try {
     const testResults = option("--test-results");
     const releaseDirectory = option("--release-dir");
+    const suiteKind = option("--suite");
     const outputDirectory = resolve(option("--output") ?? join(root, "windows-evidence-out"));
-    if (testResults === undefined || releaseDirectory === undefined) throw new Error("Usage: windows-evidence.mjs --test-results FILE --release-dir DIR [--output DIR]");
-    const { evidence, serialized } = generateWindowsEvidence({ testResults, releaseDirectory });
+    if (testResults === undefined || releaseDirectory === undefined || suiteKind === undefined) throw new Error("Usage: windows-evidence.mjs --suite <full|elevated-gate> --test-results FILE --release-dir DIR [--output DIR]");
+    const { evidence, serialized } = generateWindowsEvidence({ testResults, releaseDirectory, suiteKind });
     mkdirSync(outputDirectory, { recursive: true });
     const jsonName = "windows-evidence-v1.json";
     writeFileSync(join(outputDirectory, jsonName), serialized, { mode: 0o644 });

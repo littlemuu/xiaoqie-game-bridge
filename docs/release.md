@@ -11,6 +11,11 @@ The artifact schema is version 1. Every manifest records the fixed Issue #17
 baseline commit, actual build commit, repository/ref, exact Node/npm versions,
 platform and architecture. Timestamps, random IDs, absolute paths, runner names
 and usernames are deliberately absent from normalized assets.
+The build commit is always derived from `git rev-parse HEAD`. Expected commit
+and ref inputs are assertions only: branches must equal the checkout symbolic
+ref, PR refs must resolve to HEAD, and release tags must be annotated tag
+objects whose peeled commit is HEAD. A caller cannot replace checkout identity
+with mutually consistent false metadata.
 
 ## Canonical builder
 
@@ -81,7 +86,7 @@ Generate a Vitest JSON report in a repository-owned ignored directory, build the
 release evidence, then run:
 
 ```text
-npm run windows:evidence -- --test-results release-input/vitest.json --release-dir release-out
+npm run windows:evidence -- --suite full --test-results release-input/vitest.json --release-dir release-out
 ```
 
 The report records only closed-world counts, skip categories, exact tool/OS
@@ -93,19 +98,28 @@ firewall, system policy or global environment.
 
 An elevated runner can only report `elevated-fail-closed-only`. Failed or
 unknown assertions remain unverified; skipped assertions are counted by safe
-category and prevent an unqualified `allRegisteredTestsPassed` claim. Real
+category and prevent an unqualified `allRegisteredTestsPassed` claim. Full
+evidence additionally requires the exact version-1 nine-file inventory, every
+required core/audit/MCP/operator/process/release/containment category, nonzero
+assertions and a successful trusted containment probe. Empty, partial,
+unexpected or duplicate reports remain unverified. The hosted targeted run uses
+the distinct `elevated-gate` suite kind and cannot become full evidence. Real
 non-elevated evidence requires an actual non-elevated Windows session.
 
 ## Tag, publish and rollback
 
 Draft PRs never create or move tags, Releases, deployments or npm publications.
 After maintainer review and merge, the maintainer may create the annotated,
-protected `v0.1.0-rc.1` tag at the exact merge commit. The tag-only workflow
-checks protection, annotated tag type and target commit before receiving its
-minimal `contents`, `id-token` and `attestations` write permissions. It performs
-a clean rebuild, validation and GitHub attestation, creates a draft prerelease,
-uploads only the five files, downloads them again, verifies digests and the
-attestation subject, and only then publishes the prerelease. Missing evidence,
+protected `v0.1.0-rc.1` tag at the exact merge commit. The tag-only workflow has
+two jobs. The build job explicitly has only `contents: read`; it verifies HEAD,
+tag protection/object/target, performs dependency installation and all project
+execution, then uploads the exact five-file evidence artifact. Only after that
+job succeeds does a separate publish job receive minimal `contents`, `id-token`
+and `attestations` writes. It downloads that run's artifact and executes only
+the narrow verifier before attesting. It creates a draft prerelease, uploads
+the five files, downloads them again, verifies digests and the attestation
+subject, and only then publishes. The credential-bearing job never runs npm,
+tests, demo, general builds or reproducibility scripts. Missing evidence,
 unsupported attestation, upload failure or digest mismatch leaves the job
 failed and never records a successful publication.
 

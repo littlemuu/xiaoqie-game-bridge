@@ -3,8 +3,6 @@ export interface ReleaseOptions {
   outputDirectory?: string;
   allowDirty?: boolean;
   skipCompile?: boolean;
-  commit?: string;
-  ref?: string;
   expectedCommit?: string;
   expectedRef?: string;
 }

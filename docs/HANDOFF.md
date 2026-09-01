@@ -12,6 +12,15 @@
   enforcement and exact temporary cleanup
 - Closed-world Windows JSON/Markdown evidence with explicit elevation, skip,
   failure, unknown and containment/cleanup status
+- Checkout-derived provenance identity with expected commit/ref used only as
+  assertions, including annotated-tag peel and PR-ref resolution checks
+- Versioned exact full-suite inventory that prevents empty, partial, duplicate
+  or targeted Vitest output from becoming non-elevated Windows evidence
+- Separate read-only tag build and minimal credential-bearing publish jobs;
+  dependency installation and general project execution never receive release
+  write/OIDC credentials
+- Closed parsing of every workflow `uses:` key, including rejection of quoted,
+  expression, Docker, floating and otherwise unrecognized forms
 
 - Node.js 22 + TypeScript project with strict compiler settings
 - Versioned strict request/response protocol and stable error codes

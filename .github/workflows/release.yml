@@ -8,14 +8,12 @@ permissions:
   contents: read
 
 jobs:
-  release:
+  build:
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     permissions:
-      contents: write
-      id-token: write
-      attestations: write
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -25,12 +23,13 @@ jobs:
         with:
           node-version-file: .nvmrc
           cache: npm
-      - name: Fail closed unless this is the protected annotated version tag at this commit
+      - name: Fail closed unless checkout is the protected annotated version tag
         env:
           REF_PROTECTED: ${{ github.ref_protected }}
         run: |
           set -euo pipefail
           test "$REF_PROTECTED" = "true"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           version="$(node -p "require('./package.json').version")"
           test "$GITHUB_REF_NAME" = "v${version}"
           test "$(git cat-file -t "$GITHUB_REF_NAME")" = "tag"
@@ -47,6 +46,44 @@ jobs:
         run: npm run release:build -- --expected-commit "$GITHUB_SHA" --expected-ref "$GITHUB_REF"
       - run: npm run release:verify -- --expected-commit "$GITHUB_SHA" --expected-ref "$GITHUB_REF"
       - run: git diff --check
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rc-release-evidence-${{ github.sha }}
+          path: release-out/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rc-release-evidence-${{ github.sha }}
+          path: release-out
+      - name: Reverify tag identity and downloaded evidence only
+        env:
+          REF_PROTECTED: ${{ github.ref_protected }}
+        run: |
+          set -euo pipefail
+          test "$REF_PROTECTED" = "true"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git cat-file -t "$GITHUB_REF_NAME")" = "tag"
+          test "$(git rev-list -n 1 "$GITHUB_REF_NAME")" = "$GITHUB_SHA"
+          node scripts/release.mjs verify --output release-out --expected-commit "$GITHUB_SHA" --expected-ref "$GITHUB_REF"
       - name: Create GitHub artifact attestation for the canonical bundle
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
