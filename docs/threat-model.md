@@ -1,5 +1,20 @@
 # Threat model
 
+## Release-chain claims and non-claims
+
+Pinned action commits, a clean double build, checksums, an SBOM and GitHub
+attestation reduce accidental source/artifact ambiguity. The release workflow
+fails before publishing when its protected tag, evidence files, digests,
+attestation or upload verification is absent. Pull requests and ordinary pushes
+retain only read permissions and cannot enter that job.
+
+These controls do not prove a trustworthy runner, dependency safety, absence of
+compiler compromise, complete supply-chain security or runtime behavior. The
+unsigned local provenance statement is not presented as platform attestation.
+GitHub-hosted Windows remains elevated-only evidence, and Restricted Token plus
+Job containment still does not block all current-user-readable files or network
+access. Nothing here authorizes untrusted code or a real game.
+
 ## Assets and trust boundaries
 
 The protected assets are the user's future game process and saves, local

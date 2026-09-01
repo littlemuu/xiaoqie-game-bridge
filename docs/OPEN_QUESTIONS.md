@@ -1,5 +1,13 @@
 # Open questions
 
+- Will repository rules protect the annotated `v0.1.0-rc.1` tag and permit the
+  official GitHub artifact-attestation action? The release workflow fails closed
+  until both platform capabilities are available.
+- Where will durable real non-elevated Windows RC evidence be retained? Hosted
+  Windows is elevated and cannot replace that report.
+- What project license should a later public distribution carry? This RC does
+  not invent or add a license grant that the maintainer has not selected.
+
 These choices are intentionally deferred and do not block the offline
 foundation:
 
