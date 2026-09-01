@@ -100,7 +100,7 @@ describe.runIf(process.platform === "win32")("isolated mock adapter runner", () 
       env: spec.env,
       shell: spec.shell,
       windowsHide: true,
-      stdio: ["pipe", "pipe", "ignore", "pipe"],
+      stdio: ["pipe", "pipe", "ignore"],
     });
     const lines = createInterface({ input: child.stdout! });
     let readyResolve: (() => void) | undefined;

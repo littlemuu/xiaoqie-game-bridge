@@ -17,7 +17,7 @@ const launcher = spawn(spec.executable, [
   env: spec.env,
   shell: spec.shell,
   windowsHide: true,
-  stdio: ["pipe", "pipe", "ignore", "pipe"],
+  stdio: ["pipe", "pipe", "ignore"],
 });
 let stdout = "";
 let announced = false;

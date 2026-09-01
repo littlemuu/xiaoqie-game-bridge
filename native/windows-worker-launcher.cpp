@@ -4,8 +4,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
-#include <io.h>
-
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -23,7 +21,7 @@ constexpr DWORD kActiveProcessLimit = 1;
 constexpr DWORD kCpuRate = 2000;  // 20.00%, in 1/100ths of a percent.
 constexpr DWORD kParentExitWaitMs = 2000;
 constexpr DWORD kParentLivenessPollMs = 25;
-constexpr int kParentLivenessFileDescriptor = 3;
+constexpr DWORD kInputCloseWorkerExitGraceMs = 100;
 
 constexpr int kExitInvalidLaunch = 40;
 constexpr int kExitHostPolicy = 41;
@@ -383,52 +381,24 @@ bool ValidateJob(HANDLE job, HANDLE process) {
 }
 
 HANDLE ParentLivenessPipe() {
-  // libuv passes additional Windows stdio handles through STARTUPINFO's
-  // reserved buffer. Reading that native table is required here because UCRT
-  // does not expose descriptors above stderr through _get_osfhandle().
-  STARTUPINFOW startup{};
-  GetStartupInfoW(&startup);
-  if (startup.lpReserved2 == nullptr || startup.cbReserved2 < sizeof(unsigned int)) {
-    return INVALID_HANDLE_VALUE;
-  }
-
-  unsigned int descriptor_count = 0;
-  std::memcpy(&descriptor_count, startup.lpReserved2, sizeof(descriptor_count));
-  if (descriptor_count <= static_cast<unsigned int>(kParentLivenessFileDescriptor) ||
-      descriptor_count > 256) {
-    return INVALID_HANDLE_VALUE;
-  }
-
-  const size_t required_size = sizeof(unsigned int) + descriptor_count * sizeof(BYTE) +
-                               descriptor_count * sizeof(uintptr_t);
-  if (required_size > startup.cbReserved2) return INVALID_HANDLE_VALUE;
-
-  const BYTE* buffer = startup.lpReserved2;
-  constexpr BYTE kCrtOpenPipeFlags = 0x01 | 0x08;
-  const BYTE descriptor_flags =
-      buffer[sizeof(unsigned int) + kParentLivenessFileDescriptor];
-  if (descriptor_flags != kCrtOpenPipeFlags) return INVALID_HANDLE_VALUE;
-
-  const size_t handle_offset = sizeof(unsigned int) + descriptor_count * sizeof(BYTE) +
-                               kParentLivenessFileDescriptor * sizeof(HANDLE);
-  HANDLE handle = INVALID_HANDLE_VALUE;
-  std::memcpy(&handle, buffer + handle_offset, sizeof(handle));
-#if defined(XIAOQIE_CONTAINMENT_TEST_BUILD) && defined(__MINGW32__)
-  const intptr_t crt_raw = _get_osfhandle(kParentLivenessFileDescriptor);
-  if (crt_raw == -1 || reinterpret_cast<HANDLE>(crt_raw) != handle) {
-    return INVALID_HANDLE_VALUE;
-  }
-#endif
-  if (handle == nullptr || handle == INVALID_HANDLE_VALUE ||
-      GetFileType(handle) != FILE_TYPE_PIPE) {
+  // Standard handles are a Win32 process contract across CRTs. Keep an exact,
+  // non-inheritable duplicate of the fixed stdin/IPC pipe for parent-liveness
+  // monitoring; the original is passed to the worker and then closed locally.
+  HANDLE standard_input = GetStdHandle(STD_INPUT_HANDLE);
+  if (standard_input == nullptr || standard_input == INVALID_HANDLE_VALUE ||
+      GetFileType(standard_input) != FILE_TYPE_PIPE) {
     return INVALID_HANDLE_VALUE;
   }
   DWORD flags = 0;
-  if (!GetNamedPipeInfo(handle, &flags, nullptr, nullptr, nullptr) ||
-      !SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0)) {
+  if (!GetNamedPipeInfo(standard_input, &flags, nullptr, nullptr, nullptr)) {
     return INVALID_HANDLE_VALUE;
   }
-  return handle;
+  HANDLE duplicate = INVALID_HANDLE_VALUE;
+  if (!DuplicateHandle(GetCurrentProcess(), standard_input, GetCurrentProcess(), &duplicate,
+                       0, FALSE, DUPLICATE_SAME_ACCESS)) {
+    return INVALID_HANDLE_VALUE;
+  }
+  return duplicate;
 }
 
 bool ParentLivenessPipeIsOpen(HANDLE handle) {
@@ -437,8 +407,7 @@ bool ParentLivenessPipeIsOpen(HANDLE handle) {
     return false;
   }
   DWORD available = 0;
-  return PeekNamedPipe(handle, nullptr, 0, nullptr, &available, nullptr) != FALSE &&
-         available == 0;
+  return PeekNamedPipe(handle, nullptr, 0, nullptr, &available, nullptr) != FALSE;
 }
 
 bool BuildEnvironment(const std::wstring& mode, std::vector<wchar_t>* environment) {
@@ -650,8 +619,8 @@ int wmain(int argc, wchar_t** argv) {
 
   BOOL host_in_job = FALSE;
   if (!IsProcessInJob(GetCurrentProcess(), nullptr, &host_in_job)) return kExitHostPolicy;
-  HANDLE parent_liveness = ParentLivenessPipe();
-  if (!ParentLivenessPipeIsOpen(parent_liveness)) return kExitHostPolicy;
+  UniqueHandle parent_liveness(ParentLivenessPipe());
+  if (!ParentLivenessPipeIsOpen(parent_liveness.get())) return kExitHostPolicy;
 
   UniqueHandle job(CreateJobObjectW(nullptr, nullptr));
   if (!job || fault_stage == FaultStage::kJob || !ConfigureJob(job.get())) return kExitJob;
@@ -805,7 +774,7 @@ int wmain(int argc, wchar_t** argv) {
 #ifdef XIAOQIE_CONTAINMENT_TEST_BUILD
       !process_limit_verified ||
 #endif
-      !ParentLivenessPipeIsOpen(parent_liveness) ||
+      !ParentLivenessPipeIsOpen(parent_liveness.get()) ||
       !WriteAttestation(standard_output, integrity, host_in_job != FALSE)) {
     return kExitAttestation;
   }
@@ -819,19 +788,24 @@ int wmain(int argc, wchar_t** argv) {
   for (;;) {
     const DWORD wait_result = WaitForSingleObject(worker_process.get(), kParentLivenessPollMs);
     if (wait_result == WAIT_OBJECT_0) break;
-    if (wait_result != WAIT_TIMEOUT || !ParentLivenessPipeIsOpen(parent_liveness)) {
-      job.reset();
-      const DWORD worker_wait = WaitForSingleObject(worker_process.get(), kParentExitWaitMs);
-#ifdef XIAOQIE_CONTAINMENT_TEST_BUILD
-      if (EqualsIgnoreCase(worker_mode, L"probe-parent-liveness") &&
-          worker_wait == WAIT_OBJECT_0) {
-        WriteParentLivenessProbeEvidence(GetStdHandle(STD_ERROR_HANDLE));
-      }
-#else
-      (void)worker_wait;
-#endif
-      return kExitWorker;
+    if (wait_result == WAIT_TIMEOUT && ParentLivenessPipeIsOpen(parent_liveness.get())) {
+      continue;
     }
+    if (wait_result == WAIT_TIMEOUT &&
+        WaitForSingleObject(worker_process.get(), kInputCloseWorkerExitGraceMs) == WAIT_OBJECT_0) {
+      break;
+    }
+    job.reset();
+    const DWORD worker_wait = WaitForSingleObject(worker_process.get(), kParentExitWaitMs);
+#ifdef XIAOQIE_CONTAINMENT_TEST_BUILD
+    if (EqualsIgnoreCase(worker_mode, L"probe-parent-liveness") &&
+        worker_wait == WAIT_OBJECT_0) {
+      WriteParentLivenessProbeEvidence(GetStdHandle(STD_ERROR_HANDLE));
+    }
+#else
+    (void)worker_wait;
+#endif
+    return kExitWorker;
   }
   DWORD worker_exit = 1;
   if (!GetExitCodeProcess(worker_process.get(), &worker_exit)) return kExitWorker;

@@ -50,7 +50,7 @@ async function runProbe(
     env: {},
     shell: false,
     windowsHide: true,
-    stdio: ["pipe", "pipe", "pipe", "pipe"],
+    stdio: ["pipe", "pipe", "pipe"],
   });
   const launcherPid = child.pid!;
   const messages: unknown[] = [];
@@ -212,7 +212,7 @@ describe.runIf(isWindows)("real Windows worker containment", () => {
       env: {},
       shell: false,
       windowsHide: true,
-      stdio: ["pipe", "pipe", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";
     let stderr = "";
@@ -246,7 +246,7 @@ describe.runIf(isWindows)("real Windows worker containment", () => {
       }
     });
     await ready;
-    child.stdio[3]!.destroy();
+    child.stdin!.destroy();
     const code = await new Promise<number | null>((resolve) => child.once("close", resolve));
     expect(code).toBe(48);
     expect(messageOfType(stdoutMessages, "probe-parent-ready")).toBeDefined();
@@ -270,9 +270,9 @@ describe.runIf(isWindows)("real Windows worker containment", () => {
       env: {},
       shell: false,
       windowsHide: true,
-      stdio: ["pipe", "pipe", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
     });
-    child.stdio[3]!.destroy();
+    child.stdin!.destroy();
     const messages: unknown[] = [];
     let stdout = "";
     child.stdout!.setEncoding("utf8");
@@ -291,7 +291,7 @@ describe.runIf(isWindows)("real Windows worker containment", () => {
     expect(messageOfType(messages, "containment-ready")).toBeUndefined();
   });
 
-  it("fails closed when the native startup handle table has no liveness slot", async () => {
+  it("fails closed when the inherited stdin liveness endpoint is not a pipe", async () => {
     const testSpec = fixedWorkerLaunchSpec({
       testOnly: { faultMode: "hang", containmentFaultStage: "none" },
     });
@@ -305,7 +305,7 @@ describe.runIf(isWindows)("real Windows worker containment", () => {
       env: {},
       shell: false,
       windowsHide: true,
-      stdio: ["pipe", "pipe", "pipe"],
+      stdio: ["ignore", "pipe", "pipe"],
     });
     const messages: unknown[] = [];
     let stdout = "";
@@ -367,7 +367,7 @@ describe.runIf(isWindows)("real Windows worker containment", () => {
       env: { HOSTILE_OVERRIDE: "ignored" },
       shell: false,
       windowsHide: true,
-      stdio: ["pipe", "pipe", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
     });
     let stdoutBytes = 0;
     let stderrBytes = 0;

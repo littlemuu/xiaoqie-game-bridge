@@ -138,18 +138,18 @@ audit HMAC key crosses IPC. Dry-run remains explicit and non-mutating.
 The Node parent executes only the fixed native launcher. Its closed-world argv
 contains fixed `process.execPath` and the fixed built module path; cwd is derived
 from that module, the launcher environment is empty, shell is false, and stdio
-is pipe/pipe/ignored/pipe. The fourth pipe is a dedicated parent-liveness
-channel. The helper validates the exact inherited descriptor, removes its
-inherit flag, and checks it before attestation/resume and while the worker runs.
-It obtains the native endpoint from Node/libuv's bounded Windows startup handle
-table and validates both the open-pipe flags and kernel object type, rather than
-assuming UCRT maps extra stdio handles into its CRT descriptor table.
+is pipe/pipe/ignored. The fixed stdin pipe carries both IPC and parent liveness.
+The helper validates its inherited Win32 endpoint, keeps an exact
+non-inheritable duplicate for `PeekNamedPipe` monitoring without consuming IPC
+bytes, and checks it before attestation/resume and while the worker runs. It
+relies only on the standard-handle contract shared by MSVCRT and UCRT.
 It performs no process-table enumeration or parent-PID reopen, so parent exit
 cannot be confused with PID reuse. The helper independently accepts only the
 product path shape (or a separately built test-only fixture shape), creates an
 explicit `SystemRoot` plus worker-marker environment, and passes only stdin,
 stdout, and a newly opened NUL stderr handle through
-`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`; the liveness pipe never reaches the worker.
+`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`; the launcher-only duplicate never reaches
+the worker.
 
 The security-critical startup order is: reject elevated/invalid host state;
 create and configure a dedicated Job; derive and kernel-validate a restricted
@@ -171,7 +171,7 @@ real worker, which performs its own forbidden child-process attempt and reports
 the denial. After the worker settles, the launcher re-queries zero active/listed
 Job members and only then emits the fixed trusted post-attempt evidence frame.
 Parent-loss testing uses two complementary regressions: a real abnormal parent
-exit proves the dedicated pipe breaks and the launcher ends, while a directly
+exit proves the inherited stdin pipe breaks and the launcher ends, while a directly
 closed copy of that same liveness channel preserves the observer long enough for
 the launcher to confirm worker termination through its exact process handle. It
 does not use a worker PID observation as proof.

@@ -174,14 +174,15 @@ exact candidate handle, and re-queried one active/one listed member matching the
 original worker before resume. The real worker then attempted the forbidden
 child creation and reported its denial; trusted post-attempt accounting showed
 zero active/zero listed Job members. The parent-liveness regression closed the
-dedicated inherited pipe through a real abnormal parent exit and confirmed the
+inherited stdin pipe through a real abnormal parent exit and confirmed the
 launcher ended. A complementary direct liveness-channel closure kept the test
 observer open while the launcher confirmed contained-worker termination through
 its exact process handle. The product uses neither a process-table scan nor a
-parent-PID reopen. The launcher reads the liveness endpoint from Node/libuv's
-bounded Windows startup handle table and validates its open-pipe flags and
-kernel type, avoiding an MSVCRT-only assumption for extra file descriptors when
-the native helper is built with MSVC/UCRT.
+parent-PID reopen. The fixed stdin pipe carries both IPC and liveness. The
+launcher validates the inherited Win32 pipe, monitors an exact non-inheritable
+duplicate without consuming bytes, and passes only the original endpoint to the
+worker. This uses the standard-handle contract shared by MSVCRT and UCRT rather
+than relying on extra CRT file descriptors.
 
 Windows audit-file evidence was sampled from a real append-and-sync in a
 uniquely named temporary directory. The ledger object was a directory, its
