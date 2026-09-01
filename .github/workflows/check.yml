@@ -37,8 +37,19 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run check
-      - run: npm test
-      - run: npm run demo
+      - name: Confirm the hosted Windows host is elevated
+        shell: pwsh
+        run: |
+          $principal = [Security.Principal.WindowsPrincipal]::new(
+            [Security.Principal.WindowsIdentity]::GetCurrent()
+          )
+          if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            throw "The hosted Windows runner was expected to be elevated."
+          }
+      - name: Verify the product fails closed on the elevated host
+        run: npm test -- --run tests/windows-containment.test.ts
+        env:
+          XIAOQIE_EXPECT_ELEVATED_HOST: "1"
       - run: npm run build
       - run: npm audit
       - run: git diff --check

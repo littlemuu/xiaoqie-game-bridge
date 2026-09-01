@@ -23,6 +23,14 @@ const bridge = new GameBridge({
 });
 const localContext = { transport: "local" } as const;
 
+if (process.platform !== "win32") {
+  console.log(JSON.stringify({
+    skipped: true,
+    reason: "Windows kernel containment is required; no unrestricted fallback is available.",
+  }, null, 2));
+  process.exit(0);
+}
+
 function handleLocal(requestEnvelope: RequestEnvelope) {
   return bridge.handle(requestEnvelope, localContext);
 }

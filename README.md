@@ -11,6 +11,9 @@ separate bounded local audit ledger; that ledger is not a game save.
 
 - Node.js 22
 - npm 10 or newer
+- On Windows, either MSVC Build Tools with the Windows SDK or MinGW-w64 `g++`.
+  The build compiles the checked-in narrow Win32 helper from source; no EXE/DLL
+  is committed or downloaded at runtime.
 
 ## Five-minute verification
 
@@ -24,9 +27,11 @@ npm audit
 git diff --check
 ```
 
-The demo opens an in-memory session, previews a movement, commits it once,
+On Windows, the demo opens an in-memory session, previews a movement, commits it once,
 replays the same request without a second side effect, triggers the safety
 latch, and proves that observation remains available while writes are denied.
+Other platforms print a fixed skip result because the product has no
+unrestricted worker fallback.
 
 ## Safety properties
 
@@ -57,12 +62,33 @@ See [architecture](docs/architecture.md), [threat model](docs/threat-model.md),
 
 ## Isolated mock adapter process
 
-The product stdio entrypoint registers `ProcessMockAdapter`. It launches one
-fixed built `mock-worker.js` with `process.execPath`, fixed argv/cwd, `shell:
-false`, hidden windows, pipe-only stdio, and an explicit minimal parent-supplied
-environment. Requests cannot select an executable, path, argument, environment,
-or adapter identity. The pure in-memory mock remains the worker implementation
-and a unit-test fixture only.
+The Windows product stdio entrypoint registers `ProcessMockAdapter` only after a
+checked-in, source-built Win32 launcher has established containment for the one
+fixed built `mock-worker.js`. Trusted code fixes the launcher, `process.execPath`,
+entrypoint, argv, cwd, empty launcher environment, `shell: false`, hidden window,
+and pipe-only stdio. Stdin carries adapter IPC; stderr is a dedicated reverse
+parent-liveness pipe. The launcher validates the inherited Win32 write endpoint,
+keeps an exact non-inheritable duplicate, and writes fixed one-byte pulses while
+the Node parent drains them. Parent read-end closure makes a pulse fail
+independently of unread stdin bytes. The worker receives a new NUL stderr handle,
+never the liveness channel. This standard-handle contract remains valid across
+MSVCRT and UCRT. The launcher never enumerates the process table or reopens a PID
+and closes the Job when the endpoint breaks. It supplies only `SystemRoot` and a
+fixed worker marker to the worker. Requests, MCP, CLI, adapters, and environment
+variables cannot select any of these values.
+Non-Windows product startup and any Windows containment failure fail closed;
+there is no direct-`spawn()` fallback.
+
+The launcher derives a real primary restricted token from the non-elevated
+caller, disables maximum privileges, makes administrator/operator groups
+disabled or deny-only, and uses the source user plus enabled non-privileged
+groups as the restricting-SID policy. It then creates the worker suspended,
+assigns it to a dedicated Job, queries both token and Job state, writes one
+closed-world attestation, and only then resumes JavaScript. The Job enforces
+kill-on-close, one active process, a 256 MiB process-memory limit, a 192 MiB
+job-memory limit, a 20% CPU hard cap, and no breakaway. The existing 2 s
+handshake/call, 1 s graceful-close, eight-call, 64 KiB frame, and 32 KiB message
+limits remain in force.
 
 Adapter IPC is newline-delimited, versioned, strict JSON with a 64 KiB frame
 limit, 32 KiB logical-message limit, eight pending calls, two-second handshake
@@ -72,10 +98,22 @@ identity. Malformed/unknown/oversized output, wrong or duplicate IDs, timeout,
 EOF, crash, and non-zero exit fail closed and settle pending calls with fixed
 sanitized bridge errors.
 
-This is fault containment between trusted components running as the same OS
-user, not a proven OS sandbox. The worker remains trusted code requiring
-separate review. It receives no caller context, principal, session/owner data,
-caller-tag key, credential, or host secret. No real adapter is authorized.
+The trusted helper verifies `TokenIsRestricted`, dangerous privileges, group
+policy, restricting SIDs, medium-or-lower integrity, Job membership, every
+resource limit, and the one-member count from kernel results. A bounded test
+probe also proves child-process denial, memory-limit settlement, CPU policy,
+failure before resume, exact parent-loss cleanup, and nested-Job behavior on the
+actual Windows host. The process-count probe is launcher-owned: it creates a
+second suspended restricted candidate, requires Job assignment to fail with the
+active-process quota, and confirms candidate termination while the original
+worker remains the Job's only live member. The real worker then attempts the
+same forbidden child creation; after its denial settles, the launcher queries
+zero live Job members before emitting the trusted post-attempt evidence.
+The abnormal-parent probe uses the launcher's exact worker process handle—not a
+PID lookup—to confirm Job-close termination.
+This is still not a hostile-code, filesystem, registry, or network sandbox.
+The worker remains trusted code and receives no caller identity or secret. No
+real adapter is authorized.
 
 ## Capacity defaults and configuration
 
@@ -252,6 +290,10 @@ late handlers cannot add response work after disconnect or shutdown. Every
 audit-sink promise is tracked; operator shutdown performs a bounded audit-idle
 wait, including authorization writes that outlive a disconnected request.
 
-CI has two explicit acceptance paths. Ubuntu runs the platform-neutral core and
-skips only Windows product-child/operator cases; `windows-latest` runs the full
-suite including real named pipes, the built CLI, and the built stdio child.
+Acceptance evidence has three explicit scopes. Ubuntu runs the platform-neutral
+suite and skips Windows product-child/operator cases. GitHub-hosted
+`windows-latest` is elevated, so it compiles both helpers with MSVC/UCRT and
+verifies the product's pre-worker elevated-host rejection only; it does not run
+or claim the non-elevated allow path. The complete Windows suite, real named
+pipes, built CLI, built stdio child, and demo are exercised locally under Node
+22 on a non-elevated Windows host pending a suitable dedicated runner.

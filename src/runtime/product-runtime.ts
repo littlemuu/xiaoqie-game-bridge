@@ -17,13 +17,16 @@ export interface ProductRuntime {
 export async function createProductRuntime(): Promise<ProductRuntime> {
   const registry = new AdapterRegistry();
   const audit = await DurableAuditLedger.open();
-  let adapter: ProcessMockAdapter;
+  let adapter: ProcessMockAdapter | undefined;
   try {
     adapter = new ProcessMockAdapter();
+    await adapter.start();
   } catch (error) {
+    if (adapter !== undefined) await adapter.close().catch(() => undefined);
     await audit.close().catch(() => undefined);
     throw error;
   }
+  if (adapter === undefined) throw new Error("Contained adapter startup did not complete.");
   const safetyLatch = new SafetyLatch();
   registry.register(adapter);
   const bridge = new GameBridge({ registry, auditSink: audit, safetyLatch });
