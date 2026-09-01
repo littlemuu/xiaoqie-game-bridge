@@ -109,6 +109,28 @@ describe("canonical release evidence", () => {
     expect(() => verifyRelease({ root, outputDirectory: result.outputDirectory, expectedCommit: "f".repeat(40) })).toThrow(/expected commit/u);
   });
 
+  it("records the numeric GitHub PR merge ref without opening the ref format", () => {
+    const outputDirectory = temporaryDirectory("xiaoqie-release-pr-ref-");
+    const result = buildRelease({
+      root,
+      outputDirectory,
+      allowDirty: true,
+      skipCompile: true,
+      commit,
+      ref: "refs/pull/18/merge",
+    });
+    expect(verifyRelease({ root, outputDirectory: result.outputDirectory, expectedRef: "refs/pull/18/merge" }).manifest.source.ref)
+      .toBe("refs/pull/18/merge");
+    expect(() => buildRelease({
+      root,
+      outputDirectory,
+      allowDirty: true,
+      skipCompile: true,
+      commit,
+      ref: "refs/pull/not-a-number/merge",
+    })).toThrow(/ref is outside/u);
+  });
+
   it("fails closed when provenance names the wrong bundle digest", () => {
     const result = build(temporaryDirectory("xiaoqie-release-provenance-"));
     rewriteEvidence(result.outputDirectory, (_manifest, provenance) => {

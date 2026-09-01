@@ -246,7 +246,7 @@ function sourceIdentity(root, options) {
   const ref = options.ref ?? process.env.GITHUB_REF ?? (() => {
     try { return git(root, ["symbolic-ref", "-q", "HEAD"]); } catch { return `detached/${commit}`; }
   })();
-  if (!/^(?:refs\/(?:heads|tags)\/[A-Za-z0-9._/-]+|detached\/[0-9a-f]{40})$/u.test(ref)) {
+  if (!/^(?:refs\/(?:heads|tags)\/[A-Za-z0-9._/-]+|refs\/pull\/[1-9][0-9]*\/merge|detached\/[0-9a-f]{40})$/u.test(ref)) {
     throw new Error("Build ref is outside the closed release source format.");
   }
   return { repository: REPOSITORY, ref, commit, baseCommit: BASE_COMMIT };
