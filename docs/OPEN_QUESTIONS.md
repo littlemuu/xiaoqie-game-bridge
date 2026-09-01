@@ -2,7 +2,7 @@
 
 > 更新日期：2026-09-01  
 > 路线依据：[`docs/ROADMAP.md`](ROADMAP.md)  
-> 当前下一张工单：[Issue #19](https://github.com/littlemuu/xiaoqie-game-bridge/issues/19)
+> 当前实施工单：[Issue #19](https://github.com/littlemuu/xiaoqie-game-bridge/issues/19)；合并复审后才为阶段 B 建立独立工单
 
 本文件只保留真正需要未来工单或人工批准的问题。已经由路线复审决定的事项不再反复列为开放选择。
 
@@ -11,28 +11,29 @@
 1. 当前 `v0.1.0-rc.1` 继续保持 mock-only、offline-first、default-deny。
 2. default-deny、单一 `GameBridge` 裁决路径、session owner binding、幂等、独立 operator、durable audit、固定 mock worker 和 Windows containment 均保留。
 3. 发布链、durable ledger 和 Windows containment 暂时冻结，不继续增加新的证明层或安全机制。
-4. 下一张工单不是 remote relay、Minecraft 写入、更多 provenance 或更强 native sandbox，而是 Adapter Contract v2、可信 grant、state revision、资源级写入串行化和运行健康。
+4. Issue #19 已选择并实现 Adapter Contract v2、可信 grant、state revision、资源级写入串行化和运行健康；下一阶段不是 remote relay、Minecraft 写入、更多 provenance 或更强 native sandbox，而是 operation journal 与 reconciliation。
 5. capability 请求不等于授权；真实 grant 必须来自可信本地 profile、adapter manifest 与资源 scope 的交集。
 6. 有界并发不等于状态安全；同一真实游戏资源的写操作默认串行。
 7. timeout、worker exit、client disconnect 或进程终止不等于动作未执行，也不授权自动重试。
 8. 真实 adapter 必须先经过只读 vertical slice，再批准一个可恢复的最小写动作。
 9. 在真实只读 adapter 和 operation reconciliation 完成前，不重新评估远程 transport。
 
-## 当前阶段需要实现、但不需要小目临时决定的问题
+## 阶段 A 已采用的实现选择
 
-以下事项已写入 Issue #19，施工者应采用最小、保守、可测试的方案，不应停下来等待交互式选择：
+以下事项已在 Issue #19 分支中采用最小、保守、可替换的实现，不再作为开放问题：
 
 - Adapter Contract v2 的字段组织与 TypeScript 命名；
 - manifest 注册时的验证、快照和冻结方式；
 - Zod input/output schema 到 closed-world JSON Schema 的最小转换方式；
 - 可信 mock grant profile 的具体代码结构；
-- action budget 的有界内部表示；
+- commit dispatch attempt 的 session/per-action 有界预算；dry-run、dispatch 前拒绝和重放不扣减，adapter 明确拒绝与 outcome unknown 扣减一次；
 - mock state revision 与同资源单写 permit 的最小实现；
+- mock observation 的并行只读语义与 preview 不取得 write permit 的最小调度规则；
 - runtime/adapter/audit/safety 健康枚举的具体类型；
 - package、MCP、protocol 版本单一来源的最小实现；
 - 重复 stable/canonical JSON helper 的收敛方式。
 
-只要实现不扩大能力边界、通过全部回归并在 PR 中准确记录，就不需要把这些代码级选择重新上升为产品决策。
+这些选择仍需完整验收和 Draft PR 复审，但不扩大能力边界，也不授权真实 adapter、持久 operation store 或远程 transport。
 
 ## 阶段 B：Operation journal 与 reconciliation
 
@@ -86,7 +87,7 @@
 1. safety latch 是否在真实 adapter 启动时默认 stopped，还是持久化并恢复上一次安全状态。
 2. stale operator descriptor 的 closed-world 恢复流程；当前异常 kill 后重启会 fail closed，但没有受支持的用户操作命令。
 3. operator descriptor 是否需要显式 Windows DACL、restricted-token broker 或 OS-owned rendezvous；当前继承 ACL 不是 hostile same-user 隔离证明。
-4. operator `status` 应显示哪些固定健康计数，同时避免成为日志浏览器或任意文件管理接口。
+4. 当前 operator `status` 已固定显示 runtime/adapter/audit/safety 类别与非敏感计数；阶段 B 是否需要 journal 状态或 drained 计数，仍必须保持 closed-world，不能变成日志浏览器或任意文件管理接口。
 5. audit full/corrupt、journal full/corrupt、adapter fault 和 runtime fault 的 seal、archive、quarantine、acknowledged reset 流程。
 6. 恢复操作如何确保只处理固定应用对象，不接受任意 path，也不删除无法重新识别的文件。
 

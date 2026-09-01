@@ -1,12 +1,12 @@
 # xiaoqie-game-bridge 路线图
 
-> 状态：已决定
+> 状态：阶段 A 已在 `feat/adapter-contract-v2` 实现，待 Draft PR 复审
 >
 > 更新日期：2026-09-01
 >
 > 决策基线：`main@0baac6571903c1f587b288b85feb160299454470`
 >
-> 当前下一张工单：[Issue #19 — Adapter Contract v2、可信授权与运行健康基础](https://github.com/littlemuu/xiaoqie-game-bridge/issues/19)
+> 当前实施工单：[Issue #19 — Adapter Contract v2、可信授权与运行健康基础](https://github.com/littlemuu/xiaoqie-game-bridge/issues/19)
 
 ## 1. 路线调整结论
 
@@ -53,6 +53,8 @@
 对应：[Issue #19](https://github.com/littlemuu/xiaoqie-game-bridge/issues/19)
 
 本阶段仍只运行 mock adapter，目标是修正通用领域模型，而不是接入真实游戏。
+
+实施状态：本分支已采用最小 closed-world 方案完成下列项目，仍需完整验收与 Draft PR 复审；这不授权提前进入真实 adapter。
 
 必须完成：
 
@@ -193,12 +195,10 @@
 
 在真实写 adapter 前，以下问题必须关闭：
 
-- capability 仍缺可信 grant；
-- adapter contract 缺 output schema、revision、效果类型与错误命名空间；
 - session 幂等只在活进程内成立；
-- dispatch 后结果未知无法对账；
+- dispatch 后结果未知已有稳定分类，但仍无法通过 durable operation journal 与 `operationId` 对账；
 - safety latch 重启后恢复为 running；
-- operator health 不能完整表达 adapter/audit/runtime 故障；
+- operator 已表达 runtime/adapter/audit/safety 固定健康类别，但 fault/full/corrupt/stale 状态仍缺受支持的恢复命令；
 - durable audit 的关键安全事件与普通运行审计尚未分层；
 - stale descriptor、audit full/corrupt 等状态缺少受支持的恢复路径；
 - observation 缺分页、freshness、revision 和不可信游戏文本标记；

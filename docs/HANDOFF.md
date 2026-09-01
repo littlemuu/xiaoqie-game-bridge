@@ -2,6 +2,33 @@
 
 ## Completed
 
+- Adapter Contract v2 with strict input/output schemas, read/preview/write
+  effect metadata, dry-run semantics, required-capability sets, fixed result
+  byte limits, resource-serial declarations, adapter error namespaces,
+  revision requirements, and future reconciliation metadata
+- Registration-time validation, snapshotting, and freezing of adapter identity,
+  observation, actions, schemas, capabilities, limits, and metadata; runtime
+  replacement of the source manifest cannot expand the registered surface
+- Pure-JSON `bridge.describe` catalog with input/output JSON Schema and no Zod
+  instances, functions, or arbitrary adapter objects
+- Explicit trusted mock grant provider with fixed tiny-world scope, actual
+  requested/profile/manifest intersection, TTL cap, session action budget, and
+  per-action budgets; owner binding remains independent from authorization
+- Monotonic mock `stateRevision`, observation/preview revision output,
+  required `expectedRevision` on mock commits, and one increment per successful
+  write only
+- No-queue resource-level single-write scheduler composed with the existing
+  global safety write gate; stop is checked before and during atomic admission
+- Closed runtime/adapter/audit/safety health model returned by operator status
+  and printed by the CLI without paths, endpoints, tokens, PIDs, exception text,
+  audit contents, or adapter payloads
+- Pre-response adapter output schema/serialization/byte-limit validation,
+  allowlisted adapter rejection codes, explicit dispatch-phase classification,
+  and conservative cached `OUTCOME_UNKNOWN` without retry
+- `package.json` as the MCP metadata version source, `PROTOCOL_VERSION` as the
+  bridge protocol source, shared transient canonical JSON, and explicitly
+  separate versioned audit-frame canonical encoding
+
 - `0.1.0-rc.1` single-source release version with lock/manifest/SBOM checks
 - Deterministic, normalized source-build bundle with an exact file allowlist
 - SHA-256 list, CycloneDX 1.6 JSON SBOM, versioned release manifest and unsigned
@@ -86,6 +113,19 @@
 
 ## Conservative implementation choices
 
+- The product grant provider recognizes only the fixed local `mock-world`
+  profile and `tiny-world-v1` scope. Test-only providers exercise the injection
+  seam but do not add production remote identity or broader grants.
+- Action budget counts commit attempts only after health, safety, resource and
+  revision admission. Dry-run, pre-dispatch rejection and replay do not charge;
+  adapter rejection and outcome unknown charge once because dispatch occurred.
+- Invalid output after a write is classified with a fixed output error and
+  outcome-unknown phase, then faults later commit health. The original output
+  is never echoed or audited.
+- `OUTCOME_UNKNOWN` is a narrow forward interface, not a journal. There is no
+  operation database, persistent operation ID, reconciliation, auto-retry, or
+  cross-restart exactly-once claim in this ticket.
+
 - MCP uses only client-spawned local stdio. The separate operator channel uses
   one same-user Windows named pipe; neither opens TCP or provides remote auth.
 - The parent starts only the fixed native launcher; the helper alone starts the
@@ -138,6 +178,10 @@ npm test
 npm run demo
 npm run build
 npm audit
+npm run release:workflow-policy
+npm run release:reproducible
+npm run release:build
+npm run release:verify
 git diff --check
 ```
 
@@ -146,13 +190,13 @@ Actual local results on 2026-09-01 with Node.js `v22.23.1` and npm `10.9.8`:
 - `npm ci` — passed; 73 packages installed, 74 audited, 0 vulnerabilities
 - `npm audit` — passed; 0 vulnerabilities
 - `npm run check` — passed
-- `npm test` — passed; 8 files, 112 tests passed and one non-Windows gate was
-  skipped on Windows. All prior protocol, MCP, operator, audit, safety,
-  idempotency and capacity regressions remain green. The new real Windows groups
-  cover kernel token/Job attestation before worker entry, a trusted suspended
-  candidate process-limit proof, bounded memory and CPU probes, exact inherited
-  parent-liveness cleanup of both launcher and worker, six injected setup
-  failures, closed-world argv, and fixed containment categories.
+- `npm test` — passed; 10 files, 140 tests passed and 2 explicitly inapplicable
+  Windows gates skipped (142 registered assertions) in 38.01 s. All prior
+  protocol, MCP, operator, audit, safety, idempotency, capacity and containment
+  regressions remain green. The new Adapter Contract v2 group covers immutable
+  catalog snapshots, trusted grants, revisions, write serialization, safety
+  admission, budgets, output validation, health transitions, adapter rejection,
+  and conservative outcome-unknown handling.
 - Real stdio contract — passed inside `npm test`; official
   `Client@2.0.0`/`StdioClientTransport` started the built Node entrypoint,
   completed initialize/list/calls, and closed client first then transport
@@ -231,10 +275,10 @@ product's silent exit-41 pre-worker rejection, then runs the MSVC/UCRT build,
 audit, and diff-check. It does not run or claim the non-elevated allow path,
 named-pipe/operator, process-adapter, MCP stdio, CLI, lifecycle, or demo suite.
 Those remain local non-elevated Windows evidence until a suitable dedicated
-runner exists. After this repair, the unchanged final Node 22 run passed all 8
-files with 113 passed/2 skipped in 28.44 s. Its first full run had only the
-existing durable-ledger truncation enumeration exceed 10 s (10.273 s); the
-isolated file passed 17/17 with that case at 7.998 s before the final full pass.
+runner exists. The final Node 22 run for Adapter Contract v2 passed all 10 files
+with 140 passed/2 explicitly inapplicable skips in 38.01 s; the exact inventory
+now includes `adapter-contract-v2.test.ts`, so partial or stale nine-file output
+cannot become non-elevated Windows evidence.
 
 On this Windows managed host, the final commands used an official
 SHA-256-verified temporary Node.js `v22.23.1` archive and npm `10.9.8`
@@ -266,6 +310,8 @@ configuration was accessed. GitHub-hosted CI status is recorded in the Draft PR.
   remote endpoint.
 - Session, idempotency, safety-latch, and mock-game state still disappear on
   process exit. Only the bounded sanitized audit ledger survives restart.
+- `OUTCOME_UNKNOWN` is stable and prevents later commits, but cannot be resolved
+  until the separate operation-journal/reconciliation stage exists.
 - Restricted Token + Job Object is not a complete OS sandbox or authorization
   for a real adapter; it does not block every user-readable file or network use.
 - Safety stop blocks new writes but does not forcibly cancel an asynchronous
@@ -294,7 +340,9 @@ configuration was accessed. GitHub-hosted CI status is recorded in the Draft PR.
 
 ## Next-ticket gate
 
-Review this stdio/MCP boundary, its real child-process contract evidence, and
-remaining cancellation/authentication risks before choosing any next ticket.
-Do not infer approval for a real game, remote transport, host configuration, or
-desktop integration from this mock-only contract.
+Review Issue #19's contract/grant/revision/scheduling/health semantics and its
+complete local evidence first. After merge, the next ticket must be the narrow
+operation journal, internal operation ID, `OUTCOME_UNKNOWN` persistence and
+reconciliation stage. It must not infer approval for a real game, remote
+transport, host configuration, durable session, deployment, or desktop
+integration from this mock-only contract.
