@@ -10,6 +10,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const SAFE_OUTPUT_NAME = /^[A-Za-z0-9._-]+$/u;
 export const TEST_INVENTORY_SCHEMA = "xiaoqie.vitest-inventory/v1";
 export const FULL_SUITE_FILES = Object.freeze([
+  "adapter-contract-v2.test.ts",
   "bridge.test.ts",
   "durable-audit-ledger.test.ts",
   "hardening.test.ts",
@@ -61,7 +62,7 @@ function categoryForAssertion(assertion) {
 }
 
 function fileCategory(name) {
-  if (name === "bridge.test.ts" || name === "hardening.test.ts" || name === "owner-binding.test.ts") return "bridge-core";
+  if (name === "adapter-contract-v2.test.ts" || name === "bridge.test.ts" || name === "hardening.test.ts" || name === "owner-binding.test.ts") return "bridge-core";
   if (name === "durable-audit-ledger.test.ts") return "durable-audit";
   if (name === "mcp.test.ts") return "mcp-product-boundary";
   if (name === "operator.test.ts") return "operator";

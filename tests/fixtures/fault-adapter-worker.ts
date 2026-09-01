@@ -7,6 +7,7 @@ import {
 
 const mode = process.env.XIAOQIE_TEST_MODE ?? "hang";
 const observation = {
+  stateRevision: 0,
   player: { x: 0, y: 1, z: 0 },
   nearbyBlocks: [],
 };
@@ -95,7 +96,7 @@ process.stdin.on("data", (chunk: string) => {
         ok: true,
         result: process.env.ADAPTER_PASSWORD_SENTINEL === undefined
           ? observation
-          : { player: { x: 99, y: 1, z: 0 }, nearbyBlocks: [] },
+          : { stateRevision: 0, player: { x: 99, y: 1, z: 0 }, nearbyBlocks: [] },
       });
       break;
     case "wrong-result":
@@ -106,6 +107,7 @@ process.stdin.on("data", (chunk: string) => {
         ok: true,
         result: {
           applied: true,
+          stateRevision: 1,
           change: {
             type: "move",
             from: { x: 0, y: 1, z: 0 },

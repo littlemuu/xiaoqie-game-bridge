@@ -169,7 +169,12 @@ describe("GameBridge safety contract", () => {
     const move = envelope(
       "same-move",
       "game.act",
-      { adapterId: "mock-world", gameAction: "move", input: { dx: 1, dy: 0, dz: 0 } },
+      {
+        adapterId: "mock-world",
+        gameAction: "move",
+        input: { dx: 1, dy: 0, dz: 0 },
+        expectedRevision: 0,
+      },
       { sessionId },
     );
 
@@ -199,7 +204,12 @@ describe("GameBridge safety contract", () => {
     const move = envelope(
       "concurrent-move",
       "game.act",
-      { adapterId: "mock-world", gameAction: "move", input: { dx: 1, dy: 0, dz: 0 } },
+      {
+        adapterId: "mock-world",
+        gameAction: "move",
+        input: { dx: 1, dy: 0, dz: 0 },
+        expectedRevision: 0,
+      },
       { sessionId },
     );
 
@@ -221,7 +231,12 @@ describe("GameBridge safety contract", () => {
       envelope(
         "preview",
         "game.act",
-        { adapterId: "mock-world", gameAction: "move", input: { dx: 1, dy: 0, dz: 0 } },
+      {
+        adapterId: "mock-world",
+        gameAction: "move",
+        input: { dx: 1, dy: 0, dz: 0 },
+        expectedRevision: 0,
+      },
         { sessionId, mode: "dry-run" },
       ),
     );
@@ -234,7 +249,12 @@ describe("GameBridge safety contract", () => {
       envelope(
         "commit",
         "game.act",
-        { adapterId: "mock-world", gameAction: "move", input: { dx: 1, dy: 0, dz: 0 } },
+        {
+          adapterId: "mock-world",
+          gameAction: "move",
+          input: { dx: 1, dy: 0, dz: 0 },
+          expectedRevision: 0,
+        },
         { sessionId },
       ),
     );
@@ -262,7 +282,12 @@ describe("GameBridge safety contract", () => {
         envelope(
           "blocked-move",
           "game.act",
-          { adapterId: "mock-world", gameAction: "move", input: { dx: 1, dy: 0, dz: 0 } },
+        {
+          adapterId: "mock-world",
+          gameAction: "move",
+          input: { dx: 1, dy: 0, dz: 0 },
+          expectedRevision: 0,
+        },
           { sessionId },
         ),
       ),

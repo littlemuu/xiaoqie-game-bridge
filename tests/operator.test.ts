@@ -817,7 +817,9 @@ describe.runIf(process.platform === "win32")("local operator control plane", () 
       expect(await runCli(["status"], isolated.env)).toEqual({
         exitCode: 0,
         stderr: "",
-        stdout: "STATUS stopped=false inFlightWrites=0 maxInFlightWrites=4 generation=0\n",
+        stdout:
+          "STATUS stopped=false inFlightWrites=0 maxInFlightWrites=4 generation=0 " +
+          "runtime=ready adapter=ready audit=ready registeredAdapters=1 auditWrites=0\n",
       });
 
       const opened = await callBridge(
@@ -847,6 +849,7 @@ describe.runIf(process.platform === "win32")("local operator control plane", () 
               adapterId: "mock-world",
               gameAction: "move",
               input: { dx: 1, dy: 0, dz: 0 },
+              expectedRevision: 0,
             },
             { sessionId },
           ),
@@ -874,6 +877,7 @@ describe.runIf(process.platform === "win32")("local operator control plane", () 
               adapterId: "mock-world",
               gameAction: "move",
               input: { dx: 1, dy: 0, dz: 0 },
+              expectedRevision: 0,
             },
             { sessionId, mode: "dry-run" },
           ),
@@ -909,6 +913,7 @@ describe.runIf(process.platform === "win32")("local operator control plane", () 
               adapterId: "mock-world",
               gameAction: "move",
               input: { dx: 1, dy: 0, dz: 0 },
+              expectedRevision: 0,
             },
             { sessionId },
           ),

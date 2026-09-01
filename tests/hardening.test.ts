@@ -14,6 +14,7 @@ import {
   SessionManager,
   deriveSessionOwnerKey,
   type RequestEnvelope,
+  type RequestContext,
 } from "../src/index.js";
 
 const TEST_OWNER = deriveSessionOwnerKey({ transport: "local" });
@@ -36,16 +37,63 @@ const gatedInputSchema = z
     behavior: z.enum(["success", "wait", "known-error", "unknown-error"]),
   })
   .strict();
+const gatedObservationSchema = z
+  .object({
+    commitEntries: z.number().int().nonnegative(),
+    completedWrites: z.number().int().nonnegative(),
+    dryRunCalls: z.number().int().nonnegative(),
+  })
+  .strict();
+const gatedResultSchema = z.union([
+  z.object({ applied: z.literal(false), behavior: gatedInputSchema.shape.behavior }).strict(),
+  z.object({ applied: z.literal(true), completedWrites: z.number().int().positive() }).strict(),
+]);
+
+const gatedGrantProvider = {
+  grant(request: {
+    adapter: GameAdapter;
+    context: RequestContext;
+    requestedCapabilities: readonly string[];
+    requestedTtlMs?: number;
+  }) {
+    if (request.context.transport !== "local" || request.adapter.id !== "gated-world") {
+      return { allowed: false as const };
+    }
+    return {
+      allowed: true as const,
+      capabilities: [...new Set(request.requestedCapabilities)].sort(),
+      scope: { kind: "test-resource" as const, resourceId: "gated-world" },
+      ttlMs: request.requestedTtlMs ?? 1_000,
+      totalActionBudget: 64,
+      perActionBudgets: { gated_write: 64 },
+    };
+  },
+};
 
 class GatedAdapter implements GameAdapter {
   readonly id = "gated-world";
   readonly displayName = "Deterministic gated adapter";
-  readonly observationCapability = "game.observe";
+  readonly observation = {
+    description: "Observe deterministic gated test counters.",
+    outputSchema: gatedObservationSchema,
+    effectKind: "read" as const,
+    concurrency: "parallel" as const,
+    requiredCapabilities: ["game.observe"],
+    maxResultBytes: 4 * 1_024,
+  };
   readonly actions: Readonly<Record<string, AdapterActionDefinition>> = {
     gated_write: {
       description: "A test-only write controlled by a promise gate.",
-      capability: "game.act.gated_write",
       inputSchema: gatedInputSchema,
+      outputSchema: gatedResultSchema,
+      effectKind: "write",
+      dryRunSemantics: "exact",
+      requiredCapabilities: ["game.act.gated_write"],
+      maxResultBytes: 4 * 1_024,
+      writeConcurrency: { kind: "resource-serial", resourceKey: "gated-world" },
+      adapterErrorCodes: ["OUT_OF_BOUNDS"],
+      requiresExpectedRevision: false,
+      reconciliation: "unsupported",
     },
   };
 
@@ -61,6 +109,10 @@ class GatedAdapter implements GameAdapter {
       completedWrites: this.completedWrites,
       dryRunCalls: this.dryRunCalls,
     };
+  }
+
+  async getStateRevision(): Promise<number> {
+    return this.completedWrites;
   }
 
   async execute(
@@ -88,7 +140,7 @@ class GatedAdapter implements GameAdapter {
       await gate.promise;
     }
     if (parsed.behavior === "known-error") {
-      throw new AdapterExecutionError("OUT_OF_BOUNDS", "The gated write was rejected.");
+      throw new AdapterExecutionError("OUT_OF_BOUNDS");
     }
     if (parsed.behavior === "unknown-error") {
       throw new Error("test-only unknown adapter failure");
@@ -162,6 +214,7 @@ function createHarness(
       maxInFlightWrites: options.maxInFlightWrites ?? 2,
     }),
     auditSink: audit,
+    grantProvider: gatedGrantProvider,
     clock: () => now.value,
   });
   return {
@@ -287,6 +340,7 @@ describe("bounded cache and local safety hardening", () => {
       registry,
       sessions,
       auditSink: audit,
+      grantProvider: gatedGrantProvider,
       clock: () => now.value,
     });
 
@@ -503,19 +557,25 @@ describe("bounded cache and local safety hardening", () => {
 
     expectError(
       await handleLocal(harness, writeRequest("known-error", sessionId, "known-error")),
-      "OUT_OF_BOUNDS",
-    );
-    expect(harness.control.getSafetyStatus().inFlightWrites).toBe(0);
-
-    expectError(
-      await handleLocal(harness, writeRequest("unknown-error", sessionId, "unknown-error")),
-      "INTERNAL_ERROR",
+      "ADAPTER_REJECTED",
     );
     expect(harness.control.getSafetyStatus().inFlightWrites).toBe(0);
 
     expect(
-      (await handleLocal(harness, writeRequest("after-errors", sessionId, "success"))).ok,
+      (await handleLocal(harness, writeRequest("after-known-error", sessionId, "success"))).ok,
     ).toBe(true);
+
+    expectError(
+      await handleLocal(harness, writeRequest("unknown-error", sessionId, "unknown-error")),
+      "OUTCOME_UNKNOWN",
+    );
+    expect(harness.control.getSafetyStatus().inFlightWrites).toBe(0);
+    expect(harness.control.getHealthStatus().runtime.status).toBe("faulted");
+
+    expectError(
+      await handleLocal(harness, writeRequest("after-errors", sessionId, "success")),
+      "RUNTIME_UNAVAILABLE",
+    );
     expect(harness.control.getSafetyStatus().inFlightWrites).toBe(0);
   });
 });

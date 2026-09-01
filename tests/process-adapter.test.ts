@@ -234,6 +234,7 @@ describe.runIf(process.platform === "win32")("isolated mock adapter runner", () 
         adapterId: "mock-world",
         gameAction: "move",
         input: { dx: 1, dy: 0, dz: 0 },
+        expectedRevision: 0,
       };
       const preview = await bridge.handle(
         { ...request("preview", "game.act", move, sessionId), mode: "dry-run" },
@@ -285,6 +286,7 @@ describe.runIf(process.platform === "win32")("isolated mock adapter runner", () 
     const adapter = fixtureAdapter("duplicate-id");
     try {
       expect(await adapter.observe()).toEqual({
+        stateRevision: 0,
         player: { x: 0, y: 1, z: 0 },
         nearbyBlocks: [],
       });
@@ -387,7 +389,7 @@ describe.runIf(process.platform === "win32")("isolated mock adapter runner", () 
         request("observe-hostile", "game.observe", { adapterId: "mock-world" }, sessionId),
         local,
       );
-      expectError(response, "INTERNAL_ERROR");
+      expectError(response, "RUNTIME_UNAVAILABLE");
       const serialized = JSON.stringify({ response, audit: audit.events });
       expect(serialized).not.toContain("Bearer-worker-result-secret");
       expect(serialized).not.toContain("authorization");

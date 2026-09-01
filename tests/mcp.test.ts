@@ -10,6 +10,7 @@ import {
   type BridgeResponse,
   GameBridge,
   MockGameAdapter,
+  PACKAGE_VERSION,
   SessionManager,
   errorResponse,
   responseEnvelopeSchema,
@@ -178,6 +179,10 @@ describe("local MCP contract", () => {
     const { client } = await connectInMemory(
       createGameBridgeMcpServer({ bridge: createMockBridge({ sessions }) }),
     );
+    expect(client.getServerVersion()).toEqual({
+      name: "xiaoqie-game-bridge",
+      version: PACKAGE_VERSION,
+    });
 
     const opened = parseBridgeResponse(
       await callBridge(
@@ -257,6 +262,7 @@ describe("local MCP contract", () => {
           adapterId: "mock-world",
           gameAction: "move",
           input: { dx, dy: 0, dz: 0 },
+          expectedRevision: 0,
         },
         { sessionId, mode },
       );
@@ -480,6 +486,7 @@ describe("local MCP contract", () => {
           adapterId: "mock-world",
           gameAction: "move",
           input: { dx: 1, dy: 0, dz: 0 },
+          expectedRevision: 0,
         },
         { sessionId },
       );

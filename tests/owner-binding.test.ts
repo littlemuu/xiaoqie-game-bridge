@@ -55,6 +55,27 @@ class AllowTrustedRemoteAuthorizer implements SessionAuthorizer {
   }
 }
 
+const trustedRemoteGrantProvider = {
+  grant(request: {
+    adapter: GameAdapter;
+    context: RequestContext;
+    requestedCapabilities: readonly string[];
+    requestedTtlMs?: number;
+  }) {
+    if (request.context.transport !== "remote" || request.adapter.id !== "mock-world") {
+      return { allowed: false as const };
+    }
+    return {
+      allowed: true as const,
+      capabilities: [...new Set(request.requestedCapabilities)].sort(),
+      scope: { kind: "test-resource" as const, resourceId: "owner-bound-world" },
+      ttlMs: request.requestedTtlMs ?? 15 * 60 * 1_000,
+      totalActionBudget: 64,
+      perActionBudgets: { move: 64, place_block: 64 },
+    };
+  },
+};
+
 interface Harness {
   audit: MemoryAuditSink;
   authorizer: SessionAuthorizer;
@@ -84,6 +105,7 @@ function createHarness(options: {
       registry,
       auditSink: audit,
       authorizer,
+      grantProvider: trustedRemoteGrantProvider,
       callerTagKey: options.callerTagKey ?? TEST_CALLER_TAG_KEY,
       sessions,
       safetyLatch: new SafetyLatch(),
@@ -151,6 +173,7 @@ function moveRequest(
       adapterId: "mock-world",
       gameAction: "move",
       input: { dx: 1, dy: 0, dz: 0 },
+      expectedRevision: 0,
     },
     { sessionId, mode },
   );
@@ -435,16 +458,33 @@ describe("session owner binding", () => {
 });
 
 const gatedSchema = z.object({ wait: z.boolean() }).strict();
+const ownerObservationSchema = z.object({ entries: z.number().int().nonnegative() }).strict();
+const ownerResultSchema = z.object({ applied: z.boolean() }).strict();
 
 class OwnerGatedAdapter implements GameAdapter {
   readonly id = "mock-world";
   readonly displayName = "Owner binding gated adapter";
-  readonly observationCapability = "game.observe";
+  readonly observation = {
+    description: "Observe the owner-binding test entry count.",
+    outputSchema: ownerObservationSchema,
+    effectKind: "read" as const,
+    concurrency: "parallel" as const,
+    requiredCapabilities: ["game.observe"],
+    maxResultBytes: 1_024,
+  };
   readonly actions: Readonly<Record<string, AdapterActionDefinition>> = {
     move: {
       description: "Test-only owner binding gate.",
-      capability: "game.act.move",
       inputSchema: gatedSchema,
+      outputSchema: ownerResultSchema,
+      effectKind: "write",
+      dryRunSemantics: "exact",
+      requiredCapabilities: ["game.act.move"],
+      maxResultBytes: 1_024,
+      writeConcurrency: { kind: "resource-serial", resourceKey: "owner-world" },
+      adapterErrorCodes: [],
+      requiresExpectedRevision: false,
+      reconciliation: "unsupported",
     },
   };
   entries = 0;
@@ -453,6 +493,10 @@ class OwnerGatedAdapter implements GameAdapter {
 
   async observe(): Promise<unknown> {
     return { entries: this.entries };
+  }
+
+  async getStateRevision(): Promise<number> {
+    return this.entries;
   }
 
   async execute(_action: string, input: unknown, mode: BridgeMode): Promise<unknown> {
