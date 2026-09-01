@@ -17,11 +17,12 @@ function available(command) {
   return spawnSync("where.exe", [command], { stdio: "ignore", windowsHide: true }).status === 0;
 }
 
-function run(command, args) {
+function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
     cwd: root,
     stdio: "inherit",
     windowsHide: true,
+    windowsVerbatimArguments: options.windowsVerbatimArguments ?? false,
   });
   if (result.error || result.status !== 0) process.exit(result.status ?? 1);
 }
@@ -74,7 +75,10 @@ function buildMsvc(output, testBuild, vsDevCmd) {
     return;
   }
   const command = `call ${quoteCmd(vsDevCmd)} -no_logo -arch=x64 >nul && cl.exe ${args.map(quoteCmd).join(" ")}`;
-  run("cmd.exe", ["/d", "/s", "/c", command]);
+  // CMD does not use the C-runtime backslash quoting that Node normally adds.
+  // Keep this fixed command line verbatim so a quoted Visual Studio path with
+  // spaces reaches CALL as ordinary CMD syntax.
+  run("cmd.exe", ["/d", "/c", command], { windowsVerbatimArguments: true });
 }
 
 function buildMingw(output, testBuild) {
