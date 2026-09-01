@@ -42,8 +42,11 @@ export type AdapterRunnerFailure =
   | "worker-exit";
 
 export class AdapterRunnerError extends AdapterRuntimeError {
-  constructor(readonly category: AdapterRunnerFailure) {
-    super("unavailable");
+  constructor(
+    readonly category: AdapterRunnerFailure,
+    dispatch: "not-dispatched" | "dispatched" = "not-dispatched",
+  ) {
+    super("unavailable", dispatch);
     this.name = "AdapterRunnerError";
   }
 }
@@ -91,6 +94,7 @@ interface PendingCall {
   resultSchema: ZodType<unknown>;
   timer: NodeJS.Timeout;
   outcomeUnknownOnFailure: boolean;
+  dispatched: boolean;
 }
 
 const staticAdapter = new MockGameAdapter();
@@ -333,7 +337,7 @@ export class ProcessMockAdapter implements GameAdapter {
         reject(
           outcomeUnknownOnFailure
             ? new AdapterRuntimeError("outcome-unknown")
-            : new AdapterRunnerError("timeout"),
+            : new AdapterRunnerError("timeout", "dispatched"),
         );
         this.#fail("timeout");
       }, this.#options.callTimeoutMs);
@@ -343,6 +347,7 @@ export class ProcessMockAdapter implements GameAdapter {
         resultSchema,
         timer,
         outcomeUnknownOnFailure,
+        dispatched: false,
       });
       try {
         this.#write({
@@ -351,6 +356,7 @@ export class ProcessMockAdapter implements GameAdapter {
           callId,
           ...call,
         });
+        this.#pending.get(callId)!.dispatched = true;
       } catch {
         this.#fail("protocol");
       }
@@ -362,8 +368,7 @@ export class ProcessMockAdapter implements GameAdapter {
     if (child?.stdin === null || child?.stdin === undefined || child.stdin.destroyed) {
       throw new AdapterRunnerError("worker-exit");
     }
-    const accepted = child.stdin.write(encodeAdapterFrame(message));
-    if (!accepted) throw new AdapterRunnerError("capacity");
+    child.stdin.write(encodeAdapterFrame(message));
   }
 
   #consume(chunk: Buffer): void {
@@ -467,9 +472,12 @@ export class ProcessMockAdapter implements GameAdapter {
       const parsedResult = pending.resultSchema.safeParse(message.result);
       if (!parsedResult.success) {
         pending.reject(
-          pending.outcomeUnknownOnFailure
+          pending.outcomeUnknownOnFailure && pending.dispatched
             ? new AdapterRuntimeError("outcome-unknown")
-            : new AdapterRunnerError("protocol"),
+            : new AdapterRunnerError(
+                "protocol",
+                pending.dispatched ? "dispatched" : "not-dispatched",
+              ),
         );
         this.#fail("protocol");
         return;
@@ -479,9 +487,12 @@ export class ProcessMockAdapter implements GameAdapter {
     }
     if (message.error.code === "ADAPTER_FAILURE") {
       pending.reject(
-        pending.outcomeUnknownOnFailure
+        pending.outcomeUnknownOnFailure && pending.dispatched
           ? new AdapterRuntimeError("outcome-unknown")
-          : new AdapterRunnerError("protocol"),
+          : new AdapterRunnerError(
+              "protocol",
+              pending.dispatched ? "dispatched" : "not-dispatched",
+            ),
       );
       return;
     }
@@ -528,9 +539,12 @@ export class ProcessMockAdapter implements GameAdapter {
     for (const pending of this.#pending.values()) {
       clearTimeout(pending.timer);
       pending.reject(
-        pending.outcomeUnknownOnFailure
+        pending.outcomeUnknownOnFailure && pending.dispatched
           ? new AdapterRuntimeError("outcome-unknown")
-          : new AdapterRunnerError(category),
+          : new AdapterRunnerError(
+              category,
+              pending.dispatched ? "dispatched" : "not-dispatched",
+            ),
       );
     }
     this.#pending.clear();

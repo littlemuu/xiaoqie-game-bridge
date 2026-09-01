@@ -19,6 +19,7 @@ import {
   encodeAdapterFrame,
   fixedWorkerLaunchSpec,
   type BridgeResponse,
+  type GameAdapter,
   type RequestEnvelope,
 } from "../src/index.js";
 
@@ -45,6 +46,15 @@ async function category(promise: Promise<unknown>): Promise<string | undefined> 
     return undefined;
   } catch (error) {
     return error instanceof AdapterRunnerError ? error.category : "unexpected";
+  }
+}
+
+async function runnerFailure(promise: Promise<unknown>): Promise<AdapterRunnerError | undefined> {
+  try {
+    await promise;
+    return undefined;
+  } catch (error) {
+    return error instanceof AdapterRunnerError ? error : undefined;
   }
 }
 
@@ -216,6 +226,7 @@ describe.runIf(process.platform === "win32")("isolated mock adapter runner", () 
 
   it("preserves dry-run, one-effect idempotency, safety stop, observe, and close", async () => {
     const adapter = new ProcessMockAdapter();
+    await adapter.start();
     const registry = new AdapterRegistry();
     registry.register(adapter);
     const bridge = new GameBridge({ registry });
@@ -256,6 +267,62 @@ describe.runIf(process.platform === "win32")("isolated mock adapter runner", () 
       expect((await bridge.handle(request("stop", "safety.stop", {}, sessionId), local)).ok).toBe(true);
       expectError(await bridge.handle(request("blocked", "game.act", move, sessionId), local), "SAFETY_STOPPED");
       expect((await bridge.handle(request("close", "session.close", {}, sessionId), local)).ok).toBe(true);
+    } finally {
+      await adapter.close();
+    }
+  });
+
+  it("charges a worker-dispatched revision rejection once and reports adapter-rejected", async () => {
+    const adapter = new ProcessMockAdapter();
+    await adapter.start();
+    await adapter.execute(
+      "move",
+      { dx: 1, dy: 0, dz: 0 },
+      "commit",
+      { expectedRevision: 0 },
+    );
+    const staleRevisionAdapter: GameAdapter = {
+      id: adapter.id,
+      displayName: adapter.displayName,
+      observation: adapter.observation,
+      actions: adapter.actions,
+      observe: adapter.observe.bind(adapter),
+      getStateRevision: async () => 0,
+      execute: adapter.execute.bind(adapter),
+      health: adapter.health.bind(adapter),
+    };
+    const registry = new AdapterRegistry();
+    registry.register(staleRevisionAdapter);
+    const sessions = new SessionManager({ idGenerator: () => "worker-revision-session" });
+    const bridge = new GameBridge({ registry, sessions });
+    const local = { transport: "local" } as const;
+    try {
+      const opened = await bridge.handle(
+        request("open-worker-revision", "session.open", {
+          adapterId: "mock-world",
+          capabilities: ["game.act.move"],
+        }),
+        local,
+      );
+      expect(opened.ok).toBe(true);
+      const sessionId = (opened as { result: { sessionId: string } }).result.sessionId;
+      const operation = request(
+        "stale-at-worker",
+        "game.act",
+        {
+          adapterId: "mock-world",
+          gameAction: "move",
+          input: { dx: 1, dy: 0, dz: 0 },
+          expectedRevision: 0,
+        },
+        sessionId,
+      );
+      const response = await bridge.handle(operation, local);
+      expectError(response, "REVISION_CONFLICT");
+      expect(response.ok ? undefined : response.error.operationPhase).toBe("adapter-rejected");
+      expect(sessions.find(sessionId)).toMatchObject({ actionBudgetRemaining: 127 });
+      expect(await bridge.handle(operation, local)).toEqual(response);
+      expect(sessions.find(sessionId)).toMatchObject({ actionBudgetRemaining: 127 });
     } finally {
       await adapter.close();
     }
@@ -351,18 +418,27 @@ describe.runIf(process.platform === "win32")("isolated mock adapter runner", () 
 
   it("bounds handshake, call time, pending capacity, and close with pending work", async () => {
     const noHandshake = fixtureAdapter("no-handshake", { handshakeTimeoutMs: 500 });
-    expect(await category(noHandshake.start())).toBe("handshake");
+    expect(await runnerFailure(noHandshake.start())).toMatchObject({
+      category: "handshake",
+      dispatch: "not-dispatched",
+    });
     await noHandshake.close();
 
     const timeout = fixtureAdapter("hang", { callTimeoutMs: 20 });
-    expect(await category(timeout.observe())).toBe("timeout");
+    expect(await runnerFailure(timeout.observe())).toMatchObject({
+      category: "timeout",
+      dispatch: "dispatched",
+    });
     expect(timeout.pendingCalls).toBe(0);
     await timeout.close();
 
     const bounded = fixtureAdapter("hang", { callTimeoutMs: 5_000, maxPendingCalls: 1 });
     const pendingCategory = category(bounded.observe());
     await new Promise((resolve) => setImmediate(resolve));
-    expect(await category(bounded.observe())).toBe("capacity");
+    expect(await runnerFailure(bounded.observe())).toMatchObject({
+      category: "capacity",
+      dispatch: "not-dispatched",
+    });
     await bounded.close();
     expect(await pendingCategory).toBe("closed");
     expect(bounded.pendingCalls).toBe(0);
@@ -370,6 +446,7 @@ describe.runIf(process.platform === "win32")("isolated mock adapter runner", () 
 
   it("keeps credential-shaped success output out of bridge responses and audit", async () => {
     const adapter = fixtureAdapter("credential-result");
+    await adapter.start();
     const registry = new AdapterRegistry();
     registry.register(adapter);
     const audit = new MemoryAuditSink();

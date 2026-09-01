@@ -8,23 +8,34 @@ const MANIFEST_NAME_PATTERN = /^[a-z][a-z0-9_.-]{0,127}$/u;
 
 export type AdapterEffectKind = "read" | "preview" | "write";
 export type AdapterDryRunSemantics = "exact" | "best-effort" | "unsupported";
+export type AdapterObservationConcurrency =
+  | Readonly<{ kind: "parallel" }>
+  | Readonly<{ kind: "serial" }>
+  | Readonly<{ kind: "resource-serial"; resourceKey: string }>;
 export type AdapterWriteConcurrency =
   | Readonly<{ kind: "none" }>
   | Readonly<{ kind: "resource-serial"; resourceKey: string }>;
 
+export interface AdapterSchema {
+  readonly jsonSchema?: unknown;
+  safeParse(value: unknown):
+    | Readonly<{ success: true; data: unknown }>
+    | Readonly<{ success: false }>;
+}
+
 export interface AdapterObservationDefinition {
   description: string;
-  outputSchema: z.ZodType<unknown>;
+  outputSchema: z.ZodType<unknown> | AdapterSchema;
   effectKind: "read";
-  concurrency: "parallel";
+  concurrency: AdapterObservationConcurrency;
   requiredCapabilities: readonly string[];
   maxResultBytes: number;
 }
 
 export interface AdapterActionDefinition {
   description: string;
-  inputSchema: z.ZodType<unknown>;
-  outputSchema: z.ZodType<unknown>;
+  inputSchema: z.ZodType<unknown> | AdapterSchema;
+  outputSchema: z.ZodType<unknown> | AdapterSchema;
   effectKind: AdapterEffectKind;
   dryRunSemantics: AdapterDryRunSemantics;
   requiredCapabilities: readonly string[];
@@ -56,7 +67,7 @@ export interface AdapterDescription {
     description: string;
     outputSchema: unknown;
     effectKind: "read";
-    concurrency: "parallel";
+    concurrency: AdapterObservationConcurrency;
     requiredCapabilities: readonly string[];
     maxResultBytes: number;
   };
@@ -73,8 +84,8 @@ export interface GameAdapter {
   readonly observation: AdapterObservationDefinition;
   readonly actions: Readonly<Record<string, AdapterActionDefinition>>;
   observe(): Promise<unknown>;
-  getStateRevision(): Promise<number>;
-  execute(
+  getStateRevision?(): Promise<number>;
+  execute?(
     action: string,
     input: unknown,
     mode: BridgeMode,
@@ -94,7 +105,11 @@ export class AdapterExecutionError extends Error {
 }
 
 export class AdapterRuntimeError extends Error {
-  constructor(readonly kind: "unavailable" | "outcome-unknown") {
+  constructor(
+    readonly kind: "unavailable" | "outcome-unknown",
+    readonly dispatch: "not-dispatched" | "dispatched" =
+      kind === "outcome-unknown" ? "dispatched" : "not-dispatched",
+  ) {
     super("The adapter runtime could not confirm the operation result.");
     this.name = "AdapterRuntimeError";
   }
@@ -143,132 +158,83 @@ function stringSet(value: unknown, label: string, pattern = MANIFEST_NAME_PATTER
   return Object.freeze([...values].sort());
 }
 
-function warmSchemaGraph(value: object, seen = new WeakSet<object>()): void {
-  if (seen.has(value)) return;
-  seen.add(value);
-  if (value instanceof z.ZodType) {
-    try {
-      value.safeParse(undefined);
-    } catch {
-      // A custom refinement may throw for the deliberately invalid warm-up
-      // value; the schema remains eligible if JSON Schema conversion succeeds.
+const CODE_BEARING_SCHEMA_TYPES = new Set([
+  "catch",
+  "custom",
+  "default",
+  "function",
+  "lazy",
+  "pipe",
+  "prefault",
+  "promise",
+  "transform",
+]);
+
+function rejectCodeBearingSchema(value: object, label: string): void {
+  const seen = new WeakSet<object>();
+  const visit = (candidate: unknown): void => {
+    if (candidate === null || typeof candidate !== "object" || seen.has(candidate)) return;
+    seen.add(candidate);
+    const internal = candidate as { _zod?: { def?: unknown } };
+    const definition = internal._zod?.def;
+    if (definition !== null && typeof definition === "object") {
+      const descriptor = definition as { type?: unknown; check?: unknown };
+      if (
+        (typeof descriptor.type === "string" &&
+          CODE_BEARING_SCHEMA_TYPES.has(descriptor.type)) ||
+        descriptor.check === "custom"
+      ) {
+        throw new TypeError(`${label} must use the declarative schema subset.`);
+      }
     }
-  }
-  for (const descriptor of Object.values(Object.getOwnPropertyDescriptors(value))) {
-    if (
-      "value" in descriptor &&
-      descriptor.value !== null &&
-      typeof descriptor.value === "object"
-    ) {
-      warmSchemaGraph(descriptor.value, seen);
+    for (const property of Object.values(Object.getOwnPropertyDescriptors(candidate))) {
+      if ("value" in property) visit(property.value);
     }
-  }
+  };
+  visit(value);
 }
 
-function deepFreezeSchemaGraph<T extends object>(value: T, seen = new WeakSet<object>()): T {
-  if (seen.has(value)) return value;
-  seen.add(value);
-  // RegExp.lastIndex is intentionally writable and Zod resets it before each
-  // pattern check. Sealing preserves the immutable source/flags contract while
-  // leaving that required engine cursor writable.
-  if (value instanceof RegExp) return Object.seal(value);
-  for (const descriptor of Object.values(Object.getOwnPropertyDescriptors(value))) {
-    if (
-      "value" in descriptor &&
-      descriptor.value !== null &&
-      typeof descriptor.value === "object"
-    ) {
-      deepFreezeSchemaGraph(descriptor.value, seen);
-    }
-  }
+function deepFreezeJson(value: unknown): unknown {
+  if (value === null || typeof value !== "object") return value;
+  for (const child of Object.values(value as Record<string, unknown>)) deepFreezeJson(child);
   return Object.freeze(value);
 }
 
-function cloneSchemaValue(value: unknown, seen = new Map<object, unknown>()): unknown {
-  if (value === null || (typeof value !== "object" && typeof value !== "function")) {
-    return value;
-  }
-  if (typeof value === "function") return value;
-  const existing = seen.get(value);
-  if (existing !== undefined) return existing;
-  if (value instanceof RegExp) {
-    const cloned = new RegExp(value.source, value.flags);
-    cloned.lastIndex = value.lastIndex;
-    seen.set(value, cloned);
-    return cloned;
-  }
-  if (Array.isArray(value)) {
-    const cloned: unknown[] = [];
-    seen.set(value, cloned);
-    for (const entry of value) cloned.push(cloneSchemaValue(entry, seen));
-    return cloned;
-  }
-  if (value instanceof Map) {
-    const cloned = new Map<unknown, unknown>();
-    seen.set(value, cloned);
-    for (const [key, entry] of value) {
-      cloned.set(cloneSchemaValue(key, seen), cloneSchemaValue(entry, seen));
-    }
-    return cloned;
-  }
-  if (value instanceof Set) {
-    const cloned = new Set<unknown>();
-    seen.set(value, cloned);
-    for (const entry of value) cloned.add(cloneSchemaValue(entry, seen));
-    return cloned;
-  }
-  if (value instanceof z.ZodType) {
-    const clonedDefinition = cloneSchemaValue(value._def, seen);
-    const cloned = value.clone(clonedDefinition as never);
-    seen.set(value, cloned);
-    return cloned;
-  }
-  const zodInternal = value as {
-    _zod?: { def?: unknown };
-    clone?: (definition: unknown) => unknown;
-  };
-  if (
-    zodInternal._zod !== undefined &&
-    zodInternal._zod.def !== undefined &&
-    typeof zodInternal.clone === "function"
-  ) {
-    const clonedDefinition = cloneSchemaValue(zodInternal._zod.def, seen);
-    const cloned = zodInternal.clone(clonedDefinition);
-    seen.set(value, cloned);
-    return cloned;
-  }
-  const cloned = Object.create(Object.getPrototypeOf(value)) as object;
-  seen.set(value, cloned);
-  for (const key of Reflect.ownKeys(value)) {
-    const descriptor = Object.getOwnPropertyDescriptor(value, key)!;
-    Object.defineProperty(
-      cloned,
-      key,
-      "value" in descriptor
-        ? { ...descriptor, value: cloneSchemaValue(descriptor.value, seen) }
-        : descriptor,
-    );
-  }
-  return cloned;
-}
-
-function schemaSnapshot(value: unknown, label: string): z.ZodType<unknown> {
+function schemaSnapshot(value: unknown, label: string): AdapterSchema {
   if (!(value instanceof z.ZodType)) {
     throw new TypeError(`${label} must be a Zod schema.`);
   }
-  let snapshot: z.ZodType<unknown>;
   try {
-    snapshot = cloneSchemaValue(value) as z.ZodType<unknown>;
-    JSON.stringify(z.toJSONSchema(snapshot));
-    // Install Zod's lazy parsing methods throughout the graph before sealing.
-    // The definition graph is independently cloned, so none of its nested
-    // mutable objects are shared with adapter-owned schemas and refinements are
-    // preserved rather than approximated through JSON Schema round-tripping.
-    warmSchemaGraph(snapshot);
-  } catch {
-    throw new TypeError(`${label} cannot be represented as JSON Schema.`);
+    rejectCodeBearingSchema(value, label);
+    const jsonSchema = deepFreezeJson(
+      JSON.parse(JSON.stringify(z.toJSONSchema(value))) as unknown,
+    );
+    const validator = z.fromJSONSchema(
+      structuredClone(jsonSchema) as Parameters<typeof z.fromJSONSchema>[0],
+    );
+    return Object.freeze({
+      jsonSchema,
+      safeParse: (candidate: unknown) => {
+        const result = validator.safeParse(candidate);
+        return result.success
+          ? Object.freeze({ success: true as const, data: result.data })
+          : Object.freeze({ success: false as const });
+      },
+    });
+  } catch (error) {
+    if (error instanceof TypeError && /declarative schema subset/u.test(error.message)) {
+      throw error;
+    }
+    throw new TypeError(`${label} cannot be represented as declarative JSON Schema.`);
   }
-  return deepFreezeSchemaGraph(snapshot);
+}
+
+function schemaJson(schema: z.ZodType<unknown> | AdapterSchema): unknown {
+  if (schema instanceof z.ZodType) return z.toJSONSchema(schema);
+  if (schema.jsonSchema === undefined) {
+    throw new TypeError("Registered adapter schema has no JSON representation.");
+  }
+  return schema.jsonSchema;
 }
 
 function snapshotObservation(value: unknown): AdapterObservationDefinition {
@@ -278,14 +244,12 @@ function snapshotObservation(value: unknown): AdapterObservationDefinition {
   if (ownData(value, "effectKind") !== "read") {
     throw new TypeError("Adapter observation effect kind must be read.");
   }
-  if (ownData(value, "concurrency") !== "parallel") {
-    throw new TypeError("Adapter observation concurrency must be parallel.");
-  }
+  const concurrency = snapshotObservationConcurrency(ownData(value, "concurrency"));
   return Object.freeze({
     description: manifestString(ownData(value, "description"), "observation description"),
     outputSchema: schemaSnapshot(ownData(value, "outputSchema"), "observation outputSchema"),
     effectKind: "read",
-    concurrency: "parallel",
+    concurrency,
     requiredCapabilities: stringSet(
       ownData(value, "requiredCapabilities"),
       "observation requiredCapabilities",
@@ -295,6 +259,25 @@ function snapshotObservation(value: unknown): AdapterObservationDefinition {
       "observation maxResultBytes",
     ),
   });
+}
+
+function snapshotObservationConcurrency(value: unknown): AdapterObservationConcurrency {
+  if (value === null || typeof value !== "object") {
+    throw new TypeError("Adapter observation concurrency contract is invalid.");
+  }
+  const kind = ownData(value, "kind");
+  if (kind === "parallel" || kind === "serial") return Object.freeze({ kind });
+  if (kind === "resource-serial") {
+    return Object.freeze({
+      kind,
+      resourceKey: manifestString(
+        ownData(value, "resourceKey"),
+        "observation concurrency resourceKey",
+        MANIFEST_NAME_PATTERN,
+      ),
+    });
+  }
+  throw new TypeError("Adapter observation concurrency kind is invalid.");
 }
 
 function snapshotConcurrency(value: unknown): AdapterWriteConcurrency {
@@ -387,8 +370,8 @@ export function snapshotAdapter(adapter: GameAdapter): GameAdapter {
     throw new TypeError("Adapter actions must be a plain record.");
   }
   const actionEntries = Object.entries(actionsValue as Record<string, unknown>);
-  if (actionEntries.length < 1 || actionEntries.length > 64) {
-    throw new TypeError("Adapter actions must be a non-empty bounded record.");
+  if (actionEntries.length > 64) {
+    throw new TypeError("Adapter actions must be a bounded record.");
   }
   const actions = Object.freeze(
     Object.fromEntries(
@@ -403,12 +386,17 @@ export function snapshotAdapter(adapter: GameAdapter): GameAdapter {
         .sort(([left], [right]) => left.localeCompare(right)),
     ),
   );
-  if (
-    typeof adapter.observe !== "function" ||
-    typeof adapter.getStateRevision !== "function" ||
-    typeof adapter.execute !== "function"
-  ) {
-    throw new TypeError("Adapter execution methods are invalid.");
+  if (typeof adapter.observe !== "function") {
+    throw new TypeError("Adapter observation method is invalid.");
+  }
+  const requiresRevision = Object.values(actions).some(
+    (definition) => definition.requiresExpectedRevision,
+  );
+  if (actionEntries.length > 0 && typeof adapter.execute !== "function") {
+    throw new TypeError("Adapter action execution method is required when actions exist.");
+  }
+  if (requiresRevision && typeof adapter.getStateRevision !== "function") {
+    throw new TypeError("Adapter revision provider is required by a write action.");
   }
   return Object.freeze({
     id,
@@ -416,8 +404,10 @@ export function snapshotAdapter(adapter: GameAdapter): GameAdapter {
     observation: snapshotObservation(ownData(adapter, "observation")),
     actions,
     observe: adapter.observe.bind(adapter),
-    getStateRevision: adapter.getStateRevision.bind(adapter),
-    execute: adapter.execute.bind(adapter),
+    ...(typeof adapter.getStateRevision === "function"
+      ? { getStateRevision: adapter.getStateRevision.bind(adapter) }
+      : {}),
+    ...(typeof adapter.execute === "function" ? { execute: adapter.execute.bind(adapter) } : {}),
     ...(typeof adapter.health === "function" ? { health: adapter.health.bind(adapter) } : {}),
   });
 }
@@ -428,7 +418,7 @@ export function describeAdapter(adapter: GameAdapter): AdapterDescription {
     displayName: adapter.displayName,
     observation: {
       description: adapter.observation.description,
-      outputSchema: z.toJSONSchema(adapter.observation.outputSchema),
+      outputSchema: schemaJson(adapter.observation.outputSchema),
       effectKind: adapter.observation.effectKind,
       concurrency: adapter.observation.concurrency,
       requiredCapabilities: adapter.observation.requiredCapabilities,
@@ -439,8 +429,8 @@ export function describeAdapter(adapter: GameAdapter): AdapterDescription {
         name,
         {
           description: definition.description,
-          inputSchema: z.toJSONSchema(definition.inputSchema),
-          outputSchema: z.toJSONSchema(definition.outputSchema),
+          inputSchema: schemaJson(definition.inputSchema),
+          outputSchema: schemaJson(definition.outputSchema),
           effectKind: definition.effectKind,
           dryRunSemantics: definition.dryRunSemantics,
           requiredCapabilities: definition.requiredCapabilities,

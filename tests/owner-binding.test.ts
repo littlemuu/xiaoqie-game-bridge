@@ -468,7 +468,7 @@ class OwnerGatedAdapter implements GameAdapter {
     description: "Observe the owner-binding test entry count.",
     outputSchema: ownerObservationSchema,
     effectKind: "read" as const,
-    concurrency: "parallel" as const,
+    concurrency: { kind: "parallel" as const },
     requiredCapabilities: ["game.observe"],
     maxResultBytes: 1_024,
   };

@@ -42,8 +42,10 @@ export async function createProductRuntime(): Promise<ProductRuntime> {
     close: () => {
       closePromise ??= (async () => {
         bridge.beginQuiescing();
-        await audit.close();
+        await bridge.waitForStateChangesIdle();
         await adapter.close();
+        await control.waitForAuditIdle();
+        await audit.close();
       })();
       return closePromise;
     },

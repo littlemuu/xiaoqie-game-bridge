@@ -137,6 +137,13 @@ later replacement of actions, schemas, capability arrays, or metadata cannot
 change the active permission surface. A session binds to one adapter, so a
 granted capability cannot be redirected to another adapter.
 
+Schemas are restricted to the declarative Zod subset that round-trips through
+JSON Schema. Refinements, transforms, codecs, lazy/function schemas, defaults,
+and other code-bearing nodes are rejected. Registration deep-freezes the JSON
+snapshot, rebuilds the active validator from an isolated clone, and exposes
+only a frozen `safeParse` wrapper; neither source closures nor validator
+internals remain mutable through the registered manifest.
+
 The mock adapter is a proof of this boundary, not a placeholder shell: it has a
 deterministic state, validates movement and block placement, previews changes
 without mutation, and applies authorized commits in memory only.
@@ -152,13 +159,16 @@ mock observation 与 dry-run preview 返回当前 `stateRevision`。声明
 `requiresExpectedRevision` 的 commit 必须提供 `expectedRevision`；core 在持有
 同资源单写 permit 与全局 safety write permit 时读取并比较 revision，只有匹配
 才预留一次动作预算并 dispatch。成功写只递增一次；dry-run、stale/future
-revision、容量拒绝和幂等重放不递增。adapter 明确拒绝和 dispatch 后结果未知
-已经消耗一次 attempt 预算，因为 adapter 已经被调用。
+revision、容量拒绝和幂等重放不递增。预算先预留；adapter 明确报告
+`not-dispatched` 时回滚，明确拒绝和 dispatch 后结果未知则消耗一次 attempt。
+因此 worker 侧 revision conflict 计费一次，而 core 自己发现的 stale revision
+仍是零计费。
 
-observation contract 固定标注 `effectKind: read` 与 `concurrency: parallel`；
-preview action 则通过 `effectKind` 和 `writeConcurrency: none` 明确不进入写锁。
-当前 mock 的 read/preview 可以并发，但不得修改 world。未来真实 adapter 若无法
-提供这一读取语义，必须在独立工单收窄 contract，不能隐式复用本声明。
+observation contract 固定标注 `effectKind: read`，并显式选择 `parallel`、
+`serial` 或 `resource-serial`；preview action 则通过 `effectKind` 和
+`writeConcurrency: none` 明确不进入写锁。纯只读 adapter 可以拥有零个 action，
+此时不要求 `execute` 或 revision provider。只有声明 revision-required action 时
+才要求 `getStateRevision`。当前 mock 的 read/preview 可以并发且不得修改 world。
 
 ## Adapter process lifecycle
 
@@ -446,9 +456,10 @@ creates the durable ledger before returning a bridge/control object. The stdio
 entrypoint then starts `LocalOperatorServer` before calling `serveStdio`; any
 ledger, runtime-directory, descriptor, or listener failure writes one fixed
 stderr category and returns without accepting MCP. Shutdown first marks bridge
-health `quiescing`, starts closing MCP, then closes operator
-connections/listener, ledger, and adapter
-with bounded waits, and finally waits briefly for MCP transport completion. A
+health `quiescing`; this refuses new session opens and commit writes while
+retaining stop, close, and read admission. It then waits for every admitted
+state change and its critical audit write to settle before closing the adapter
+and durable ledger, with bounded outer transport shutdown. A
 process-exit fallback performs the same identity-checked descriptor cleanup
 synchronously.
 

@@ -87,6 +87,8 @@ type ContractBehavior =
   | "success"
   | "wait"
   | "explicit-reject"
+  | "revision-reject"
+  | "pre-dispatch-unavailable"
   | "invalid-output"
   | "oversized-output"
   | "outcome-unknown";
@@ -110,7 +112,7 @@ class ContractTestAdapter implements GameAdapter {
       description: "Observe the test revision without external state.",
       outputSchema: contractObservationSchema,
       effectKind: "read",
-      concurrency: "parallel",
+      concurrency: { kind: "parallel" },
       requiredCapabilities: ["game.observe"],
       maxResultBytes: 128,
     };
@@ -148,6 +150,12 @@ class ContractTestAdapter implements GameAdapter {
     this.entered.resolve();
     if (this.behavior === "wait") await this.release.promise;
     if (this.behavior === "explicit-reject") throw new AdapterExecutionError("DENIED");
+    if (this.behavior === "revision-reject") {
+      throw new AdapterExecutionError("REVISION_CONFLICT");
+    }
+    if (this.behavior === "pre-dispatch-unavailable") {
+      throw new AdapterRuntimeError("unavailable", "not-dispatched");
+    }
     if (this.behavior === "outcome-unknown") {
       throw new AdapterRuntimeError("outcome-unknown");
     }
@@ -165,6 +173,52 @@ class ContractTestAdapter implements GameAdapter {
     return this.healthState;
   }
 }
+
+class ReadOnlySerialAdapter implements GameAdapter {
+  readonly id = "read-only-test";
+  readonly displayName = "Pure read-only serial adapter";
+  readonly observation: AdapterObservationDefinition = {
+    description: "Observe one read-only value.",
+    outputSchema: z.object({ value: z.number().int() }).strict(),
+    effectKind: "read",
+    concurrency: { kind: "serial" },
+    requiredCapabilities: ["game.observe"],
+    maxResultBytes: 128,
+  };
+  readonly actions = {};
+  readonly entered = deferred();
+  readonly release = deferred();
+
+  async observe(): Promise<unknown> {
+    this.entered.resolve();
+    await this.release.promise;
+    return { value: 1 };
+  }
+}
+
+const readOnlyGrantProvider = {
+  grant(grantRequest: {
+    adapter: GameAdapter;
+    context: RequestContext;
+    requestedCapabilities: readonly string[];
+    requestedTtlMs?: number;
+  }) {
+    if (
+      grantRequest.context.transport !== "local" ||
+      grantRequest.adapter.id !== "read-only-test"
+    ) {
+      return { allowed: false as const };
+    }
+    return {
+      allowed: true as const,
+      capabilities: [...new Set(grantRequest.requestedCapabilities)].sort(),
+      scope: { kind: "test-resource" as const, resourceId: "read-only-world" },
+      ttlMs: grantRequest.requestedTtlMs ?? 60_000,
+      totalActionBudget: 0,
+      perActionBudgets: {},
+    };
+  },
+};
 
 function testGrantProvider(options: { total?: number; perAction?: number } = {}) {
   return {
@@ -257,6 +311,28 @@ class ToggleAuditSink implements AuditSink {
   }
 }
 
+class GatedStateChangeAuditSink implements AuditSink {
+  readonly events: AuditEvent[] = [];
+  readonly writeAuditEntered = deferred();
+  readonly releaseWriteAudit = deferred();
+
+  async write(event: AuditEvent): Promise<void> {
+    if (event.action === "game.act") {
+      this.writeAuditEntered.resolve();
+      await this.releaseWriteAudit.promise;
+    }
+    this.events.push(event);
+  }
+
+  isWritable(): boolean {
+    return true;
+  }
+
+  health(): Readonly<{ status: "ready"; outstandingWrites: number }> {
+    return Object.freeze({ status: "ready", outstandingWrites: 0 });
+  }
+}
+
 describe("Adapter Contract v2", () => {
   it("snapshots and serializes a closed adapter manifest at registration", () => {
     const adapter = new ContractTestAdapter();
@@ -303,11 +379,26 @@ describe("Adapter Contract v2", () => {
     });
     expect(description.observation).toMatchObject({
       effectKind: "read",
-      concurrency: "parallel",
+      concurrency: { kind: "parallel" },
     });
     const serialized = JSON.stringify(description);
     expect(serialized).not.toContain("_def");
     expect(serialized).not.toContain("safeParse");
+
+    const registeredInput = registered.actions.write!.inputSchema as {
+      readonly jsonSchema?: unknown;
+      safeParse(value: unknown): { success: boolean };
+    };
+    expect(Object.isFrozen(registeredInput)).toBe(true);
+    expect(Object.keys(registeredInput).sort()).toEqual(["jsonSchema", "safeParse"]);
+    expect(Object.isFrozen(registeredInput.jsonSchema)).toBe(true);
+    const registeredJson = registeredInput.jsonSchema as { properties?: unknown };
+    expect(Object.isFrozen(registeredJson.properties)).toBe(true);
+    expect(Reflect.set(registeredJson, "additionalProperties", true)).toBe(false);
+    expect(
+      Reflect.set(registeredInput, "safeParse", () => ({ success: true })),
+    ).toBe(false);
+    expect(registeredInput.safeParse({ nested: { unexpected: true } }).success).toBe(false);
 
     const mockRegistry = new AdapterRegistry();
     mockRegistry.register(new MockGameAdapter());
@@ -322,7 +413,70 @@ describe("Adapter Contract v2", () => {
       ...invalid.actions.write!,
       inputSchema: z.string().transform((value) => value.length),
     };
-    expect(() => new AdapterRegistry().register(invalid)).toThrow(/JSON Schema/u);
+    expect(() => new AdapterRegistry().register(invalid)).toThrow(/declarative/u);
+
+    let refinementAllows = false;
+    const closureBacked = new ContractTestAdapter();
+    (closureBacked.actions as Record<string, AdapterActionDefinition>).write = {
+      ...closureBacked.actions.write!,
+      inputSchema: z.object({ value: z.string() }).refine(() => refinementAllows),
+    };
+    expect(() => new AdapterRegistry().register(closureBacked)).toThrow(/declarative/u);
+    refinementAllows = true;
+  });
+
+  it("registers a zero-action adapter without a revision provider and enforces serial reads", async () => {
+    const adapter = new ReadOnlySerialAdapter();
+    const registry = new AdapterRegistry();
+    registry.register(adapter);
+    expect(describeAdapter(registry.get(adapter.id)!)).toMatchObject({
+      observation: { concurrency: { kind: "serial" } },
+      actions: {},
+    });
+
+    const actionSource = new ContractTestAdapter();
+    const noRevisionActionAdapter: GameAdapter = {
+      id: "no-revision-action",
+      displayName: "Action adapter without revision admission",
+      observation: actionSource.observation,
+      actions: actionSource.actions,
+      observe: actionSource.observe.bind(actionSource),
+      execute: actionSource.execute.bind(actionSource),
+    };
+    expect(() => new AdapterRegistry().register(noRevisionActionAdapter)).not.toThrow();
+    const revisionRequiredAdapter: GameAdapter = {
+      ...noRevisionActionAdapter,
+      id: "revision-required-action",
+      actions: {
+        write: {
+          ...actionSource.actions.write!,
+          requiresExpectedRevision: true,
+        },
+      },
+    };
+    expect(() => new AdapterRegistry().register(revisionRequiredAdapter)).toThrow(
+      /revision provider/u,
+    );
+
+    const bridge = new GameBridge({
+      registry,
+      sessions: new SessionManager({ idGenerator: () => "read-only-session" }),
+      grantProvider: readOnlyGrantProvider,
+    });
+    const sessionId = await open(bridge, adapter.id, ["game.observe"]);
+    const first = bridge.handle(
+      request("read-first", "game.observe", { adapterId: adapter.id }, { sessionId }),
+      local,
+    );
+    await adapter.entered.promise;
+    const second = await bridge.handle(
+      request("read-second", "game.observe", { adapterId: adapter.id }, { sessionId }),
+      local,
+    );
+    expectError(second, "RESOURCE_CAPACITY");
+    expect(second.ok ? undefined : second.error.operationPhase).toBe("pre-dispatch");
+    adapter.release.resolve();
+    expect(await first).toMatchObject({ ok: true, result: { value: 1 } });
   });
 
   it("uses the trusted mock profile instead of treating requested capabilities as grants", async () => {
@@ -482,6 +636,59 @@ describe("Adapter Contract v2", () => {
     expect(adapter.entries).toBe(1);
   });
 
+  it("rolls back undispatched reservations and charges worker-side rejections once", async () => {
+    const unavailable = new ContractTestAdapter("pre-dispatch-unavailable");
+    const unavailableHarness = contractHarness(unavailable, {
+      totalBudget: 1,
+      perActionBudget: 1,
+    });
+    const unavailableSession = await open(
+      unavailableHarness.bridge,
+      unavailable.id,
+      ["game.act.write"],
+    );
+    const unavailableRequest = writeRequest("runtime-not-started", unavailableSession);
+    const unavailableResponse = await unavailableHarness.bridge.handle(
+      unavailableRequest,
+      local,
+    );
+    expectError(unavailableResponse, "RUNTIME_UNAVAILABLE");
+    expect(unavailableResponse.ok ? undefined : unavailableResponse.error.operationPhase).toBe(
+      "pre-dispatch",
+    );
+    expect(unavailableHarness.sessions.find(unavailableSession)).toMatchObject({
+      actionBudgetRemaining: 1,
+    });
+    expect(await unavailableHarness.bridge.handle(unavailableRequest, local)).toEqual(
+      unavailableResponse,
+    );
+    expect(unavailable.entries).toBe(1);
+
+    const revisionRejected = new ContractTestAdapter("revision-reject");
+    const rejectedHarness = contractHarness(revisionRejected, {
+      totalBudget: 1,
+      perActionBudget: 1,
+    });
+    const rejectedSession = await open(
+      rejectedHarness.bridge,
+      revisionRejected.id,
+      ["game.act.write"],
+    );
+    const rejectedRequest = writeRequest("worker-revision-conflict", rejectedSession);
+    const rejectedResponse = await rejectedHarness.bridge.handle(rejectedRequest, local);
+    expectError(rejectedResponse, "REVISION_CONFLICT");
+    expect(rejectedResponse.ok ? undefined : rejectedResponse.error.operationPhase).toBe(
+      "adapter-rejected",
+    );
+    expect(rejectedHarness.sessions.find(rejectedSession)).toMatchObject({
+      actionBudgetRemaining: 0,
+    });
+    expect(await rejectedHarness.bridge.handle(rejectedRequest, local)).toEqual(
+      rejectedResponse,
+    );
+    expect(revisionRejected.entries).toBe(1);
+  });
+
   it("fails closed on invalid or oversized adapter results without leaking values", async () => {
     for (const [behavior, expectedCode, maxResultBytes] of [
       ["invalid-output", "ADAPTER_OUTPUT_INVALID", 128],
@@ -568,6 +775,54 @@ describe("Adapter Contract v2", () => {
       "RUNTIME_UNAVAILABLE",
     );
     expect(quiescingAdapter.entries).toBe(0);
+  });
+
+  it("blocks new state-change admission while quiescing and drains write audit completion", async () => {
+    const adapter = new ContractTestAdapter("wait");
+    const audit = new GatedStateChangeAuditSink();
+    const { bridge } = contractHarness(adapter, { auditSink: audit });
+    const sessionId = await open(bridge, adapter.id, ["game.observe", "game.act.write"]);
+    const write = bridge.handle(writeRequest("drained-write", sessionId), local);
+    await adapter.entered.promise;
+
+    bridge.beginQuiescing();
+    const refusedOpen = await bridge.handle(
+      request("open-during-quiesce", "session.open", {
+        adapterId: adapter.id,
+        capabilities: ["game.observe"],
+      }),
+      local,
+    );
+    expectError(refusedOpen, "RUNTIME_UNAVAILABLE");
+    expect(refusedOpen.ok ? undefined : refusedOpen.error.operationPhase).toBe("pre-dispatch");
+    expect(
+      await bridge.handle(
+        request("observe-during-quiesce", "game.observe", { adapterId: adapter.id }, { sessionId }),
+        local,
+      ),
+    ).toMatchObject({ ok: true, result: { stateRevision: 0 } });
+
+    const idle = bridge.waitForStateChangesIdle();
+    let idleSettled = false;
+    void idle.then(() => {
+      idleSettled = true;
+    });
+    await Promise.resolve();
+    expect(idleSettled).toBe(false);
+    adapter.release.resolve();
+    await audit.writeAuditEntered.promise;
+    await Promise.resolve();
+    expect(idleSettled).toBe(false);
+    audit.releaseWriteAudit.resolve();
+    expect(await write).toMatchObject({ ok: true });
+    await idle;
+    expect(idleSettled).toBe(true);
+    expect(
+      await bridge.handle(
+        request("close-during-quiesce", "session.close", {}, { sessionId }),
+        local,
+      ),
+    ).toMatchObject({ ok: true, result: { closed: true } });
   });
 
   it("caches outcome-unknown without retrying and blocks later commits", async () => {

@@ -121,11 +121,12 @@ commit-write limits. Session open sweeps eligible terminal state before a
 stable capacity refusal. Request capacity never evicts in-flight or completed
 commit evidence; new requests are refused before adapter execution.
 
-Adapter Contract v2 不从这些容量上限推导安全并发。mock observation contract
-显式声明可并行只读，preview action 不取得 write permit；两者都不能修改 world。
-commit write 在现有全局 safety gate 内取得 adapter/scope/resource 单写 permit。
-未来真实 adapter 必须用实际证据声明自己的读取与写入语义，不能隐式继承 mock
-的并发结论。
+Adapter Contract v2 不从这些容量上限推导安全并发。每个 observation 显式声明
+`parallel`、`serial` 或 `resource-serial`；后两者使用无等待队列 permit。
+preview action 不取得 write permit；read/preview 都不能修改 world。纯只读 adapter
+可声明零个 action 且无需 revision provider。commit write 在现有全局 safety gate
+内取得 adapter/scope/resource 单写 permit。未来真实 adapter 必须用实际证据声明
+自己的读取与写入语义，不能隐式继承 mock 的并发结论。
 
 The stdio transport has an explicit 64 KiB read-buffer ceiling. The tool handler
 independently measures deterministic UTF-8 envelope bytes and refuses more than
@@ -137,7 +138,8 @@ per-principal and per-action rate limits.
 session 还具有总 commit-attempt 与 per-action 预算。同资源写入使用无等待队列
 的单写 permit；全局最多四个 write 只负责资源上限，不再被当作状态安全证明。
 预算只在 revision、health、safety 与资源 permit 全部通过、即将 dispatch 前
-原子预留；dry-run、dispatch 前拒绝和幂等重放不扣减。
+原子预留；adapter 明确报告 `not-dispatched` 时回滚。dry-run、dispatch 前拒绝和
+幂等重放不扣减，worker 已接收后的明确拒绝或不确定结果只扣一次。
 
 ### Protocol output or diagnostics leak attacker data
 
@@ -212,6 +214,11 @@ reconciliation 能力。`bridge.describe` 只输出可序列化 JSON Schema 与�
 固定字段，不暴露 Zod 实例或函数。adapter-specific 错误只能作为固定
 `ADAPTER_REJECTED` 下的 allowlisted code 出现，不能扩张 core error enum 或
 回显异常文本。
+
+注册只接受能无损转成 JSON Schema 的声明式 Zod 子集。refinement、transform、
+codec 和其他携带闭包或运行时代码的 schema 被拒绝；活动 validator 从深冻结
+JSON 快照的隔离副本重建并隐藏，源 schema、闭包或公开对象的后续修改不能改变
+授权时实际使用的验证逻辑。
 
 The parent still owns identity, session binding, capabilities, action schemas,
 policy, idempotency, safety, and audit. Static metadata must exactly match the

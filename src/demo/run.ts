@@ -54,6 +54,7 @@ function request(
 }
 
 async function main(): Promise<void> {
+  await adapter.start();
   const opened = await handleLocal(
     request("demo-open", "session.open", {
       adapterId: "mock-world",

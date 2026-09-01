@@ -9,6 +9,11 @@
 - Registration-time validation, snapshotting, and freezing of adapter identity,
   observation, actions, schemas, capabilities, limits, and metadata; runtime
   replacement of the source manifest cannot expand the registered surface
+- Declarative JSON-Schema-round-trippable Zod subset only; code-bearing
+  refinements/transforms/codecs are rejected and the rebuilt validator is
+  hidden behind a frozen wrapper
+- Zero-action read-only adapters, optional revision providers unless demanded
+  by an action, and parallel/serial/resource-serial observation scheduling
 - Pure-JSON `bridge.describe` catalog with input/output JSON Schema and no Zod
   instances, functions, or arbitrary adapter objects
 - Explicit trusted mock grant provider with fixed tiny-world scope, actual
@@ -20,8 +25,8 @@
 - No-queue resource-level single-write scheduler composed with the existing
   global safety write gate; stop is checked before and during atomic admission
 - Closed runtime/adapter/audit/safety health model returned by operator status
-  and printed by the CLI without paths, endpoints, tokens, PIDs, exception text,
-  audit contents, or adapter payloads
+  from one coherent snapshot and printed by the CLI without paths, endpoints,
+  tokens, PIDs, exception text, audit contents, or adapter payloads
 - Pre-response adapter output schema/serialization/byte-limit validation,
   allowlisted adapter rejection codes, explicit dispatch-phase classification,
   and conservative cached `OUTCOME_UNKNOWN` without retry
@@ -117,8 +122,12 @@
   profile and `tiny-world-v1` scope. Test-only providers exercise the injection
   seam but do not add production remote identity or broader grants.
 - Action budget counts commit attempts only after health, safety, resource and
-  revision admission. Dry-run, pre-dispatch rejection and replay do not charge;
-  adapter rejection and outcome unknown charge once because dispatch occurred.
+  revision admission. A `not-dispatched` runtime result rolls back the
+  reservation. Dry-run, pre-dispatch rejection and replay do not charge;
+  worker rejection and outcome unknown charge once because dispatch occurred.
+- Quiescing rejects new session opens and commit writes, retains stop/close/read,
+  and product shutdown drains admitted state changes plus their critical audit
+  writes before closing the adapter and ledger.
 - Invalid output after a write is classified with a fixed output error and
   outcome-unknown phase, then faults later commit health. The original output
   is never echoed or audited.
@@ -190,8 +199,8 @@ Actual local results on 2026-09-01 with Node.js `v22.23.1` and npm `10.9.8`:
 - `npm ci` — passed; 73 packages installed, 74 audited, 0 vulnerabilities
 - `npm audit` — passed; 0 vulnerabilities
 - `npm run check` — passed
-- `npm test` — passed; 10 files, 140 tests passed and 2 explicitly inapplicable
-  Windows gates skipped (142 registered assertions) in 38.01 s. All prior
+- `npm test` — passed; 10 files, 146 tests passed and 2 explicitly inapplicable
+  Windows gates skipped (148 registered assertions) in 42.03 s. All prior
   protocol, MCP, operator, audit, safety, idempotency, capacity and containment
   regressions remain green. The new Adapter Contract v2 group covers immutable
   catalog snapshots, trusted grants, revisions, write serialization, safety
@@ -276,7 +285,7 @@ audit, and diff-check. It does not run or claim the non-elevated allow path,
 named-pipe/operator, process-adapter, MCP stdio, CLI, lifecycle, or demo suite.
 Those remain local non-elevated Windows evidence until a suitable dedicated
 runner exists. The final Node 22 run for Adapter Contract v2 passed all 10 files
-with 140 passed/2 explicitly inapplicable skips in 38.01 s; the exact inventory
+with 146 passed/2 explicitly inapplicable skips in 42.03 s; the exact inventory
 now includes `adapter-contract-v2.test.ts`, so partial or stale nine-file output
 cannot become non-elevated Windows evidence.
 

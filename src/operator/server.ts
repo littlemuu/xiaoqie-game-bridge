@@ -505,13 +505,14 @@ export class LocalOperatorServer {
     signal: AbortSignal,
   ): Promise<OperatorResponse> {
     if (request.command === "status") {
+      const health = this.#control.getHealthStatus();
       return {
         version: OPERATOR_PROTOCOL_VERSION,
         type: "result",
         ok: true,
         command: "status",
-        status: this.#control.getSafetyStatus(),
-        health: this.#control.getHealthStatus(),
+        status: health.safety,
+        health,
       };
     }
     if (request.command === "stop") {

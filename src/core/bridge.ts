@@ -4,6 +4,7 @@ import {
   AdapterExecutionError,
   AdapterRuntimeError,
   describeAdapter,
+  type AdapterSchema,
   type AdapterActionDefinition,
 } from "./adapter.js";
 import { AdapterRegistry } from "./adapter-registry.js";
@@ -123,6 +124,7 @@ export interface BridgeLocalControlPlane {
   getHealthStatus(): BridgeHealthStatus;
   getOutstandingAuditWrites(): number;
   waitForAuditIdle(): Promise<void>;
+  waitForStateChangesIdle(): Promise<void>;
   resumeSafety(
     generation: number,
     options?: { signal?: AbortSignal },
@@ -190,7 +192,7 @@ type AdapterOutputValidation =
   | { valid: false; code: "ADAPTER_OUTPUT_INVALID" | "ADAPTER_RESULT_TOO_LARGE" };
 
 function validateAdapterOutput(
-  schema: z.ZodType<unknown>,
+  schema: z.ZodType<unknown> | AdapterSchema,
   maxResultBytes: number,
   candidate: unknown,
 ): AdapterOutputValidation {
@@ -222,6 +224,7 @@ export class GameBridge {
   readonly #clock: () => number;
   readonly #callerTagKey: Buffer;
   readonly #auditWrites = new Set<Promise<void>>();
+  readonly #stateChanges = new Set<Promise<BridgeResponse>>();
   #runtimeHealth: RuntimeHealthStatus = "ready";
   #observedAuditHealth: AuditHealthStatus = "ready";
   #localResumePending = false;
@@ -248,6 +251,12 @@ export class GameBridge {
 
   beginQuiescing(): void {
     if (this.#runtimeHealth !== "faulted") this.#runtimeHealth = "quiescing";
+  }
+
+  async waitForStateChangesIdle(): Promise<void> {
+    while (this.#stateChanges.size > 0) {
+      await Promise.allSettled([...this.#stateChanges]);
+    }
   }
 
   getHealthStatus(): BridgeHealthStatus {
@@ -305,6 +314,7 @@ export class GameBridge {
           await Promise.allSettled([...this.#auditWrites]);
         }
       },
+      waitForStateChangesIdle: () => this.waitForStateChangesIdle(),
       resumeSafety: async (
         generation: number,
         options: { signal?: AbortSignal } = {},
@@ -468,6 +478,27 @@ export class GameBridge {
     raw: unknown,
     context?: unknown,
   ): Promise<BridgeResponse> {
+    const admission = requestEnvelopeSchema.safeParse(raw);
+    const operation = this.#handleRequest(raw, context);
+    if (
+      !admission.success ||
+      admission.data.mode !== "commit" ||
+      !new Set(["session.open", "session.close", "game.act", "safety.stop"]).has(
+        admission.data.action,
+      )
+    ) {
+      return operation;
+    }
+    let tracked!: Promise<BridgeResponse>;
+    tracked = operation.finally(() => this.#stateChanges.delete(tracked));
+    this.#stateChanges.add(tracked);
+    return tracked;
+  }
+
+  async #handleRequest(
+    raw: unknown,
+    context?: unknown,
+  ): Promise<BridgeResponse> {
     const trustedContext = snapshotRequestContext(context);
     const callerOwnerKey =
       trustedContext === undefined ? undefined : deriveSessionOwnerKey(trustedContext);
@@ -581,6 +612,32 @@ export class GameBridge {
       );
       await this.#record(request, response, false, adapter.id, undefined, callerOwnerKey);
       return response;
+    }
+    if (request.mode === "commit") {
+      const health = this.getHealthStatus();
+      if (
+        health.runtime.status !== "ready" ||
+        health.adapter.status !== "ready" ||
+        health.audit.status === "full" ||
+        health.audit.status === "corrupt" ||
+        health.audit.status === "closed"
+      ) {
+        const response = errorResponse(
+          request,
+          "RUNTIME_UNAVAILABLE",
+          "Runtime health does not permit a new session.",
+          { operationPhase: "pre-dispatch" },
+        );
+        await this.#record(
+          request,
+          response,
+          false,
+          adapter.id,
+          undefined,
+          callerOwnerKey,
+        );
+        return response;
+      }
     }
     const grant = await this.#grantProvider.grant({
       adapter,
@@ -878,6 +935,23 @@ export class GameBridge {
         { operationPhase: "pre-dispatch" },
       );
     }
+    const concurrency = adapterCheck.adapter.observation.concurrency;
+    const observationPermit =
+      concurrency.kind === "parallel"
+        ? undefined
+        : this.#writeScheduler.tryAcquire(
+            `${adapterCheck.adapter.id}\u0000${session.scope.kind}\u0000${session.scope.resourceId}\u0000${
+              concurrency.kind === "serial" ? "__observation__" : concurrency.resourceKey
+            }`,
+          );
+    if (concurrency.kind !== "parallel" && observationPermit === undefined) {
+      return errorResponse(
+        request,
+        "RESOURCE_CAPACITY",
+        "The adapter observation concurrency limit is occupied.",
+        { operationPhase: "pre-dispatch" },
+      );
+    }
     try {
       const output = validateAdapterOutput(
         adapterCheck.adapter.observation.outputSchema,
@@ -899,6 +973,8 @@ export class GameBridge {
         "The adapter is unavailable for observation.",
         { operationPhase: "adapter-rejected" },
       );
+    } finally {
+      observationPermit?.release();
     }
   }
 
@@ -937,7 +1013,7 @@ export class GameBridge {
     }
     const executeAndValidate = async (): Promise<BridgeResponse> => {
       try {
-        const result = await adapterCheck.adapter.execute(
+        const result = await adapterCheck.adapter.execute!(
           parsed.data.gameAction,
           decision.parsedInput,
           request.mode,
@@ -976,7 +1052,7 @@ export class GameBridge {
               request,
               "REVISION_CONFLICT",
               "The adapter state revision no longer matches the expected revision.",
-              { operationPhase: "pre-dispatch" },
+              { operationPhase: "adapter-rejected" },
             );
           }
           if (definition.adapterErrorCodes.includes(error.code)) {
@@ -994,7 +1070,7 @@ export class GameBridge {
         const outcomeUnknown =
           request.mode === "commit" &&
           definition.effectKind === "write" &&
-          (!(error instanceof AdapterRuntimeError) || error.kind === "outcome-unknown");
+          (!(error instanceof AdapterRuntimeError) || error.dispatch === "dispatched");
         if (outcomeUnknown) {
           this.#runtimeHealth = "faulted";
           return errorResponse(
@@ -1008,7 +1084,12 @@ export class GameBridge {
           request,
           "RUNTIME_UNAVAILABLE",
           "The adapter runtime is unavailable.",
-          { operationPhase: "adapter-rejected" },
+          {
+            operationPhase:
+              error instanceof AdapterRuntimeError && error.dispatch === "not-dispatched"
+                ? "pre-dispatch"
+                : "adapter-rejected",
+          },
         );
       }
     };
@@ -1092,7 +1173,7 @@ export class GameBridge {
       if (definition.requiresExpectedRevision) {
         let currentRevision: number;
         try {
-          currentRevision = await adapterCheck.adapter.getStateRevision();
+          currentRevision = await adapterCheck.adapter.getStateRevision!();
         } catch {
           return errorResponse(
             request,
@@ -1114,7 +1195,11 @@ export class GameBridge {
           );
         }
       }
-      if (!reserveSessionActionBudget(session, parsed.data.gameAction)) {
+      const budgetReservation = reserveSessionActionBudget(
+        session,
+        parsed.data.gameAction,
+      );
+      if (budgetReservation === undefined) {
         return errorResponse(
           request,
           "RESOURCE_CAPACITY",
@@ -1122,7 +1207,13 @@ export class GameBridge {
           { operationPhase: "pre-dispatch" },
         );
       }
-      return await executeAndValidate();
+      const response = await executeAndValidate();
+      if (!response.ok && response.error.operationPhase === "pre-dispatch") {
+        budgetReservation.rollback();
+      } else {
+        budgetReservation.commit();
+      }
+      return response;
     } finally {
       writePermit.release();
       resourcePermit.release();

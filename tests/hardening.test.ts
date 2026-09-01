@@ -18,6 +18,11 @@ import {
 } from "../src/index.js";
 
 const TEST_OWNER = deriveSessionOwnerKey({ transport: "local" });
+const DIRECT_TEST_GRANT = {
+  scope: { kind: "test-resource" as const, resourceId: "direct-session-test" },
+  totalActionBudget: 4,
+  perActionBudgets: {},
+};
 
 interface Deferred<T> {
   promise: Promise<T>;
@@ -77,7 +82,7 @@ class GatedAdapter implements GameAdapter {
     description: "Observe deterministic gated test counters.",
     outputSchema: gatedObservationSchema,
     effectKind: "read" as const,
-    concurrency: "parallel" as const,
+    concurrency: { kind: "parallel" as const },
     requiredCapabilities: ["game.observe"],
     maxResultBytes: 4 * 1_024,
   };
@@ -309,6 +314,7 @@ describe("bounded cache and local safety hardening", () => {
       "first-adapter",
       ["first-capability"],
       1_000,
+      DIRECT_TEST_GRANT,
     );
 
     expect(() =>
@@ -317,12 +323,20 @@ describe("bounded cache and local safety hardening", () => {
         "second-adapter",
         ["second-capability"],
         1_000,
+        DIRECT_TEST_GRANT,
       ),
     ).toThrow(SessionIdCollisionError);
     expect(directSessions.size).toBe(1);
     expect(directSessions.find(collidingId)).toBe(first);
     expect(first.adapterId).toBe("first-adapter");
     expect([...first.capabilities]).toEqual(["first-capability"]);
+    expect(Reflect.set(first, "capabilities", new Set(["injected"]))).toBe(false);
+    expect(Reflect.set(first, "actionBudgetRemaining", 999)).toBe(false);
+    expect(
+      Reflect.set(first, "perActionBudgetRemaining", new Map([["injected", 999]])),
+    ).toBe(false);
+    expect([...first.capabilities]).toEqual(["first-capability"]);
+    expect(first.actionBudgetRemaining).toBe(DIRECT_TEST_GRANT.totalActionBudget);
 
     const now = { value: 0 };
     const sessions = new SessionManager({
@@ -407,9 +421,9 @@ describe("bounded cache and local safety hardening", () => {
       terminalRetentionMs: 10,
       maxRequestsPerSession: 1,
     });
-    const closed = sessions.open(TEST_OWNER, "gated-world", [], 100);
+    const closed = sessions.open(TEST_OWNER, "gated-world", [], 100, DIRECT_TEST_GRANT);
     sessions.close(closed);
-    const expired = sessions.open(TEST_OWNER, "gated-world", [], 5);
+    const expired = sessions.open(TEST_OWNER, "gated-world", [], 5, DIRECT_TEST_GRANT);
 
     now.value = 5;
     expect(sessions.sweep()).toBe(0);

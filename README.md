@@ -153,7 +153,7 @@ capability 请求不等于授权。当前产品只使用可信代码中的 fixed
 - adapter IPC 默认最多有 8 个 pending call；
 - 达到容量时在 adapter 副作用前拒绝，不建立无界等待队列。
 
-这些限制只能证明资源有界，不能单独证明状态安全。Adapter Contract v2 另外要求同一 adapter/scope/resource 的写入默认单写；observation 显式声明为可并行 `read`，mock dry-run preview 也不取得 write permit，二者都不能修改世界。mock observation 和 preview 返回 `stateRevision`，声明需要 revision 的 commit 必须携带 `expectedRevision`。stale/future revision、预算耗尽、stop 和同资源并发均在 adapter 副作用前拒绝；成功 commit 只递增一次，dry-run、拒绝和幂等重放不递增。
+这些限制只能证明资源有界，不能单独证明状态安全。Adapter Contract v2 另外要求同一 adapter/scope/resource 的写入默认单写；observation 必须显式声明 `parallel`、`serial` 或 `resource-serial`，纯只读 adapter 可以声明零个 action，也不需要 revision provider。mock dry-run preview 不取得 write permit，read/preview 都不能修改世界。mock observation 和 preview 返回 `stateRevision`，声明需要 revision 的 commit 必须携带 `expectedRevision`。core 在派发前发现的 stale/future revision、预算耗尽、stop 和并发占用均不扣预算；已派发到 worker 的明确拒绝（包括 worker 侧 revision conflict）扣一次，幂等重放不重复扣减。成功 commit 只递增一次。
 
 ## Safety latch 与本地 operator
 
@@ -205,7 +205,7 @@ MCP surface：
 - bridge 输出会再次经过 schema、请求身份和脱敏验证；
 - client disconnect 不被描述成已经取消或回滚进入 core/worker 的动作。
 
-MCP 仍只使用一个通用 tool；`bridge.describe` 现在返回纯 JSON action catalog，包含输入/输出 JSON Schema、read/preview/write、dry-run 精确度、required capabilities、revision、结果上限、资源调度与 adapter error namespace，不返回 Zod 实例或函数。MCP server version 从 `package.json` 单一来源读取，协议版本只使用 `PROTOCOL_VERSION`。
+MCP 仍只使用一个通用 tool；`bridge.describe` 现在返回纯 JSON action catalog，包含输入/输出 JSON Schema、read/preview/write、dry-run 精确度、required capabilities、revision、结果上限、资源调度与 adapter error namespace，不返回 Zod 实例或函数。注册仅接受可转成 JSON Schema 的声明式 Zod 子集，拒绝 refinement、transform、codec 等携带运行时代码的 schema；活动 validator 由不可变 JSON 快照重建并隐藏在闭包中。MCP server version 从 `package.json` 单一来源读取，协议版本只使用 `PROTOCOL_VERSION`。
 
 ## 持久审计账本
 

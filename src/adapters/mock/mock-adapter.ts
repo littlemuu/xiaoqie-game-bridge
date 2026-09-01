@@ -10,14 +10,13 @@ import type { BridgeMode } from "../../core/protocol.js";
 
 const coordinateSchema = z.number().int().min(-8).max(8);
 const heightSchema = z.number().int().min(0).max(4);
-export const mockMoveInputSchema = z
-  .object({
-    dx: z.number().int().min(-1).max(1),
-    dy: z.number().int().min(-1).max(1),
-    dz: z.number().int().min(-1).max(1),
-  })
-  .strict()
-  .refine(({ dx, dy, dz }) => dx !== 0 || dy !== 0 || dz !== 0);
+const deltaSchema = z.number().int().min(-1).max(1);
+const nonZeroDeltaSchema = z.union([z.literal(-1), z.literal(1)]);
+export const mockMoveInputSchema = z.union([
+  z.object({ dx: nonZeroDeltaSchema, dy: deltaSchema, dz: deltaSchema }).strict(),
+  z.object({ dx: z.literal(0), dy: nonZeroDeltaSchema, dz: deltaSchema }).strict(),
+  z.object({ dx: z.literal(0), dy: z.literal(0), dz: nonZeroDeltaSchema }).strict(),
+]);
 export const mockPlaceBlockInputSchema = z
   .object({
     x: coordinateSchema,
@@ -104,7 +103,7 @@ export class MockGameAdapter implements GameAdapter {
     description: "Observe the bounded mock player and nearby allowlisted blocks.",
     outputSchema: mockObservationResultSchema,
     effectKind: "read",
-    concurrency: "parallel",
+    concurrency: { kind: "parallel" },
     requiredCapabilities: ["game.observe"],
     maxResultBytes: 8 * 1_024,
   };
