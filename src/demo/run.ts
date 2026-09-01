@@ -3,6 +3,7 @@ import {
   GameBridge,
   MemoryAuditSink,
   ProcessMockAdapter,
+  PROTOCOL_VERSION,
   SessionManager,
   type RequestEnvelope,
 } from "../index.js";
@@ -43,7 +44,7 @@ function request(
   sessionId?: string,
 ): RequestEnvelope {
   return {
-    protocolVersion: "1.0",
+    protocolVersion: PROTOCOL_VERSION,
     requestId,
     ...(sessionId === undefined ? {} : { sessionId }),
     action,
@@ -67,14 +68,24 @@ async function main(): Promise<void> {
   const preview = request(
     "demo-preview",
     "game.act",
-    { adapterId: "mock-world", gameAction: "move", input: { dx: 1, dy: 0, dz: 0 } },
+    {
+      adapterId: "mock-world",
+      gameAction: "move",
+      input: { dx: 1, dy: 0, dz: 0 },
+      expectedRevision: 0,
+    },
     "dry-run",
     sessionId,
   );
   const commit = request(
     "demo-commit",
     "game.act",
-    { adapterId: "mock-world", gameAction: "move", input: { dx: 1, dy: 0, dz: 0 } },
+    {
+      adapterId: "mock-world",
+      gameAction: "move",
+      input: { dx: 1, dy: 0, dz: 0 },
+      expectedRevision: 0,
+    },
     "commit",
     sessionId,
   );
@@ -89,7 +100,12 @@ async function main(): Promise<void> {
       request(
         "demo-blocked",
         "game.act",
-        { adapterId: "mock-world", gameAction: "move", input: { dx: 0, dy: 0, dz: 1 } },
+        {
+          adapterId: "mock-world",
+          gameAction: "move",
+          input: { dx: 0, dy: 0, dz: 1 },
+          expectedRevision: 1,
+        },
         "commit",
         sessionId,
       ),

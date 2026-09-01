@@ -89,6 +89,12 @@ export const adapterCallSchema = z.union([
         action: z.literal("move"),
         input: mockMoveInputSchema,
         mode: z.enum(["dry-run", "commit"]),
+        expectedRevision: z
+          .number()
+          .int()
+          .nonnegative()
+          .max(Number.MAX_SAFE_INTEGER)
+          .optional(),
       })
       .strict(),
     baseSchema
@@ -99,6 +105,12 @@ export const adapterCallSchema = z.union([
         action: z.literal("place_block"),
         input: mockPlaceBlockInputSchema,
         mode: z.enum(["dry-run", "commit"]),
+        expectedRevision: z
+          .number()
+          .int()
+          .nonnegative()
+          .max(Number.MAX_SAFE_INTEGER)
+          .optional(),
       })
       .strict(),
   ]),
@@ -126,6 +138,7 @@ export const adapterResultSchema = z.discriminatedUnion("ok", [
           "OUT_OF_BOUNDS",
           "BLOCK_NOT_ALLOWED",
           "TARGET_OCCUPIED",
+          "REVISION_CONFLICT",
           "ADAPTER_FAILURE",
         ]),
       }).strict(),

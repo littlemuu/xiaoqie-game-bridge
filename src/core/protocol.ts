@@ -34,9 +34,13 @@ export const errorCodes = [
   "REQUEST_ID_REUSED",
   "RESOURCE_CAPACITY",
   "AUTHORIZATION_DENIED",
-  "OUT_OF_BOUNDS",
-  "BLOCK_NOT_ALLOWED",
-  "TARGET_OCCUPIED",
+  "ADAPTER_REJECTED",
+  "ADAPTER_OUTPUT_INVALID",
+  "ADAPTER_RESULT_TOO_LARGE",
+  "REVISION_REQUIRED",
+  "REVISION_CONFLICT",
+  "RUNTIME_UNAVAILABLE",
+  "OUTCOME_UNKNOWN",
   "INTERNAL_ERROR",
 ] as const;
 
@@ -45,6 +49,12 @@ export type ErrorCode = (typeof errorCodes)[number];
 export interface BridgeError {
   code: ErrorCode;
   message: string;
+  operationPhase?:
+    | "pre-dispatch"
+    | "adapter-rejected"
+    | "adapter-succeeded"
+    | "outcome-unknown";
+  adapterError?: { code: string };
 }
 
 interface ResponseBase {
@@ -81,7 +91,22 @@ export const responseEnvelopeSchema = z.discriminatedUnion("ok", [
     .extend({
       ok: z.literal(false),
       error: z
-        .object({ code: z.enum(errorCodes), message: z.string().min(1).max(512) })
+        .object({
+          code: z.enum(errorCodes),
+          message: z.string().min(1).max(512),
+          operationPhase: z
+            .enum([
+              "pre-dispatch",
+              "adapter-rejected",
+              "adapter-succeeded",
+              "outcome-unknown",
+            ])
+            .optional(),
+          adapterError: z
+            .object({ code: z.string().regex(/^[A-Z][A-Z0-9_]{0,63}$/u) })
+            .strict()
+            .optional(),
+        })
         .strict(),
     })
     .strict(),
@@ -106,6 +131,7 @@ export function errorResponse(
   request: Pick<RequestEnvelope, "requestId" | "sessionId" | "action" | "mode">,
   code: ErrorCode,
   message: string,
+  details: Pick<BridgeError, "operationPhase" | "adapterError"> = {},
 ): ErrorResponse {
   return {
     protocolVersion: PROTOCOL_VERSION,
@@ -114,7 +140,7 @@ export function errorResponse(
     action: request.action,
     mode: request.mode,
     ok: false,
-    error: { code, message },
+    error: { code, message, ...details },
   };
 }
 

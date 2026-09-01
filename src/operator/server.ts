@@ -511,6 +511,7 @@ export class LocalOperatorServer {
         ok: true,
         command: "status",
         status: this.#control.getSafetyStatus(),
+        health: this.#control.getHealthStatus(),
       };
     }
     if (request.command === "stop") {

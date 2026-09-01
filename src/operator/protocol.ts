@@ -19,6 +19,25 @@ export const operatorSafetyStatusSchema = z
   })
   .strict();
 
+export const operatorHealthStatusSchema = z
+  .object({
+    runtime: z.object({ status: z.enum(["ready", "degraded", "quiescing", "faulted"]) }).strict(),
+    adapter: z
+      .object({
+        status: z.enum(["ready", "unavailable", "faulted"]),
+        registeredAdapters: z.number().int().min(0).max(64),
+      })
+      .strict(),
+    audit: z
+      .object({
+        status: z.enum(["ready", "degraded", "full", "corrupt", "closed"]),
+        outstandingWrites: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+      })
+      .strict(),
+    safety: operatorSafetyStatusSchema,
+  })
+  .strict();
+
 const requestBaseSchema = z.object({
   version: z.literal(OPERATOR_PROTOCOL_VERSION),
   token: tokenSchema,
@@ -54,6 +73,7 @@ export const operatorResponseSchema = z.union([
       ok: z.literal(true),
       command: z.literal("status"),
       status: operatorSafetyStatusSchema,
+      health: operatorHealthStatusSchema,
     })
     .strict(),
   responseBaseSchema

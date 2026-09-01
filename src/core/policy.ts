@@ -1,7 +1,7 @@
 import type { GameAdapter } from "./adapter.js";
 
 export type PolicyDecision =
-  | { allowed: true; parsedInput: unknown; capability: string }
+  | { allowed: true; parsedInput: unknown; requiredCapabilities: readonly string[] }
   | {
       allowed: false;
       code: "ACTION_NOT_ALLOWED" | "INVALID_PARAMS" | "CAPABILITY_DENIED";
@@ -23,7 +23,11 @@ export class PolicyEngine {
         message: "The requested game action is not registered by this adapter.",
       };
     }
-    if (!capabilities.has(definition.capability)) {
+    if (
+      definition.requiredCapabilities.some(
+        (capability) => !capabilities.has(capability),
+      )
+    ) {
       return {
         allowed: false,
         code: "CAPABILITY_DENIED",
@@ -41,7 +45,7 @@ export class PolicyEngine {
     return {
       allowed: true,
       parsedInput: parsed.data,
-      capability: definition.capability,
+      requiredCapabilities: definition.requiredCapabilities,
     };
   }
 }

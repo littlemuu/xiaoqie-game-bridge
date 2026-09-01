@@ -1,20 +1,21 @@
-import type { GameAdapter } from "./adapter.js";
+import { snapshotAdapter, type GameAdapter } from "./adapter.js";
 
 export class AdapterRegistry {
   readonly #adapters = new Map<string, GameAdapter>();
 
   register(adapter: GameAdapter): void {
-    if (this.#adapters.has(adapter.id)) {
-      throw new Error(`Adapter already registered: ${adapter.id}`);
+    const snapshot = snapshotAdapter(adapter);
+    if (this.#adapters.has(snapshot.id)) {
+      throw new Error(`Adapter already registered: ${snapshot.id}`);
     }
-    this.#adapters.set(adapter.id, adapter);
+    this.#adapters.set(snapshot.id, snapshot);
   }
 
   get(adapterId: string): GameAdapter | undefined {
     return this.#adapters.get(adapterId);
   }
 
-  list(): GameAdapter[] {
+  list(): readonly GameAdapter[] {
     return [...this.#adapters.values()];
   }
 
@@ -24,9 +25,9 @@ export class AdapterRegistry {
       return undefined;
     }
     return new Set([
-      adapter.observationCapability,
       "safety.stop",
-      ...Object.values(adapter.actions).map((action) => action.capability),
+      ...adapter.observation.requiredCapabilities,
+      ...Object.values(adapter.actions).flatMap((action) => action.requiredCapabilities),
     ]);
   }
 }

@@ -1,6 +1,7 @@
 import { Buffer } from "node:buffer";
 import { McpServer, type CallToolResult } from "@modelcontextprotocol/server";
 import { redactSensitive } from "../core/audit.js";
+import { canonicalJson } from "../core/canonical-json.js";
 import type { RequestContext } from "../core/request-context.js";
 import {
   type BridgeResponse,
@@ -9,6 +10,7 @@ import {
   requestEnvelopeSchema,
   responseEnvelopeSchema,
 } from "../core/protocol.js";
+import { PACKAGE_VERSION } from "../package-version.js";
 
 export const GAME_BRIDGE_TOOL_NAME = "game_bridge_request";
 export const STDIO_MAX_BUFFER_BYTES = 64 * 1_024;
@@ -77,24 +79,6 @@ function requirePositiveByteLimit(value: number): void {
   }
 }
 
-function canonicalJson(value: unknown): string {
-  if (Array.isArray(value)) {
-    return `[${value.map(canonicalJson).join(",")}]`;
-  }
-  if (value !== null && typeof value === "object") {
-    return `{${Object.entries(value as Record<string, unknown>)
-      .filter(([, child]) => child !== undefined)
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([key, child]) => `${JSON.stringify(key)}:${canonicalJson(child)}`)
-      .join(",")}}`;
-  }
-  const serialized = JSON.stringify(value);
-  if (serialized === undefined) {
-    throw new TypeError("The MCP response is not JSON serializable.");
-  }
-  return serialized;
-}
-
 function fixedInternalResponse(request: RequestEnvelope): BridgeResponse {
   return errorResponse(
     request,
@@ -158,7 +142,7 @@ export function createGameBridgeMcpServer(
     );
   const server = new McpServer({
     name: "xiaoqie-game-bridge",
-    version: "0.1.0",
+    version: PACKAGE_VERSION,
   });
 
   server.registerTool(

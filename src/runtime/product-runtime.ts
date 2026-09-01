@@ -41,6 +41,7 @@ export async function createProductRuntime(): Promise<ProductRuntime> {
     safetyLatch,
     close: () => {
       closePromise ??= (async () => {
+        bridge.beginQuiescing();
         await audit.close();
         await adapter.close();
       })();

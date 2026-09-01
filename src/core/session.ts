@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { BridgeResponse, ErrorCode } from "./protocol.js";
 import { isSessionOwnerKey, type SessionOwnerKey } from "./request-context.js";
+import type { ResourceScopeSummary } from "./grant.js";
 
 export const DEFAULT_SESSION_TTL_MS = 15 * 60 * 1_000;
 export const MAX_SESSION_TTL_MS = 60 * 60 * 1_000;
@@ -41,6 +42,9 @@ export interface Session {
   readonly ownerKey: SessionOwnerKey;
   adapterId: string;
   capabilities: Set<string>;
+  readonly scope: Readonly<ResourceScopeSummary>;
+  actionBudgetRemaining: number;
+  readonly perActionBudgetRemaining: Map<string, number>;
   createdAt: number;
   expiresAt: number;
   closedAt?: number;
@@ -63,6 +67,18 @@ export interface SessionManagerOptions {
   terminalRetentionMs?: number;
   maxRequestsPerSession?: number;
 }
+
+export interface SessionGrantSettings {
+  scope: Readonly<ResourceScopeSummary>;
+  totalActionBudget: number;
+  perActionBudgets: Readonly<Record<string, number>>;
+}
+
+const DEFAULT_DIRECT_GRANT: SessionGrantSettings = Object.freeze({
+  scope: Object.freeze({ kind: "test-resource", resourceId: "direct-session" }),
+  totalActionBudget: Number.MAX_SAFE_INTEGER,
+  perActionBudgets: Object.freeze({}),
+});
 
 function requirePositiveInteger(name: string, value: number): void {
   if (!Number.isSafeInteger(value) || value <= 0) {
@@ -106,6 +122,7 @@ export class SessionManager {
     adapterId: string,
     capabilities: Iterable<string>,
     ttlMs?: number,
+    grant: SessionGrantSettings = DEFAULT_DIRECT_GRANT,
   ): Session {
     if (!isSessionOwnerKey(ownerKey)) {
       throw new TypeError("Session owner key must be a full SHA-256 digest.");
@@ -119,6 +136,15 @@ export class SessionManager {
       throw new SessionCapacityError();
     }
     const now = this.now();
+    requireNonNegativeInteger("totalActionBudget", grant.totalActionBudget);
+    const perActionBudgetRemaining = new Map<string, number>();
+    for (const [action, budget] of Object.entries(grant.perActionBudgets)) {
+      if (!/^[a-z][a-z0-9_.-]{0,127}$/u.test(action)) {
+        throw new TypeError("Per-action budget names must be closed manifest names.");
+      }
+      requireNonNegativeInteger(`perActionBudgets.${action}`, budget);
+      perActionBudgetRemaining.set(action, budget);
+    }
     const sessionId = this.#idGenerator();
     if (this.#sessions.has(sessionId)) {
       throw new SessionIdCollisionError();
@@ -128,6 +154,9 @@ export class SessionManager {
       ownerKey,
       adapterId,
       capabilities: new Set(capabilities),
+      scope: Object.freeze({ ...grant.scope }),
+      actionBudgetRemaining: grant.totalActionBudget,
+      perActionBudgetRemaining,
       createdAt: now,
       expiresAt: now + effectiveTtl,
       requestCapacity: this.#maxRequestsPerSession,
@@ -136,6 +165,12 @@ export class SessionManager {
     Object.defineProperty(session, "ownerKey", {
       value: ownerKey,
       enumerable: false,
+      writable: false,
+      configurable: false,
+    });
+    Object.defineProperty(session, "scope", {
+      value: session.scope,
+      enumerable: true,
       writable: false,
       configurable: false,
     });
@@ -190,4 +225,14 @@ export class SessionManager {
   get size(): number {
     return this.#sessions.size;
   }
+}
+
+export function reserveSessionActionBudget(session: Session, action: string): boolean {
+  const actionRemaining = session.perActionBudgetRemaining.get(action);
+  if (session.actionBudgetRemaining < 1 || actionRemaining === 0) return false;
+  session.actionBudgetRemaining -= 1;
+  if (actionRemaining !== undefined) {
+    session.perActionBudgetRemaining.set(action, actionRemaining - 1);
+  }
+  return true;
 }
