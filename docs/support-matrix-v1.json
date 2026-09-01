@@ -1,0 +1,30 @@
+{
+  "schema": "xiaoqie.support-matrix/v1",
+  "release": "0.1.0-rc.1",
+  "targets": [
+    {
+      "id": "linux-canonical-builder",
+      "role": "deterministic-bundle-and-platform-neutral-tests",
+      "evidence": "required-in-tag-workflow"
+    },
+    {
+      "id": "github-hosted-windows",
+      "role": "msvc-build-and-elevated-host-fail-closed",
+      "evidence": "not-non-elevated-validation"
+    },
+    {
+      "id": "real-non-elevated-windows",
+      "role": "full-worker-operator-and-containment-validation",
+      "evidence": "separate-report-required"
+    }
+  ],
+  "unsupported": [
+    "real-games",
+    "game-accounts",
+    "launchers",
+    "save-files",
+    "remote-transports",
+    "host-mcp-configuration",
+    "hostile-code-sandbox"
+  ]
+}

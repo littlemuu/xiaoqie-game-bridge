@@ -1,6 +1,9 @@
 node_modules/
 dist/
 coverage/
+release-input/
+release-out/
+windows-evidence-out/
 *.log
 .env
 .env.*
