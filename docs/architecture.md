@@ -137,10 +137,11 @@ later replacement of actions, schemas, capability arrays, or metadata cannot
 change the active permission surface. A session binds to one adapter, so a
 granted capability cannot be redirected to another adapter.
 
-Schemas are restricted to the declarative Zod subset that round-trips through
-JSON Schema. Refinements, transforms, codecs, lazy/function schemas, defaults,
-and other code-bearing nodes are rejected. Registration deep-freezes the JSON
-snapshot, rebuilds the active validator from an isolated clone, and exposes
+Schemas are restricted by a positive allowlist of Zod nodes, checks, and exact
+definition fields that round-trip through JSON Schema. Refinements, transforms,
+codecs, overwrite/trim, coerce, user `when`, lazy/function schemas, defaults,
+and every unknown node/check/option are rejected. Registration deep-freezes the
+JSON snapshot, rebuilds the active validator from an isolated clone, and exposes
 only a frozen `safeParse` wrapper; neither source closures nor validator
 internals remain mutable through the registered manifest.
 
@@ -154,6 +155,11 @@ without mutation, and applies authorized commits in memory only.
 `mock-world` 批准 allowlist 能力和 `tiny-world-v1` scope；session 保存实际
 grant、scope 摘要、总动作预算与 per-action 预算。owner key 只证明调用者与
 session 的绑定，不参与 grant 推导，也不作为资源标识。
+
+Provider 返回值在任何 session 或 audit-reservation 副作用前经过 closed-world
+运行时快照：TTL 是受请求与全局上限约束的正 safe integer，capabilities 是请求与
+manifest 的去重子集，scope kind 必须位于 adapter 自身 namespace，resource ID
+有界且无额外字段，per-action budget 只能引用 manifest 中的 write action。
 
 mock observation 与 dry-run preview 返回当前 `stateRevision`。声明
 `requiresExpectedRevision` 的 commit 必须提供 `expectedRevision`；core 在持有
@@ -244,11 +250,13 @@ plus enabled non-privileged source groups as restricting SIDs. That latter
 choice keeps fixed Node/repository ACL access portable across managed Windows
 hosts; it is not claimed to isolate files.
 
-At most eight calls are pending and there is no application wait queue. Strict
-64 KiB frame and 32 KiB message limits apply. Malformed JSON, unknown
+At most eight calls are pending and there is no application-level wait queue.
+Strict 64 KiB frame and 32 KiB message limits bound the bytes Node may buffer
+after `Writable.write()` accepts a frame; a `false` return is treated as accepted
+backpressure rather than an undispatched failure. Malformed JSON, unknown
 fields/types, oversized output, identity mismatch, wrong/duplicate/late call
-ID, backpressure, timeout, EOF, crash, or non-zero exit fail closed, settle every
-pending promise once, release timers/capacity, and terminate the child. Normal
+ID, timeout, EOF, crash, or non-zero exit fail closed, settle every pending
+promise once, release timers/capacity, and terminate the child. Normal
 close waits for shutdown acknowledgement and zero exit; close with pending work
 settles that work before termination.
 
@@ -457,9 +465,10 @@ entrypoint then starts `LocalOperatorServer` before calling `serveStdio`; any
 ledger, runtime-directory, descriptor, or listener failure writes one fixed
 stderr category and returns without accepting MCP. Shutdown first marks bridge
 health `quiescing`; this refuses new session opens and commit writes while
-retaining stop, close, and read admission. It then waits for every admitted
-state change and its critical audit write to settle before closing the adapter
-and durable ledger, with bounded outer transport shutdown. A
+retaining stop, close, and read admission. It separately tracks adapter mutation
+settlement (excluding audit), waits only to a fixed deadline, closes the adapter,
+then invokes durable-ledger close so the ledger's own bounded drain/abort handles
+pending native writes. Ledger close is attempted even if adapter close rejects. A
 process-exit fallback performs the same identity-checked descriptor cleanup
 synchronously.
 

@@ -163,7 +163,11 @@ export class SessionManager {
     if (grant === undefined) {
       throw new TypeError("Session creation requires an explicit capability grant.");
     }
-    if (effectiveTtl <= 0 || effectiveTtl > MAX_SESSION_TTL_MS) {
+    if (
+      !Number.isSafeInteger(effectiveTtl) ||
+      effectiveTtl <= 0 ||
+      effectiveTtl > MAX_SESSION_TTL_MS
+    ) {
       throw new RangeError("Session TTL must be between 1 ms and 60 minutes.");
     }
     this.sweep();

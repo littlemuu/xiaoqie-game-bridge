@@ -21,6 +21,7 @@ import { AdapterRegistry } from "../src/core/adapter-registry.js";
 import type { AuditEvent } from "../src/core/audit.js";
 import { GameBridge } from "../src/core/bridge.js";
 import { SafetyLatch } from "../src/core/safety-latch.js";
+import { closeProductRuntimeComponents } from "../src/runtime/product-runtime.js";
 
 const temporaryDirectories = new Set<string>();
 
@@ -486,7 +487,19 @@ describe("durable local audit ledger", () => {
     const pendingRejection = expect(pending).rejects.toMatchObject({ code: "closed" });
     await new Promise((resolve) => setImmediate(resolve));
     const started = Date.now();
-    await shutdownLedger.close();
+    let quiescing = false;
+    await closeProductRuntimeComponents({
+      bridge: {
+        beginQuiescing: () => {
+          quiescing = true;
+        },
+        waitForMutationsIdle: async () => undefined,
+      },
+      adapter: { close: async () => undefined },
+      audit: shutdownLedger,
+      mutationDrainMs: 25,
+    });
+    expect(quiescing).toBe(true);
     expect(Date.now() - started).toBeLessThan(250);
     await pendingRejection;
     await expect(abandonedReservation!.write(event(99))).rejects.toMatchObject({
@@ -498,6 +511,31 @@ describe("durable local audit ledger", () => {
     await new Promise((resolve) => setTimeout(resolve, 30));
     expect((await lstat(join(shutdownFixture.root, "segment-0001.audit"))).size).toBe(size);
     expect(await readdir(shutdownFixture.root)).toEqual(["segment-0001.audit"]);
+  });
+
+  it("bounds mutation drain and closes audit after adapter close rejection", async () => {
+    const adapterFailure = new Error("adapter close fixture failure");
+    let auditCloseCalls = 0;
+    const started = Date.now();
+    await expect(closeProductRuntimeComponents({
+      bridge: {
+        beginQuiescing: () => undefined,
+        waitForMutationsIdle: () => new Promise<void>(() => undefined),
+      },
+      adapter: {
+        close: async () => {
+          throw adapterFailure;
+        },
+      },
+      audit: {
+        close: async () => {
+          auditCloseCalls += 1;
+        },
+      },
+      mutationDrainMs: 10,
+    })).rejects.toBe(adapterFailure);
+    expect(Date.now() - started).toBeLessThan(250);
+    expect(auditCloseCalls).toBe(1);
   });
 
   it("bounds shutdown while a native append promise remains pending", async () => {

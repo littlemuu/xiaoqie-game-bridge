@@ -205,7 +205,7 @@ MCP surface：
 - bridge 输出会再次经过 schema、请求身份和脱敏验证；
 - client disconnect 不被描述成已经取消或回滚进入 core/worker 的动作。
 
-MCP 仍只使用一个通用 tool；`bridge.describe` 现在返回纯 JSON action catalog，包含输入/输出 JSON Schema、read/preview/write、dry-run 精确度、required capabilities、revision、结果上限、资源调度与 adapter error namespace，不返回 Zod 实例或函数。注册仅接受可转成 JSON Schema 的声明式 Zod 子集，拒绝 refinement、transform、codec 等携带运行时代码的 schema；活动 validator 由不可变 JSON 快照重建并隐藏在闭包中。MCP server version 从 `package.json` 单一来源读取，协议版本只使用 `PROTOCOL_VERSION`。
+MCP 仍只使用一个通用 tool；`bridge.describe` 现在返回纯 JSON action catalog，包含输入/输出 JSON Schema、read/preview/write、dry-run 精确度、required capabilities、revision、结果上限、资源调度与 adapter error namespace，不返回 Zod 实例或函数。注册使用 Zod node/check/options 正向白名单，只接受可转成 JSON Schema 的声明式子集；refinement、transform、codec、overwrite/trim、coerce、用户 `when` 以及任何未知定义字段均拒绝。活动 validator 由不可变 JSON 快照重建并隐藏在闭包中。MCP server version 从 `package.json` 单一来源读取，协议版本只使用 `PROTOCOL_VERSION`。
 
 ## 持久审计账本
 

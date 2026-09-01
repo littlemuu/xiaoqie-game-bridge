@@ -21,6 +21,7 @@ import {
 import { PolicyEngine } from "./policy.js";
 import {
   type CapabilityGrantProvider,
+  snapshotCapabilityGrant,
   TrustedMockGrantProvider,
 } from "./grant.js";
 import type {
@@ -124,7 +125,7 @@ export interface BridgeLocalControlPlane {
   getHealthStatus(): BridgeHealthStatus;
   getOutstandingAuditWrites(): number;
   waitForAuditIdle(): Promise<void>;
-  waitForStateChangesIdle(): Promise<void>;
+  waitForMutationsIdle(): Promise<void>;
   resumeSafety(
     generation: number,
     options?: { signal?: AbortSignal },
@@ -224,7 +225,7 @@ export class GameBridge {
   readonly #clock: () => number;
   readonly #callerTagKey: Buffer;
   readonly #auditWrites = new Set<Promise<void>>();
-  readonly #stateChanges = new Set<Promise<BridgeResponse>>();
+  readonly #mutations = new Set<Promise<BridgeResponse>>();
   #runtimeHealth: RuntimeHealthStatus = "ready";
   #observedAuditHealth: AuditHealthStatus = "ready";
   #localResumePending = false;
@@ -253,9 +254,9 @@ export class GameBridge {
     if (this.#runtimeHealth !== "faulted") this.#runtimeHealth = "quiescing";
   }
 
-  async waitForStateChangesIdle(): Promise<void> {
-    while (this.#stateChanges.size > 0) {
-      await Promise.allSettled([...this.#stateChanges]);
+  async waitForMutationsIdle(): Promise<void> {
+    while (this.#mutations.size > 0) {
+      await Promise.allSettled([...this.#mutations]);
     }
   }
 
@@ -314,7 +315,7 @@ export class GameBridge {
           await Promise.allSettled([...this.#auditWrites]);
         }
       },
-      waitForStateChangesIdle: () => this.waitForStateChangesIdle(),
+      waitForMutationsIdle: () => this.waitForMutationsIdle(),
       resumeSafety: async (
         generation: number,
         options: { signal?: AbortSignal } = {},
@@ -478,21 +479,7 @@ export class GameBridge {
     raw: unknown,
     context?: unknown,
   ): Promise<BridgeResponse> {
-    const admission = requestEnvelopeSchema.safeParse(raw);
-    const operation = this.#handleRequest(raw, context);
-    if (
-      !admission.success ||
-      admission.data.mode !== "commit" ||
-      !new Set(["session.open", "session.close", "game.act", "safety.stop"]).has(
-        admission.data.action,
-      )
-    ) {
-      return operation;
-    }
-    let tracked!: Promise<BridgeResponse>;
-    tracked = operation.finally(() => this.#stateChanges.delete(tracked));
-    this.#stateChanges.add(tracked);
-    return tracked;
+    return this.#handleRequest(raw, context);
   }
 
   async #handleRequest(
@@ -639,20 +626,20 @@ export class GameBridge {
         return response;
       }
     }
-    const grant = await this.#grantProvider.grant({
+    const grantRequest = {
       adapter,
       context,
       requestedCapabilities: parsed.data.capabilities,
       ...(parsed.data.ttlMs === undefined ? {} : { requestedTtlMs: parsed.data.ttlMs }),
-    });
-    const requestedCapabilities = new Set(parsed.data.capabilities);
-    if (
-      !grant.allowed ||
-      grant.capabilities.some(
-        (capability) =>
-          !requestedCapabilities.has(capability) || !available.has(capability),
-      )
-    ) {
+    };
+    let rawGrant: unknown;
+    try {
+      rawGrant = await this.#grantProvider.grant(grantRequest);
+    } catch {
+      rawGrant = undefined;
+    }
+    const grant = snapshotCapabilityGrant(rawGrant, grantRequest, available);
+    if (grant === undefined || !grant.allowed) {
       const response = errorResponse(
         request,
         "AUTHORIZATION_DENIED",
@@ -888,15 +875,24 @@ export class GameBridge {
     session: Session,
     operation: (session: Session) => Promise<BridgeResponse>,
   ): Promise<BridgeResponse> {
-    try {
-      return await operation(session);
-    } catch {
-      return errorResponse(
-        request,
-        "INTERNAL_ERROR",
-        "The bridge could not complete the request.",
-      );
+    const execution = (async () => {
+      try {
+        return await operation(session);
+      } catch {
+        return errorResponse(
+          request,
+          "INTERNAL_ERROR",
+          "The bridge could not complete the request.",
+        );
+      }
+    })();
+    if (request.mode !== "commit" || request.action !== "game.act") {
+      return execution;
     }
+    let tracked!: Promise<BridgeResponse>;
+    tracked = execution.finally(() => this.#mutations.delete(tracked));
+    this.#mutations.add(tracked);
+    return tracked;
   }
 
   async #closeSession(request: RequestEnvelope, session: Session): Promise<BridgeResponse> {

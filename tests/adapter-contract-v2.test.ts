@@ -17,6 +17,7 @@ import {
   type AuditSink,
   type BridgeMode,
   type BridgeResponse,
+  type CapabilityGrantProvider,
   type GameAdapter,
   type RequestContext,
   type RequestEnvelope,
@@ -212,7 +213,7 @@ const readOnlyGrantProvider = {
     return {
       allowed: true as const,
       capabilities: [...new Set(grantRequest.requestedCapabilities)].sort(),
-      scope: { kind: "test-resource" as const, resourceId: "read-only-world" },
+      scope: { kind: "read-only-test", resourceId: "read-only-world" },
       ttlMs: grantRequest.requestedTtlMs ?? 60_000,
       totalActionBudget: 0,
       perActionBudgets: {},
@@ -237,7 +238,7 @@ function testGrantProvider(options: { total?: number; perAction?: number } = {})
       return {
         allowed: true as const,
         capabilities: [...new Set(grantRequest.requestedCapabilities)].sort(),
-        scope: { kind: "test-resource" as const, resourceId: "contract-world" },
+        scope: { kind: "contract-test", resourceId: "contract-world" },
         ttlMs: grantRequest.requestedTtlMs ?? 60_000,
         totalActionBudget: options.total ?? 16,
         perActionBudgets: { write: options.perAction ?? 16 },
@@ -333,6 +334,15 @@ class GatedStateChangeAuditSink implements AuditSink {
   }
 }
 
+class ReservationCountingAuditSink extends MemoryAuditSink {
+  reservations = 0;
+
+  reserveWrite(): undefined {
+    this.reservations += 1;
+    return undefined;
+  }
+}
+
 describe("Adapter Contract v2", () => {
   it("snapshots and serializes a closed adapter manifest at registration", () => {
     const adapter = new ContractTestAdapter();
@@ -423,6 +433,34 @@ describe("Adapter Contract v2", () => {
     };
     expect(() => new AdapterRegistry().register(closureBacked)).toThrow(/declarative/u);
     refinementAllows = true;
+
+    for (const codeBearingSchema of [
+      z.string().trim().min(1),
+      z.string().overwrite((value) => value.trim()),
+      z.coerce.number(),
+      z.string().min(1, { when: () => true } as never),
+    ]) {
+      const codeBearing = new ContractTestAdapter();
+      (codeBearing.actions as Record<string, AdapterActionDefinition>).write = {
+        ...codeBearing.actions.write!,
+        inputSchema: codeBearingSchema,
+      };
+      expect(() => new AdapterRegistry().register(codeBearing)).toThrow(/declarative/u);
+    }
+
+    const publicObservation = new ContractTestAdapter();
+    (publicObservation as unknown as { observation: AdapterObservationDefinition }).observation = {
+      ...publicObservation.observation,
+      requiredCapabilities: [],
+    };
+    expect(() => new AdapterRegistry().register(publicObservation)).toThrow(/capability/u);
+
+    const publicAction = new ContractTestAdapter();
+    (publicAction.actions as Record<string, AdapterActionDefinition>).write = {
+      ...publicAction.actions.write!,
+      requiredCapabilities: [],
+    };
+    expect(() => new AdapterRegistry().register(publicAction)).toThrow(/capability/u);
   });
 
   it("registers a zero-action adapter without a revision provider and enforces serial reads", async () => {
@@ -508,6 +546,53 @@ describe("Adapter Contract v2", () => {
       ),
       "CAPABILITY_DENIED",
     );
+  });
+
+  it("rejects malformed runtime grants before session or audit reservation side effects", async () => {
+    const baseGrant = {
+      allowed: true,
+      capabilities: ["game.observe"],
+      scope: { kind: "contract-test", resourceId: "contract-world" },
+      ttlMs: 1_000,
+      totalActionBudget: 1,
+      perActionBudgets: { write: 1 },
+    };
+    const invalidGrants: readonly unknown[] = [
+      { ...baseGrant, ttlMs: Number.NaN },
+      { ...baseGrant, ttlMs: 1.5 },
+      { ...baseGrant, ttlMs: 60 * 60 * 1_000 + 1 },
+      { ...baseGrant, unexpected: true },
+      { ...baseGrant, scope: { ...baseGrant.scope, unexpected: true } },
+      { ...baseGrant, scope: { kind: "other-adapter", resourceId: "contract-world" } },
+      { ...baseGrant, scope: { kind: "contract-test", resourceId: "x".repeat(129) } },
+      { ...baseGrant, totalActionBudget: 1.5 },
+      { ...baseGrant, capabilities: ["x".repeat(129)] },
+      { ...baseGrant, perActionBudgets: { unknown_action: 1 } },
+      { ...baseGrant, perActionBudgets: { write: 2 } },
+    ];
+
+    for (const [index, invalidGrant] of invalidGrants.entries()) {
+      const adapter = new ContractTestAdapter();
+      const registry = new AdapterRegistry();
+      registry.register(adapter);
+      const sessions = new SessionManager({ idGenerator: () => `invalid-grant-${index}` });
+      const audit = new ReservationCountingAuditSink();
+      const grantProvider = {
+        grant: () => invalidGrant,
+      } as unknown as CapabilityGrantProvider;
+      const bridge = new GameBridge({ registry, sessions, auditSink: audit, grantProvider });
+      const response = await bridge.handle(
+        request(`invalid-grant-${index}`, "session.open", {
+          adapterId: adapter.id,
+          capabilities: ["game.observe"],
+        }),
+        local,
+      );
+      expectError(response, "AUTHORIZATION_DENIED");
+      expect(response.ok ? undefined : response.error.operationPhase).toBe("pre-dispatch");
+      expect(sessions.size).toBe(0);
+      expect(audit.reservations).toBe(0);
+    }
   });
 
   it("returns revisions and charges only dispatched commit attempts once", async () => {
@@ -802,7 +887,7 @@ describe("Adapter Contract v2", () => {
       ),
     ).toMatchObject({ ok: true, result: { stateRevision: 0 } });
 
-    const idle = bridge.waitForStateChangesIdle();
+    const idle = bridge.waitForMutationsIdle();
     let idleSettled = false;
     void idle.then(() => {
       idleSettled = true;
@@ -811,12 +896,19 @@ describe("Adapter Contract v2", () => {
     expect(idleSettled).toBe(false);
     adapter.release.resolve();
     await audit.writeAuditEntered.promise;
-    await Promise.resolve();
-    expect(idleSettled).toBe(false);
-    audit.releaseWriteAudit.resolve();
-    expect(await write).toMatchObject({ ok: true });
     await idle;
     expect(idleSettled).toBe(true);
+    const auditIdle = bridge.createLocalControlPlane().waitForAuditIdle();
+    let auditIdleSettled = false;
+    void auditIdle.then(() => {
+      auditIdleSettled = true;
+    });
+    await Promise.resolve();
+    expect(auditIdleSettled).toBe(false);
+    audit.releaseWriteAudit.resolve();
+    expect(await write).toMatchObject({ ok: true });
+    await auditIdle;
+    expect(auditIdleSettled).toBe(true);
     expect(
       await bridge.handle(
         request("close-during-quiesce", "session.close", {}, { sessionId }),

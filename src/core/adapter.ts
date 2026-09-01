@@ -158,37 +158,198 @@ function stringSet(value: unknown, label: string, pattern = MANIFEST_NAME_PATTER
   return Object.freeze([...values].sort());
 }
 
-const CODE_BEARING_SCHEMA_TYPES = new Set([
-  "catch",
-  "custom",
-  "default",
-  "function",
-  "lazy",
-  "pipe",
-  "prefault",
-  "promise",
-  "transform",
-]);
+const BUILTIN_LENGTH_WHEN = (
+  (
+    (z.string().min(1) as unknown as {
+      _zod: { def: { checks: Array<{ _zod: { def: { when: unknown } } }> } };
+    })._zod.def.checks[0]!
+  )._zod.def.when
+);
 
-function rejectCodeBearingSchema(value: object, label: string): void {
-  const seen = new WeakSet<object>();
-  const visit = (candidate: unknown): void => {
-    if (candidate === null || typeof candidate !== "object" || seen.has(candidate)) return;
-    seen.add(candidate);
-    const internal = candidate as { _zod?: { def?: unknown } };
-    const definition = internal._zod?.def;
-    if (definition !== null && typeof definition === "object") {
-      const descriptor = definition as { type?: unknown; check?: unknown };
+function exactKeys(value: object, expected: readonly string[]): boolean {
+  const actual = Reflect.ownKeys(value);
+  return (
+    actual.every((key) => typeof key === "string") &&
+    actual.length === expected.length &&
+    expected.every((key) => actual.includes(key))
+  );
+}
+
+function schemaDefinition(value: unknown): Record<string, unknown> | undefined {
+  if (value === null || typeof value !== "object") return undefined;
+  const internal = value as { _zod?: { def?: unknown } };
+  const definition = internal._zod?.def;
+  return definition !== null && typeof definition === "object"
+    ? definition as Record<string, unknown>
+    : undefined;
+}
+
+function requireDeclarativeCheck(value: unknown, label: string): void {
+  const definition = schemaDefinition(value);
+  if (definition === undefined || typeof definition.check !== "string") {
+    throw new TypeError(`${label} must use the declarative schema subset.`);
+  }
+  switch (definition.check) {
+    case "min_length":
       if (
-        (typeof descriptor.type === "string" &&
-          CODE_BEARING_SCHEMA_TYPES.has(descriptor.type)) ||
-        descriptor.check === "custom"
+        !exactKeys(definition, ["check", "minimum", "when"]) ||
+        !Number.isSafeInteger(definition.minimum) ||
+        (definition.minimum as number) < 0 ||
+        definition.when !== BUILTIN_LENGTH_WHEN
       ) {
         throw new TypeError(`${label} must use the declarative schema subset.`);
       }
+      return;
+    case "max_length":
+      if (
+        !exactKeys(definition, ["check", "maximum", "when"]) ||
+        !Number.isSafeInteger(definition.maximum) ||
+        (definition.maximum as number) < 0 ||
+        definition.when !== BUILTIN_LENGTH_WHEN
+      ) {
+        throw new TypeError(`${label} must use the declarative schema subset.`);
+      }
+      return;
+    case "greater_than":
+    case "less_than":
+      if (
+        !exactKeys(definition, ["check", "value", "inclusive"]) ||
+        typeof definition.value !== "number" ||
+        !Number.isFinite(definition.value) ||
+        typeof definition.inclusive !== "boolean"
+      ) {
+        throw new TypeError(`${label} must use the declarative schema subset.`);
+      }
+      return;
+    case "number_format":
+      if (
+        !exactKeys(definition, ["type", "check", "abort", "format"]) ||
+        definition.type !== "number" ||
+        definition.abort !== false ||
+        definition.format !== "safeint"
+      ) {
+        throw new TypeError(`${label} must use the declarative schema subset.`);
+      }
+      return;
+    case "string_format":
+      if (
+        !exactKeys(definition, ["check", "format", "pattern"]) ||
+        definition.format !== "regex" ||
+        !(definition.pattern instanceof RegExp) ||
+        definition.pattern.flags !== ""
+      ) {
+        throw new TypeError(`${label} must use the declarative schema subset.`);
+      }
+      return;
+    default:
+      throw new TypeError(`${label} must use the declarative schema subset.`);
+  }
+}
+
+function requireDeclarativeSchema(value: object, label: string): void {
+  const seen = new WeakSet<object>();
+  const visit = (schema: unknown): void => {
+    if (schema === null || typeof schema !== "object" || seen.has(schema)) {
+      if (schema === null || typeof schema !== "object") {
+        throw new TypeError(`${label} must use the declarative schema subset.`);
+      }
+      return;
     }
-    for (const property of Object.values(Object.getOwnPropertyDescriptors(candidate))) {
-      if ("value" in property) visit(property.value);
+    seen.add(schema);
+    const definition = schemaDefinition(schema);
+    if (definition === undefined || typeof definition.type !== "string") {
+      throw new TypeError(`${label} must use the declarative schema subset.`);
+    }
+    const checks = (): void => {
+      if (definition.checks === undefined) return;
+      if (!Array.isArray(definition.checks)) {
+        throw new TypeError(`${label} must use the declarative schema subset.`);
+      }
+      definition.checks.forEach((check) => requireDeclarativeCheck(check, label));
+    };
+    switch (definition.type) {
+      case "string":
+      case "number":
+        if (!exactKeys(definition, definition.checks === undefined ? ["type"] : ["type", "checks"])) {
+          throw new TypeError(`${label} must use the declarative schema subset.`);
+        }
+        checks();
+        return;
+      case "boolean":
+      case "never":
+        if (!exactKeys(definition, ["type"])) {
+          throw new TypeError(`${label} must use the declarative schema subset.`);
+        }
+        return;
+      case "literal":
+        if (
+          !exactKeys(definition, ["type", "values"]) ||
+          !Array.isArray(definition.values) ||
+          definition.values.length < 1 ||
+          definition.values.some(
+            (entry) =>
+              entry !== null &&
+              typeof entry !== "string" &&
+              typeof entry !== "number" &&
+              typeof entry !== "boolean",
+          )
+        ) {
+          throw new TypeError(`${label} must use the declarative schema subset.`);
+        }
+        return;
+      case "enum":
+        if (
+          !exactKeys(definition, ["type", "entries"]) ||
+          definition.entries === null ||
+          typeof definition.entries !== "object" ||
+          Array.isArray(definition.entries) ||
+          Object.values(definition.entries).some(
+            (entry) => typeof entry !== "string" && typeof entry !== "number",
+          )
+        ) {
+          throw new TypeError(`${label} must use the declarative schema subset.`);
+        }
+        return;
+      case "optional":
+        if (!exactKeys(definition, ["type", "innerType"])) {
+          throw new TypeError(`${label} must use the declarative schema subset.`);
+        }
+        visit(definition.innerType);
+        return;
+      case "union":
+        if (
+          !exactKeys(definition, ["type", "options"]) ||
+          !Array.isArray(definition.options) ||
+          definition.options.length < 1
+        ) {
+          throw new TypeError(`${label} must use the declarative schema subset.`);
+        }
+        definition.options.forEach(visit);
+        return;
+      case "array":
+        if (!exactKeys(definition, definition.checks === undefined
+          ? ["type", "element"]
+          : ["type", "element", "checks"])) {
+          throw new TypeError(`${label} must use the declarative schema subset.`);
+        }
+        checks();
+        visit(definition.element);
+        return;
+      case "object": {
+        if (
+          !exactKeys(definition, ["type", "shape", "catchall"]) ||
+          definition.shape === null ||
+          typeof definition.shape !== "object" ||
+          Array.isArray(definition.shape) ||
+          schemaDefinition(definition.catchall)?.type !== "never"
+        ) {
+          throw new TypeError(`${label} must use strict declarative objects.`);
+        }
+        Object.values(definition.shape).forEach(visit);
+        return;
+      }
+      default:
+        throw new TypeError(`${label} must use the declarative schema subset.`);
     }
   };
   visit(value);
@@ -205,7 +366,7 @@ function schemaSnapshot(value: unknown, label: string): AdapterSchema {
     throw new TypeError(`${label} must be a Zod schema.`);
   }
   try {
-    rejectCodeBearingSchema(value, label);
+    requireDeclarativeSchema(value, label);
     const jsonSchema = deepFreezeJson(
       JSON.parse(JSON.stringify(z.toJSONSchema(value))) as unknown,
     );
@@ -250,10 +411,16 @@ function snapshotObservation(value: unknown): AdapterObservationDefinition {
     outputSchema: schemaSnapshot(ownData(value, "outputSchema"), "observation outputSchema"),
     effectKind: "read",
     concurrency,
-    requiredCapabilities: stringSet(
-      ownData(value, "requiredCapabilities"),
-      "observation requiredCapabilities",
-    ),
+    requiredCapabilities: (() => {
+      const capabilities = stringSet(
+        ownData(value, "requiredCapabilities"),
+        "observation requiredCapabilities",
+      );
+      if (capabilities.length === 0) {
+        throw new TypeError("Adapter observation must require at least one capability.");
+      }
+      return capabilities;
+    })(),
     maxResultBytes: positiveResultLimit(
       ownData(value, "maxResultBytes"),
       "observation maxResultBytes",
@@ -336,10 +503,16 @@ function snapshotAction(value: unknown, actionName: string): AdapterActionDefini
     outputSchema: schemaSnapshot(ownData(value, "outputSchema"), `${actionName} outputSchema`),
     effectKind,
     dryRunSemantics,
-    requiredCapabilities: stringSet(
-      ownData(value, "requiredCapabilities"),
-      `${actionName} requiredCapabilities`,
-    ),
+    requiredCapabilities: (() => {
+      const capabilities = stringSet(
+        ownData(value, "requiredCapabilities"),
+        `${actionName} requiredCapabilities`,
+      );
+      if (capabilities.length === 0) {
+        throw new TypeError(`Adapter action ${actionName} must require a capability.`);
+      }
+      return capabilities;
+    })(),
     maxResultBytes: positiveResultLimit(
       ownData(value, "maxResultBytes"),
       `${actionName} maxResultBytes`,

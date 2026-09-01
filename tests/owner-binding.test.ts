@@ -68,10 +68,14 @@ const trustedRemoteGrantProvider = {
     return {
       allowed: true as const,
       capabilities: [...new Set(request.requestedCapabilities)].sort(),
-      scope: { kind: "test-resource" as const, resourceId: "owner-bound-world" },
+      scope: { kind: "mock-world", resourceId: "owner-bound-world" },
       ttlMs: request.requestedTtlMs ?? 15 * 60 * 1_000,
       totalActionBudget: 64,
-      perActionBudgets: { move: 64, place_block: 64 },
+      perActionBudgets: Object.fromEntries(
+        Object.entries(request.adapter.actions)
+          .filter(([, action]) => action.effectKind === "write")
+          .map(([action]) => [action, 64]),
+      ),
     };
   },
 };

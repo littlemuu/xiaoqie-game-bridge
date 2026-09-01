@@ -67,7 +67,7 @@ const gatedGrantProvider = {
     return {
       allowed: true as const,
       capabilities: [...new Set(request.requestedCapabilities)].sort(),
-      scope: { kind: "test-resource" as const, resourceId: "gated-world" },
+      scope: { kind: "gated-world", resourceId: "gated-world" },
       ttlMs: request.requestedTtlMs ?? 1_000,
       totalActionBudget: 64,
       perActionBudgets: { gated_write: 64 },

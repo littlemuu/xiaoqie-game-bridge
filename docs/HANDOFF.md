@@ -9,9 +9,9 @@
 - Registration-time validation, snapshotting, and freezing of adapter identity,
   observation, actions, schemas, capabilities, limits, and metadata; runtime
   replacement of the source manifest cannot expand the registered surface
-- Declarative JSON-Schema-round-trippable Zod subset only; code-bearing
-  refinements/transforms/codecs are rejected and the rebuilt validator is
-  hidden behind a frozen wrapper
+- Positive allowlist for JSON-Schema-round-trippable Zod nodes/checks/options;
+  refinements/transforms/codecs, overwrite/trim, coerce, user `when`, and every
+  unknown definition are rejected; the rebuilt validator is hidden and frozen
 - Zero-action read-only adapters, optional revision providers unless demanded
   by an action, and parallel/serial/resource-serial observation scheduling
 - Pure-JSON `bridge.describe` catalog with input/output JSON Schema and no Zod
@@ -19,6 +19,9 @@
 - Explicit trusted mock grant provider with fixed tiny-world scope, actual
   requested/profile/manifest intersection, TTL cap, session action budget, and
   per-action budgets; owner binding remains independent from authorization
+- Closed-world runtime grant snapshot before side effects: bounded integer TTL,
+  adapter-namespaced scope, deduplicated request/manifest capabilities, and
+  write-action-aligned budgets with no extra fields
 - Monotonic mock `stateRevision`, observation/preview revision output,
   required `expectedRevision` on mock commits, and one increment per successful
   write only
@@ -125,9 +128,9 @@
   revision admission. A `not-dispatched` runtime result rolls back the
   reservation. Dry-run, pre-dispatch rejection and replay do not charge;
   worker rejection and outcome unknown charge once because dispatch occurred.
-- Quiescing rejects new session opens and commit writes, retains stop/close/read,
-  and product shutdown drains admitted state changes plus their critical audit
-  writes before closing the adapter and ledger.
+- Quiescing rejects new session opens and commit writes and retains stop/close/read.
+  Product shutdown separately bounds mutation settlement, closes the adapter,
+  then always invokes the ledger's own bounded drain/abort even on adapter error.
 - Invalid output after a write is classified with a fixed output error and
   outcome-unknown phase, then faults later commit health. The original output
   is never echoed or audited.
@@ -199,13 +202,13 @@ Actual local results on 2026-09-01 with Node.js `v22.23.1` and npm `10.9.8`:
 - `npm ci` — passed; 73 packages installed, 74 audited, 0 vulnerabilities
 - `npm audit` — passed; 0 vulnerabilities
 - `npm run check` — passed
-- `npm test` — passed; 10 files, 146 tests passed and 2 explicitly inapplicable
-  Windows gates skipped (148 registered assertions) in 42.03 s. All prior
+- `npm test` — passed; 10 files, 148 tests passed and 2 explicitly inapplicable
+  Windows gates skipped (150 registered assertions) in 38.47 s. All prior
   protocol, MCP, operator, audit, safety, idempotency, capacity and containment
-  regressions remain green. The new Adapter Contract v2 group covers immutable
-  catalog snapshots, trusted grants, revisions, write serialization, safety
-  admission, budgets, output validation, health transitions, adapter rejection,
-  and conservative outcome-unknown handling.
+  regressions remain green. Adapter Contract v2 coverage now includes the Zod
+  positive allowlist, malformed runtime grants before side effects, separate
+  mutation/audit shutdown phases, adapter-close failure cleanup, immutable
+  catalogs, revisions, budgets, output validation, and outcome-unknown handling.
 - Real stdio contract — passed inside `npm test`; official
   `Client@2.0.0`/`StdioClientTransport` started the built Node entrypoint,
   completed initialize/list/calls, and closed client first then transport
@@ -285,7 +288,7 @@ audit, and diff-check. It does not run or claim the non-elevated allow path,
 named-pipe/operator, process-adapter, MCP stdio, CLI, lifecycle, or demo suite.
 Those remain local non-elevated Windows evidence until a suitable dedicated
 runner exists. The final Node 22 run for Adapter Contract v2 passed all 10 files
-with 146 passed/2 explicitly inapplicable skips in 42.03 s; the exact inventory
+with 148 passed/2 explicitly inapplicable skips in 38.47 s; the exact inventory
 now includes `adapter-contract-v2.test.ts`, so partial or stale nine-file output
 cannot become non-elevated Windows evidence.
 
