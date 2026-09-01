@@ -75,6 +75,8 @@ describe("canonical release evidence", () => {
     const paths = archive.map((entry) => entry.path);
     expect(paths).toContain("xiaoqie-game-bridge-0.1.0-rc.1/native/windows-worker-launcher.cpp");
     expect(paths).toContain("xiaoqie-game-bridge-0.1.0-rc.1/dist/src/mcp/stdio-server.js");
+    expect(archive.find((entry) => entry.path.endsWith("/.nvmrc"))?.data.toString("utf8"))
+      .toBe("22.23.1\n");
     expect(paths.some((path) => /(?:\.exe|\.dll|node_modules|\.git|coverage|\.log|\.env)/iu.test(path))).toBe(false);
     expect(result.manifest.files.map((file: { path: string }) => file.path))
       .toEqual(paths.map((path) => path.replace("xiaoqie-game-bridge-0.1.0-rc.1/", "")));

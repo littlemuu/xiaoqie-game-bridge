@@ -21,7 +21,7 @@ export const WINDOWS_EVIDENCE_SCHEMA = "xiaoqie.windows-evidence/v1";
 
 const scriptRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const TEXT_EXTENSIONS = new Set([
-  "", ".cjs", ".cpp", ".json", ".js", ".md", ".mjs", ".ts", ".yml", ".yaml",
+  "", ".cjs", ".cpp", ".json", ".js", ".md", ".mjs", ".nvmrc", ".ts", ".yml", ".yaml",
 ]);
 const STATIC_FILES = [
   ".nvmrc",

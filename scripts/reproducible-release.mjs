@@ -50,12 +50,18 @@ try {
   if (first.bundle.sha256 !== second.bundle.sha256 || first.bundle.bytes !== second.bundle.bytes) {
     throw new Error("Independent clean checkouts produced different canonical bundle digests.");
   }
+  run(root, process.execPath, ["scripts/release.mjs", "build", "--expected-commit", commit, "--expected-ref", ref], environment);
+  const checkoutManifest = manifest(root);
+  if (checkoutManifest.bundle.sha256 !== first.bundle.sha256 || checkoutManifest.bundle.bytes !== first.bundle.bytes) {
+    throw new Error("The release checkout bundle does not match both independent clean builds.");
+  }
   process.stdout.write(`${JSON.stringify({
     schema: "xiaoqie.reproducibility/v1",
     verified: true,
     commit,
     ref,
     builds: 2,
+    releaseCheckoutMatched: true,
     bundle: first.bundle,
   })}\n`);
 } catch (error) {
