@@ -15,6 +15,7 @@ import {
 } from "../src/index.js";
 
 const isWindows = process.platform === "win32";
+const expectElevatedHost = process.env.XIAOQIE_EXPECT_ELEVATED_HOST === "1";
 const probeWorkerPath = fileURLToPath(
   import.meta.url.endsWith(".ts")
     ? new URL("../dist/tests/fixtures/containment-probe-worker.js", import.meta.url)
@@ -96,7 +97,7 @@ function messageOfType(messages: unknown[], type: string): Record<string, unknow
   );
 }
 
-describe.runIf(isWindows)("real Windows worker containment", () => {
+describe.runIf(isWindows && !expectElevatedHost)("real Windows worker containment", () => {
   it("attests the actual restricted token and Job before the first worker instruction", async () => {
     const run = await runProbe("probe-attestation");
     expect(run.code, JSON.stringify({ messages: run.messages, stderrBytes: run.stderrBytes })).toBe(0);
@@ -375,6 +376,25 @@ describe.runIf(isWindows)("real Windows worker containment", () => {
     child.stderr!.on("data", (chunk: Buffer) => { stderrBytes += chunk.byteLength; });
     const code = await new Promise<number | null>((resolve) => child.once("close", resolve));
     expect({ code, stdoutBytes, stderrBytes }).toEqual({ code: 40, stdoutBytes: 0, stderrBytes: 0 });
+  });
+});
+
+describe.runIf(isWindows && expectElevatedHost)("elevated Windows host gate", () => {
+  it("rejects the product launch before worker entry without emitting details", async () => {
+    const spec = fixedWorkerLaunchSpec();
+    const child = spawn(spec.executable, spec.argv, {
+      cwd: spec.cwd,
+      env: spec.env,
+      shell: spec.shell,
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    child.stdout!.on("data", (chunk: Buffer) => { stdoutBytes += chunk.byteLength; });
+    child.stderr!.on("data", (chunk: Buffer) => { stderrBytes += chunk.byteLength; });
+    const code = await new Promise<number | null>((resolve) => child.once("close", resolve));
+    expect({ code, stdoutBytes, stderrBytes }).toEqual({ code: 41, stdoutBytes: 0, stderrBytes: 0 });
   });
 });
 

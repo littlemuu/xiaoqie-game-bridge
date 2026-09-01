@@ -184,6 +184,15 @@ duplicate without consuming bytes, and passes only the original endpoint to the
 worker. This uses the standard-handle contract shared by MSVCRT and UCRT rather
 than relying on extra CRT file descriptors.
 
+GitHub-hosted Windows runners are elevated administrators, while the product
+intentionally rejects every elevated host. The Windows workflow therefore
+compiles both helpers with MSVC/UCRT, explicitly verifies the runner's elevated
+role, and runs the product binary's no-output/exit-41 pre-worker rejection
+regression. It does not claim a hosted happy-path containment run. The complete
+non-elevated Windows suite remains local evidence until a non-elevated dedicated
+runner is available; no account, ACL, UAC, or product-policy mutation is used to
+manufacture a hosted pass.
+
 Windows audit-file evidence was sampled from a real append-and-sync in a
 uniquely named temporary directory. The ledger object was a directory, its
 segment was a regular 386-byte file, both were owned by the current user, each
