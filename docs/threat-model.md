@@ -52,6 +52,11 @@ injects a frozen local context. A caller that adds undeclared envelope fields is
 rejected by the SDK schema before `GameBridge.handle`; action-specific schemas
 still reject undeclared fields inside `params`.
 
+capability 请求本身不产生授权。session grant 必须同时落在调用方请求、可信
+mock profile、注册时快照的 adapter manifest 与 fixed tiny-world scope 内；
+owner digest/session ID 都不能扩大 grant。manifest 的 action、schema、required
+capabilities 和 metadata 在注册后不能通过替换原对象来扩大权限面。
+
 ### Token disclosure and replay
 
 Sessions are memory-only. Audit events store truncated SHA-256 tags instead of
@@ -97,6 +102,12 @@ request fingerprint uses deterministic key ordering. Future distributed
 transports must preserve the request ID and must not generate a fresh ID when
 automatically retrying a write.
 
+Adapter Contract v2 进一步区分 dispatch 前拒绝、adapter 明确拒绝、明确成功与
+dispatch 后 `OUTCOME_UNKNOWN`。同一个 session/request ID 会缓存并重放同一
+分类，不会自动生成新 ID 再试。当前仍没有 durable operation journal 或
+reconciliation，因此 `OUTCOME_UNKNOWN` 会把 runtime commit health 置为
+`faulted`；该保守停止不能被描述成动作未发生或已回滚。
+
 MCP's JSON-RPC request ID is transport bookkeeping and is unrelated to the
 bridge `requestId` inside tool arguments. The stdio wrapper does not synthesize,
 replace, or automatically retry bridge IDs. A logical-size or handler-capacity
@@ -110,20 +121,56 @@ commit-write limits. Session open sweeps eligible terminal state before a
 stable capacity refusal. Request capacity never evicts in-flight or completed
 commit evidence; new requests are refused before adapter execution.
 
-The stdio transport has an explicit 64 KiB read-buffer ceiling. The tool handler
+Adapter Contract v2 不从这些容量上限推导安全并发。每个 observation 显式声明
+`parallel`、`serial` 或 `resource-serial`；后两者使用无等待队列 permit。
+preview action 不取得 write permit；read/preview 都不能修改 world。纯只读 adapter
+可声明零个 action 且无需 revision provider。commit write 在现有全局 safety gate
+内取得 adapter/scope/resource 单写 permit。未来真实 adapter 必须用实际证据声明
+自己的读取与写入语义，不能隐式继承 mock 的并发结论。
+
+The stdio transport has an explicit 128 KiB read-buffer ceiling. The tool handler
 independently measures deterministic UTF-8 envelope bytes and refuses more than
-32 KiB. A synchronous gate admits at most eight concurrent handlers by default;
+32 KiB. Complete duplicated tool results are limited to 112 KiB. The remaining
+16 KiB is split into at most 8 KiB for a JSON-encoded request ID and at least
+8 KiB for outer JSON-RPC fields and escaping. IDs must be safe integers or
+bounded strings; an oversized ID receives fixed `-32600` with `id: null` and is
+not reflected. Every outbound frame is measured before the SDK writes it.
+Oversized tool output becomes fixed `RESOURCE_CAPACITY`, and an unexpected
+oversized outer response becomes a fixed bounded JSON-RPC error; the connection
+remains usable. A synchronous gate
+admits at most eight concurrent handlers by default;
 full capacity rejects immediately before bridge/adapter execution and creates no
 unbounded queue. Permits release in `finally`. Future remote work still needs
 per-principal and per-action rate limits.
 
+session 还具有总 commit-attempt 与 per-action 预算。同资源写入使用无等待队列
+的单写 permit；全局最多四个 write 只负责资源上限，不再被当作状态安全证明。
+预算只在 revision、health、safety 与资源 permit 全部通过、即将 dispatch 前
+原子预留；adapter 明确报告 `not-dispatched` 时回滚。dry-run、dispatch 前拒绝和
+幂等重放不扣减，worker 已接收后的明确拒绝或不确定结果只扣一次。
+
 ### Protocol output or diagnostics leak attacker data
 
-Every core result is validated by `responseEnvelopeSchema`, sanitized, and
+Every core result is validated by `responseEnvelopeSchema` and
 serialized deterministically. Invalid output, thrown errors, and mismatched
 request identity become a fixed `INTERNAL_ERROR`; raw results, stack traces, and
 exceptions are not written to MCP. Stdout carries MCP only. Transport failures
 write a fixed message to stderr without embedding the received frame or error.
+The wrapper measures the complete text-plus-structured tool result before the
+SDK can frame it, so an oversized bridge response is replaced by a fixed
+`RESOURCE_CAPACITY` envelope rather than a transport disconnect.
+The transport wrapper also measures the final JSON-RPC frame and bounds the
+otherwise-unlimited SDK string request ID before handler dispatch.
+Audit key-name redaction is deliberately not applied to protocol responses:
+otherwise ordinary domain fields such as `path`, `token`, or `password` would
+silently change a validated JSON Schema or result type. Adapter results are
+validated against their registered output schema before the envelope is built;
+the MCP wrapper performs no later value transformation.
+
+observation 和 action 返回值在进入 `BridgeResponse` 前还必须通过注册快照中的
+output schema 与固定 UTF-8 字节上限。schema 不匹配、不可 JSON 序列化或过大
+只返回固定 `ADAPTER_OUTPUT_INVALID` / `ADAPTER_RESULT_TOO_LARGE`；原值、
+sentinel 与 stack 不进入 response、MCP text、stderr 或 audit。
 
 ### Audit loss, corruption, or false durability
 
@@ -179,6 +226,49 @@ and when the action executes. A real adapter still requires code review and
 adapter-specific sandboxing because TypeScript interfaces alone cannot contain
 malicious implementation code.
 
+每个 action 同时声明 effect kind、dry-run 语义、required capability 集合、
+result limit、资源并发键、adapter error allowlist、revision 要求和未来
+reconciliation 能力。`bridge.describe` 只输出可序列化 JSON Schema 与这些
+固定字段，不暴露 Zod 实例或函数。adapter-specific 错误只能作为固定
+`ADAPTER_REJECTED` 下的 allowlisted code 出现，不能扩张 core error enum 或
+回显异常文本。
+
+注册按 Zod node/check/option 正向白名单只接受能无损转成 JSON Schema 的声明式
+子集。注册先以 descriptor 捕获有界、own-data-only 的不可变 AST；hole、accessor、
+symbol/extra key、Proxy 异常、自定义 `_zod.toJSONSchema` / `_zod.processJSONSchema`、
+非有限/有损 JSON number 与任何未识别定义均被拒绝。Zod 内建 object lazy-shape
+getter 按锁定实现身份读取恰好一次。可信 schema 从 AST 重建后才使用独有空
+metadata registry 发射；活动 validator 再从深冻结 JSON 快照的隔离副本重建并
+隐藏，因此源 definition graph、metadata、emitter 或后续修改不能改变验证逻辑。
+property name、string literal/enum 与 regex source 受 1 KiB UTF-8 标量上限约束，
+每份 schema snapshot、单 adapter catalog 与 registry 聚合 catalog 另有
+16 KiB / 24 KiB / 32 KiB 固定上限，registry 最多 64 个 adapter。
+
+Capability grant 虽来自受信 provider，仍作为运行时边界严格捕获、校验、复制：
+对象和 scope 无额外字段或 accessor，TTL 是受请求/全局上限约束的正 safe
+integer，capability 是请求与 manifest 的去重子集，scope kind 属于 adapter
+namespace，budget key 只引用 manifest write action。非法 grant 在 session 插入和
+audit reservation 之前固定拒绝，因此 `NaN` expiry 不能形成不可回收 session。
+异步 grant 返回后还会立即重检 runtime/adapter/audit health；quiescing 或 faulted
+转换不能在 provider 等待窗口后提交 session。
+capability array 的 own `length` data descriptor 只读取一次；live Proxy `length`
+不会被重复读取来改变 64 项上限、own-key 校验或捕获循环边界。
+
+adapter manifest 的可选 health member 在注册 snapshot 时只读取一次；真正缺省才允许
+ready 默认值，已定义的非函数、Promise/thenable 或 getter 异常直接拒绝注册。已注册
+health callback 的返回结果与 audit health 同样收敛到闭集；unknown status、throw、
+Promise/thenable、accessor、`NaN` 或负 count 分别保守映射为 adapter `faulted` 或 audit
+`corrupt`；operator 仍得到合法固定快照，commit 则在 session/world 副作用前拒绝。
+
+`game.act` 的 effect × mode 是闭合集合：read/preview action 只允许 dry-run，commit
+仅属于 write action；non-write 同时必须声明 `writeConcurrency: none`，不能在 catalog
+中声称运行时未执行的 `resource-serial`。non-write commit 在 adapter dispatch 前固定拒绝，因而不能靠
+`mode === "commit"` 绕过 write health、safety latch、resource scheduler、revision
+admission 或动作预算。
+
+manifest 的 required capability 与 adapter error code 数组使用 descriptor-based
+dense capture；hole、index accessor、symbol/extra key 在任何元素读取前固定拒绝。
+
 The parent still owns identity, session binding, capabilities, action schemas,
 policy, idempotency, safety, and audit. Static metadata must exactly match the
 worker handshake. Caller/session/request identity and secrets never enter IPC.
@@ -196,6 +286,11 @@ crash, non-zero exit, and hostile stdout fail closed. Stderr is discarded, and
 worker/path/stack/raw output never reaches bridge responses or audit. Pending
 promises settle once with timers/capacity released; normal close waits for
 acknowledged zero exit. There is no unbounded queue.
+
+commit 已经 dispatch 后的 timeout、worker exit、非法 result 或无法确认的
+内部异常均保守映射为 `OUTCOME_UNKNOWN`；只有 adapter 在 strict IPC 中明确
+返回 allowlisted 拒绝，才是 `ADAPTER_REJECTED`。client disconnect 不触发自动
+重试，也不声称取消已经进入 worker 的动作。
 
 The native helper now verifies a Restricted Token and dedicated Job before
 resuming worker code. Kernel limits deny a second process, cap process/job
@@ -324,10 +419,11 @@ settlement and then returns to zero.
   no automatic retention/deletion policy or external anchor.
 - The mock worker has a kernel-enforced Restricted Token + Job boundary, but it
   is not a proven filesystem/network sandbox for hostile or real-game code.
-- Capability grants are approved by a simple local-only authorizer; the stdio
-  boundary is the trusted component that asserts locality. A test-only remote
-  authorizer proves the core seam, but no production remote authentication or
-  transport exists.
+- Capability grant 使用显式 fixed mock profile 和 fixed scope；stdio boundary
+  仍是断言 local context 的可信组件。真实 adapter 尚无批准的 profile/resource
+  discovery，test-only remote authorizer/grant 只证明 seam，不构成生产远程认证。
+- `OUTCOME_UNKNOWN` 已阻止后续 commit，但尚无 durable operation journal、
+  operation ID、reconciliation 或跨重启 replay 证据。
 - Already-started adapter writes are not forcibly cancelled; real adapters may
   require cooperative cancellation semantics.
 - The operator launch token and stop generation are process-local. The token is

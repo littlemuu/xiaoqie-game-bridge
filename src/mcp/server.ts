@@ -1,6 +1,6 @@
 import { Buffer } from "node:buffer";
 import { McpServer, type CallToolResult } from "@modelcontextprotocol/server";
-import { redactSensitive } from "../core/audit.js";
+import { canonicalJson } from "../core/canonical-json.js";
 import type { RequestContext } from "../core/request-context.js";
 import {
   type BridgeResponse,
@@ -9,9 +9,13 @@ import {
   requestEnvelopeSchema,
   responseEnvelopeSchema,
 } from "../core/protocol.js";
+import { PACKAGE_VERSION } from "../package-version.js";
 
 export const GAME_BRIDGE_TOOL_NAME = "game_bridge_request";
-export const STDIO_MAX_BUFFER_BYTES = 64 * 1_024;
+export const STDIO_MAX_BUFFER_BYTES = 128 * 1_024;
+export const MCP_JSON_RPC_RESERVE_BYTES = 16 * 1_024;
+export const MCP_MAX_TOOL_RESULT_BYTES =
+  STDIO_MAX_BUFFER_BYTES - MCP_JSON_RPC_RESERVE_BYTES;
 export const MCP_MAX_ENVELOPE_BYTES = 32 * 1_024;
 export const MCP_MAX_CONCURRENT_HANDLERS = 8;
 
@@ -77,29 +81,26 @@ function requirePositiveByteLimit(value: number): void {
   }
 }
 
-function canonicalJson(value: unknown): string {
-  if (Array.isArray(value)) {
-    return `[${value.map(canonicalJson).join(",")}]`;
-  }
-  if (value !== null && typeof value === "object") {
-    return `{${Object.entries(value as Record<string, unknown>)
-      .filter(([, child]) => child !== undefined)
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([key, child]) => `${JSON.stringify(key)}:${canonicalJson(child)}`)
-      .join(",")}}`;
-  }
-  const serialized = JSON.stringify(value);
-  if (serialized === undefined) {
-    throw new TypeError("The MCP response is not JSON serializable.");
-  }
-  return serialized;
-}
-
 function fixedInternalResponse(request: RequestEnvelope): BridgeResponse {
   return errorResponse(
     request,
     "INTERNAL_ERROR",
     "The local MCP boundary could not produce a valid bridge response.",
+  );
+}
+
+class McpToolResultCapacityError extends Error {
+  constructor() {
+    super("The MCP tool result exceeds its supported wire budget.");
+    this.name = "McpToolResultCapacityError";
+  }
+}
+
+function fixedCapacityResponse(request: RequestEnvelope): BridgeResponse {
+  return errorResponse(
+    request,
+    "RESOURCE_CAPACITY",
+    "The local MCP response exceeds its supported wire budget.",
   );
 }
 
@@ -116,25 +117,35 @@ function responseMatchesRequest(
 }
 
 function toolResult(response: BridgeResponse): CallToolResult {
-  const sanitized = redactSensitive(response);
-  const parsed = responseEnvelopeSchema.safeParse(sanitized);
+  const parsed = responseEnvelopeSchema.safeParse(response);
   if (!parsed.success) {
-    throw new TypeError("The sanitized bridge response is invalid.");
+    throw new TypeError("The bridge response is invalid.");
   }
-  const validated = sanitized as BridgeResponse;
+  const validated = parsed.data as BridgeResponse;
   const text = canonicalJson(validated);
-  return {
+  const candidate: CallToolResult = {
     content: [{ type: "text", text }],
     structuredContent: validated,
     ...(!validated.ok ? { isError: true } : {}),
   };
+  if (
+    Buffer.byteLength(canonicalJson(candidate), "utf8") >
+    MCP_MAX_TOOL_RESULT_BYTES
+  ) {
+    throw new McpToolResultCapacityError();
+  }
+  return candidate;
 }
 
 function safeToolResult(response: BridgeResponse, request: RequestEnvelope): CallToolResult {
   try {
     return toolResult(response);
-  } catch {
-    return toolResult(fixedInternalResponse(request));
+  } catch (error) {
+    return toolResult(
+      error instanceof McpToolResultCapacityError
+        ? fixedCapacityResponse(request)
+        : fixedInternalResponse(request),
+    );
   }
 }
 
@@ -158,7 +169,7 @@ export function createGameBridgeMcpServer(
     );
   const server = new McpServer({
     name: "xiaoqie-game-bridge",
-    version: "0.1.0",
+    version: PACKAGE_VERSION,
   });
 
   server.registerTool(

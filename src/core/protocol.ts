@@ -34,9 +34,13 @@ export const errorCodes = [
   "REQUEST_ID_REUSED",
   "RESOURCE_CAPACITY",
   "AUTHORIZATION_DENIED",
-  "OUT_OF_BOUNDS",
-  "BLOCK_NOT_ALLOWED",
-  "TARGET_OCCUPIED",
+  "ADAPTER_REJECTED",
+  "ADAPTER_OUTPUT_INVALID",
+  "ADAPTER_RESULT_TOO_LARGE",
+  "REVISION_REQUIRED",
+  "REVISION_CONFLICT",
+  "RUNTIME_UNAVAILABLE",
+  "OUTCOME_UNKNOWN",
   "INTERNAL_ERROR",
 ] as const;
 
@@ -45,6 +49,12 @@ export type ErrorCode = (typeof errorCodes)[number];
 export interface BridgeError {
   code: ErrorCode;
   message: string;
+  operationPhase?:
+    | "pre-dispatch"
+    | "adapter-rejected"
+    | "adapter-succeeded"
+    | "outcome-unknown";
+  adapterError?: { code: string };
 }
 
 interface ResponseBase {
@@ -81,11 +91,78 @@ export const responseEnvelopeSchema = z.discriminatedUnion("ok", [
     .extend({
       ok: z.literal(false),
       error: z
-        .object({ code: z.enum(errorCodes), message: z.string().min(1).max(512) })
+        .object({
+          code: z.enum(errorCodes),
+          message: z.string().min(1).max(512),
+          operationPhase: z
+            .enum([
+              "pre-dispatch",
+              "adapter-rejected",
+              "adapter-succeeded",
+              "outcome-unknown",
+            ])
+            .optional(),
+          adapterError: z
+            .object({ code: z.string().regex(/^[A-Z][A-Z0-9_]{0,63}$/u) })
+            .strict()
+            .optional(),
+        })
         .strict(),
     })
     .strict(),
-]);
+]).superRefine((response, context) => {
+  if (response.ok) return;
+  const { code, operationPhase, adapterError } = response.error;
+  const semanticCodes: ReadonlySet<ErrorCode> = new Set([
+    "ADAPTER_REJECTED",
+    "ADAPTER_OUTPUT_INVALID",
+    "ADAPTER_RESULT_TOO_LARGE",
+    "REVISION_REQUIRED",
+    "REVISION_CONFLICT",
+    "RUNTIME_UNAVAILABLE",
+    "OUTCOME_UNKNOWN",
+  ]);
+  const allowedByPhase: Partial<Record<NonNullable<BridgeError["operationPhase"]>, ReadonlySet<ErrorCode>>> = {
+    "pre-dispatch": new Set([
+      "INVALID_PARAMS",
+      "CAPABILITY_DENIED",
+      "ACTION_NOT_ALLOWED",
+      "SAFETY_STOPPED",
+      "RESOURCE_CAPACITY",
+      "AUTHORIZATION_DENIED",
+      "REVISION_REQUIRED",
+      "REVISION_CONFLICT",
+      "RUNTIME_UNAVAILABLE",
+    ]),
+    "adapter-rejected": new Set([
+      "ADAPTER_REJECTED",
+      "REVISION_CONFLICT",
+      "RUNTIME_UNAVAILABLE",
+    ]),
+    "adapter-succeeded": new Set([
+      "ADAPTER_OUTPUT_INVALID",
+      "ADAPTER_RESULT_TOO_LARGE",
+    ]),
+    "outcome-unknown": new Set([
+      "ADAPTER_OUTPUT_INVALID",
+      "ADAPTER_RESULT_TOO_LARGE",
+      "OUTCOME_UNKNOWN",
+    ]),
+  };
+  if (
+    (code === "ADAPTER_REJECTED") !== (adapterError !== undefined) ||
+    (code === "ADAPTER_REJECTED" && operationPhase !== "adapter-rejected") ||
+    (code === "OUTCOME_UNKNOWN" && operationPhase !== "outcome-unknown") ||
+    (semanticCodes.has(code) && operationPhase === undefined) ||
+    (operationPhase !== undefined && !allowedByPhase[operationPhase]?.has(code))
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "Bridge error code, phase, and adapter namespace are inconsistent.",
+      path: ["error"],
+    });
+  }
+});
 
 export function successResponse(
   request: RequestEnvelope,
@@ -106,6 +183,7 @@ export function errorResponse(
   request: Pick<RequestEnvelope, "requestId" | "sessionId" | "action" | "mode">,
   code: ErrorCode,
   message: string,
+  details: Pick<BridgeError, "operationPhase" | "adapterError"> = {},
 ): ErrorResponse {
   return {
     protocolVersion: PROTOCOL_VERSION,
@@ -114,7 +192,7 @@ export function errorResponse(
     action: request.action,
     mode: request.mode,
     ok: false,
-    error: { code, message },
+    error: { code, message, ...details },
   };
 }
 

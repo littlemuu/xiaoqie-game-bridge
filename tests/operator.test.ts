@@ -272,6 +272,43 @@ async function waitUntilMissing(path: string): Promise<boolean> {
 }
 
 describe.runIf(process.platform === "win32")("local operator control plane", () => {
+  it("derives top-level status from the same health snapshot", async () => {
+    const { bridge } = bridgeFixture();
+    const base = bridge.createLocalControlPlane();
+    const baseHealth = base.getHealthStatus();
+    let healthCalls = 0;
+    let safetyCalls = 0;
+    const server = await startLocalOperatorServer(Object.freeze({
+      ...base,
+      getHealthStatus: () => {
+        healthCalls += 1;
+        return Object.freeze({
+          ...baseHealth,
+          safety: Object.freeze({
+            ...baseHealth.safety,
+            stopped: true,
+            stopGeneration: 40 + healthCalls,
+          }),
+        });
+      },
+      getSafetyStatus: () => {
+        safetyCalls += 1;
+        return base.getSafetyStatus();
+      },
+    }));
+    servers.push(server);
+
+    const response = await callLocalOperator({ command: "status" });
+    expect(response).toMatchObject({
+      ok: true,
+      command: "status",
+      status: { stopped: true, stopGeneration: 41 },
+      health: { safety: { stopped: true, stopGeneration: 41 } },
+    });
+    expect(healthCalls).toBe(1);
+    expect(safetyCalls).toBe(0);
+  });
+
   it("shares safety state, enforces stop generations, and writes bounded audit events", async () => {
     const { audit } = await startFixture();
     const initial = await callLocalOperator({ command: "status" });
@@ -697,8 +734,15 @@ describe.runIf(process.platform === "win32")("local operator control plane", () 
     expect(gatePermit).toBeDefined();
     expect(writePermit.allowed).toBe(true);
     const ownerKey = deriveSessionOwnerKey({ transport: "local" });
-    sessions.open(ownerKey, "mock-world", ["game.observe"]);
-    expect(() => sessions.open(ownerKey, "mock-world", ["game.observe"])).toThrow();
+    const directGrant = {
+      scope: { kind: "test-resource" as const, resourceId: "operator-capacity" },
+      totalActionBudget: 1,
+      perActionBudgets: {},
+    };
+    sessions.open(ownerKey, "mock-world", ["game.observe"], undefined, directGrant);
+    expect(() =>
+      sessions.open(ownerKey, "mock-world", ["game.observe"], undefined, directGrant),
+    ).toThrow();
     const pendingAdapter = adapter.observe().catch((error: unknown) => error);
     await new Promise((resolvePromise) => setImmediate(resolvePromise));
     await expect(adapter.observe()).rejects.toMatchObject({ category: "capacity" });
@@ -817,7 +861,9 @@ describe.runIf(process.platform === "win32")("local operator control plane", () 
       expect(await runCli(["status"], isolated.env)).toEqual({
         exitCode: 0,
         stderr: "",
-        stdout: "STATUS stopped=false inFlightWrites=0 maxInFlightWrites=4 generation=0\n",
+        stdout:
+          "STATUS stopped=false inFlightWrites=0 maxInFlightWrites=4 generation=0 " +
+          "runtime=ready adapter=ready audit=ready registeredAdapters=1 auditWrites=0\n",
       });
 
       const opened = await callBridge(
@@ -847,6 +893,7 @@ describe.runIf(process.platform === "win32")("local operator control plane", () 
               adapterId: "mock-world",
               gameAction: "move",
               input: { dx: 1, dy: 0, dz: 0 },
+              expectedRevision: 0,
             },
             { sessionId },
           ),
@@ -874,6 +921,7 @@ describe.runIf(process.platform === "win32")("local operator control plane", () 
               adapterId: "mock-world",
               gameAction: "move",
               input: { dx: 1, dy: 0, dz: 0 },
+              expectedRevision: 0,
             },
             { sessionId, mode: "dry-run" },
           ),
@@ -909,6 +957,7 @@ describe.runIf(process.platform === "win32")("local operator control plane", () 
               adapterId: "mock-world",
               gameAction: "move",
               input: { dx: 1, dy: 0, dz: 0 },
+              expectedRevision: 0,
             },
             { sessionId },
           ),

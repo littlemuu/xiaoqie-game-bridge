@@ -97,6 +97,49 @@ function handleLocal(harness: Harness, request: RequestEnvelope): Promise<Bridge
 }
 
 describe("GameBridge safety contract", () => {
+  it("rejects contradictory adapter error codes and operation phases", () => {
+    const base = {
+      protocolVersion: "1.0",
+      requestId: "response-contract",
+      action: "game.act",
+      mode: "commit",
+      ok: false,
+    } as const;
+    expect(responseEnvelopeSchema.safeParse({
+      ...base,
+      error: {
+        code: "ADAPTER_REJECTED",
+        message: "rejected",
+        operationPhase: "adapter-rejected",
+        adapterError: { code: "TARGET_OCCUPIED" },
+      },
+    }).success).toBe(true);
+    for (const error of [
+      {
+        code: "ADAPTER_REJECTED",
+        message: "missing namespace",
+        operationPhase: "adapter-rejected",
+      },
+      {
+        code: "RUNTIME_UNAVAILABLE",
+        message: "foreign namespace",
+        operationPhase: "pre-dispatch",
+        adapterError: { code: "TARGET_OCCUPIED" },
+      },
+      {
+        code: "OUTCOME_UNKNOWN",
+        message: "wrong phase",
+        operationPhase: "adapter-rejected",
+      },
+      {
+        code: "REVISION_CONFLICT",
+        message: "missing phase",
+      },
+    ]) {
+      expect(responseEnvelopeSchema.safeParse({ ...base, error }).success).toBe(false);
+    }
+  });
+
   it("rejects an invalid envelope without echoing raw input", async () => {
     const harness = createHarness();
     const response = await harness.bridge.handle({
@@ -169,7 +212,12 @@ describe("GameBridge safety contract", () => {
     const move = envelope(
       "same-move",
       "game.act",
-      { adapterId: "mock-world", gameAction: "move", input: { dx: 1, dy: 0, dz: 0 } },
+      {
+        adapterId: "mock-world",
+        gameAction: "move",
+        input: { dx: 1, dy: 0, dz: 0 },
+        expectedRevision: 0,
+      },
       { sessionId },
     );
 
@@ -199,7 +247,12 @@ describe("GameBridge safety contract", () => {
     const move = envelope(
       "concurrent-move",
       "game.act",
-      { adapterId: "mock-world", gameAction: "move", input: { dx: 1, dy: 0, dz: 0 } },
+      {
+        adapterId: "mock-world",
+        gameAction: "move",
+        input: { dx: 1, dy: 0, dz: 0 },
+        expectedRevision: 0,
+      },
       { sessionId },
     );
 
@@ -221,7 +274,12 @@ describe("GameBridge safety contract", () => {
       envelope(
         "preview",
         "game.act",
-        { adapterId: "mock-world", gameAction: "move", input: { dx: 1, dy: 0, dz: 0 } },
+      {
+        adapterId: "mock-world",
+        gameAction: "move",
+        input: { dx: 1, dy: 0, dz: 0 },
+        expectedRevision: 0,
+      },
         { sessionId, mode: "dry-run" },
       ),
     );
@@ -234,7 +292,12 @@ describe("GameBridge safety contract", () => {
       envelope(
         "commit",
         "game.act",
-        { adapterId: "mock-world", gameAction: "move", input: { dx: 1, dy: 0, dz: 0 } },
+        {
+          adapterId: "mock-world",
+          gameAction: "move",
+          input: { dx: 1, dy: 0, dz: 0 },
+          expectedRevision: 0,
+        },
         { sessionId },
       ),
     );
@@ -262,7 +325,12 @@ describe("GameBridge safety contract", () => {
         envelope(
           "blocked-move",
           "game.act",
-          { adapterId: "mock-world", gameAction: "move", input: { dx: 1, dy: 0, dz: 0 } },
+        {
+          adapterId: "mock-world",
+          gameAction: "move",
+          input: { dx: 1, dy: 0, dz: 0 },
+          expectedRevision: 0,
+        },
           { sessionId },
         ),
       ),

@@ -46,7 +46,16 @@ function statusText(status: {
 }
 
 function successText(response: Extract<OperatorResponse, { ok: true }>): string {
-  if (response.command === "status") return `STATUS ${statusText(response.status)}`;
+  if (response.command === "status") {
+    return (
+      `STATUS ${statusText(response.status)} ` +
+      `runtime=${response.health.runtime.status} ` +
+      `adapter=${response.health.adapter.status} ` +
+      `audit=${response.health.audit.status} ` +
+      `registeredAdapters=${response.health.adapter.registeredAdapters} ` +
+      `auditWrites=${response.health.audit.outstandingWrites}`
+    );
+  }
   if (response.command === "stop") {
     return `STOPPED ${statusText(response.status)} alreadyStopped=${response.alreadyStopped}`;
   }

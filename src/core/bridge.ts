@@ -1,7 +1,15 @@
 import { z } from "zod";
 import { randomBytes } from "node:crypto";
-import { AdapterExecutionError, describeAdapter } from "./adapter.js";
+import {
+  AdapterExecutionError,
+  AdapterRuntimeError,
+  describeAdapter,
+  type AdapterSchema,
+  type AdapterActionDefinition,
+  type GameAdapter,
+} from "./adapter.js";
 import { AdapterRegistry } from "./adapter-registry.js";
+import { canonicalJson } from "./canonical-json.js";
 import {
   type AuditEvent,
   type AuditSink,
@@ -13,12 +21,24 @@ import {
 } from "./audit.js";
 import { PolicyEngine } from "./policy.js";
 import {
+  type CapabilityGrantProvider,
+  snapshotCapabilityGrant,
+  TrustedMockGrantProvider,
+} from "./grant.js";
+import type {
+  AdapterHealthStatus,
+  AuditHealthStatus,
+  BridgeHealthStatus,
+  RuntimeHealthStatus,
+} from "./health.js";
+import {
   type BridgeResponse,
   type ErrorCode,
   type RequestEnvelope,
   errorResponse,
   isKnownBridgeAction,
   knownBridgeActions,
+  PROTOCOL_VERSION,
   requestEnvelopeSchema,
   successResponse,
 } from "./protocol.js";
@@ -40,11 +60,111 @@ import {
   type Session,
   SessionCapacityError,
   SessionManager,
+  reserveSessionActionBudget,
 } from "./session.js";
+import { ResourceWriteScheduler } from "./write-scheduler.js";
 
 export type { RequestContext } from "./request-context.js";
 
 const emptyParamsSchema = z.object({}).strict();
+
+const ADAPTER_HEALTH_STATUSES = new Set<AdapterHealthStatus>([
+  "ready",
+  "unavailable",
+  "faulted",
+]);
+const AUDIT_HEALTH_STATUSES = new Set<AuditHealthStatus>([
+  "ready",
+  "degraded",
+  "full",
+  "corrupt",
+  "closed",
+]);
+const AUDIT_HEALTH_FIELDS = new Set([
+  "status",
+  "outstandingWrites",
+  "segmentCount",
+  "currentSegment",
+  "nextSequence",
+]);
+
+function captureAdapterHealth(adapter: GameAdapter): AdapterHealthStatus {
+  try {
+    const health = adapter.health;
+    if (health === undefined) return "ready";
+    if (typeof health !== "function") return "faulted";
+    const status = Reflect.apply(health, adapter, []) as unknown;
+    return typeof status === "string" && ADAPTER_HEALTH_STATUSES.has(status as AdapterHealthStatus)
+      ? (status as AdapterHealthStatus)
+      : "faulted";
+  } catch {
+    return "faulted";
+  }
+}
+
+function captureAuditHealth(
+  sink: AuditSink,
+  fallbackOutstandingWrites: number,
+): Readonly<{ status: AuditHealthStatus; outstandingWrites: number }> {
+  const invalid = (): Readonly<{
+    status: "corrupt";
+    outstandingWrites: number;
+  }> => Object.freeze({ status: "corrupt", outstandingWrites: fallbackOutstandingWrites });
+  try {
+    const health = sink.health;
+    if (health === undefined) {
+      return Object.freeze({
+        status: "ready" as const,
+        outstandingWrites: fallbackOutstandingWrites,
+      });
+    }
+    if (typeof health !== "function") return invalid();
+    const value = Reflect.apply(health, sink, []) as unknown;
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+      return invalid();
+    }
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) return invalid();
+    const keys = Reflect.ownKeys(value);
+    if (
+      keys.some(
+        (key) => typeof key !== "string" || !AUDIT_HEALTH_FIELDS.has(key),
+      )
+    ) {
+      return invalid();
+    }
+    const captured = new Map<string, unknown>();
+    for (const key of keys as string[]) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor === undefined || !("value" in descriptor)) return invalid();
+      captured.set(key, descriptor.value);
+    }
+    const status = captured.get("status");
+    const outstandingWrites = captured.get("outstandingWrites");
+    if (
+      typeof status !== "string" ||
+      !AUDIT_HEALTH_STATUSES.has(status as AuditHealthStatus) ||
+      typeof outstandingWrites !== "number" ||
+      !Number.isSafeInteger(outstandingWrites) ||
+      outstandingWrites < 0 ||
+      [...captured]
+        .filter(([key]) => key !== "status")
+        .some(
+          ([, count]) =>
+            typeof count !== "number" || !Number.isSafeInteger(count) || count < 0,
+        )
+    ) {
+      return invalid();
+    }
+    return Object.freeze({
+      status: status as AuditHealthStatus,
+      outstandingWrites,
+    });
+  } catch {
+    return invalid();
+  }
+}
+
 const sessionOpenParamsSchema = z
   .object({
     adapterId: z.string().min(1).max(128),
@@ -60,6 +180,12 @@ const gameActParamsSchema = z
     adapterId: z.string().min(1).max(128),
     gameAction: z.string().min(1).max(128),
     input: z.unknown(),
+    expectedRevision: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(Number.MAX_SAFE_INTEGER)
+      .optional(),
   })
   .strict();
 
@@ -86,6 +212,8 @@ export interface BridgeOptions {
   safetyLatch?: SafetyLatch;
   auditSink?: AuditSink;
   authorizer?: SessionAuthorizer;
+  grantProvider?: CapabilityGrantProvider;
+  writeScheduler?: ResourceWriteScheduler;
   clock?: () => number;
   callerTagKey?: Uint8Array;
 }
@@ -93,8 +221,10 @@ export interface BridgeOptions {
 export interface BridgeLocalControlPlane {
   stopSafety(): Promise<SafetyStatus & { stopped: true; alreadyStopped: boolean }>;
   getSafetyStatus(): SafetyStatus;
+  getHealthStatus(): BridgeHealthStatus;
   getOutstandingAuditWrites(): number;
   waitForAuditIdle(): Promise<void>;
+  waitForMutationsIdle(): Promise<void>;
   resumeSafety(
     generation: number,
     options?: { signal?: AbortSignal },
@@ -132,21 +262,6 @@ function abortable<T>(
   });
 }
 
-function stableStringify(value: unknown): string {
-  if (Array.isArray(value)) {
-    return `[${value.map(stableStringify).join(",")}]`;
-  }
-  if (value !== null && typeof value === "object") {
-    const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) =>
-      a.localeCompare(b),
-    );
-    return `{${entries
-      .map(([key, child]) => `${JSON.stringify(key)}:${stableStringify(child)}`)
-      .join(",")}}`;
-  }
-  return JSON.stringify(value);
-}
-
 function safeInvalidRequest(raw: unknown): RequestEnvelope {
   const object = raw !== null && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
   const requestId =
@@ -163,13 +278,36 @@ function safeInvalidRequest(raw: unknown): RequestEnvelope {
       : undefined;
   const mode = object.mode === "commit" ? "commit" : "dry-run";
   return {
-    protocolVersion: "1.0",
+    protocolVersion: PROTOCOL_VERSION,
     requestId,
     ...(sessionId === undefined ? {} : { sessionId }),
     action,
     params: {},
     mode,
   };
+}
+
+type AdapterOutputValidation =
+  | { valid: true; result: unknown }
+  | { valid: false; code: "ADAPTER_OUTPUT_INVALID" | "ADAPTER_RESULT_TOO_LARGE" };
+
+function validateAdapterOutput(
+  schema: z.ZodType<unknown> | AdapterSchema,
+  maxResultBytes: number,
+  candidate: unknown,
+): AdapterOutputValidation {
+  const parsed = schema.safeParse(candidate);
+  if (!parsed.success) return { valid: false, code: "ADAPTER_OUTPUT_INVALID" };
+  let bytes: number;
+  try {
+    bytes = Buffer.byteLength(canonicalJson(parsed.data), "utf8");
+  } catch {
+    return { valid: false, code: "ADAPTER_OUTPUT_INVALID" };
+  }
+  if (bytes > maxResultBytes) {
+    return { valid: false, code: "ADAPTER_RESULT_TOO_LARGE" };
+  }
+  return { valid: true, result: parsed.data };
 }
 
 const PROCESS_CALLER_TAG_KEY = randomBytes(CALLER_TAG_KEY_BYTES);
@@ -181,9 +319,14 @@ export class GameBridge {
   readonly #safety: SafetyLatch;
   readonly #audit: AuditSink;
   readonly #authorizer: SessionAuthorizer;
+  readonly #grantProvider: CapabilityGrantProvider;
+  readonly #writeScheduler: ResourceWriteScheduler;
   readonly #clock: () => number;
   readonly #callerTagKey: Buffer;
   readonly #auditWrites = new Set<Promise<void>>();
+  readonly #mutations = new Set<Promise<BridgeResponse>>();
+  #runtimeHealth: RuntimeHealthStatus = "ready";
+  #observedAuditHealth: AuditHealthStatus = "ready";
   #localResumePending = false;
   #localResumeInvalidation = 0;
   #localResumeController: AbortController | undefined;
@@ -196,12 +339,53 @@ export class GameBridge {
     this.#safety = options.safetyLatch ?? new SafetyLatch();
     this.#audit = options.auditSink ?? new MemoryAuditSink();
     this.#authorizer = options.authorizer ?? new OfflineLocalAuthorizer();
+    this.#grantProvider = options.grantProvider ?? new TrustedMockGrantProvider();
+    this.#writeScheduler = options.writeScheduler ?? new ResourceWriteScheduler();
     this.#clock = options.clock ?? Date.now;
     const callerTagKey = options.callerTagKey ?? PROCESS_CALLER_TAG_KEY;
     if (!(callerTagKey instanceof Uint8Array) || callerTagKey.byteLength !== CALLER_TAG_KEY_BYTES) {
       throw new RangeError("callerTagKey must contain exactly 32 bytes.");
     }
     this.#callerTagKey = Buffer.from(callerTagKey);
+  }
+
+  beginQuiescing(): void {
+    if (this.#runtimeHealth !== "faulted") this.#runtimeHealth = "quiescing";
+  }
+
+  async waitForMutationsIdle(): Promise<void> {
+    while (this.#mutations.size > 0) {
+      await Promise.allSettled([...this.#mutations]);
+    }
+  }
+
+  getHealthStatus(): BridgeHealthStatus {
+    const adapters = this.#registry.list();
+    const adapterStatuses = adapters.map(captureAdapterHealth);
+    const adapterStatus: AdapterHealthStatus = adapterStatuses.includes("faulted")
+      ? "faulted"
+      : adapterStatuses.length === 0 || adapterStatuses.includes("unavailable")
+        ? "unavailable"
+        : "ready";
+    const sinkHealth = captureAuditHealth(this.#audit, this.#auditWrites.size);
+    const sinkAuditStatus = sinkHealth.status;
+    const auditStatus =
+      sinkAuditStatus === "ready" ? this.#observedAuditHealth : sinkAuditStatus;
+    const runtimeStatus: RuntimeHealthStatus =
+      this.#runtimeHealth === "ready" && adapterStatus === "faulted"
+        ? "faulted"
+        : this.#runtimeHealth === "ready" && adapterStatus === "unavailable"
+          ? "degraded"
+          : this.#runtimeHealth;
+    return Object.freeze({
+      runtime: Object.freeze({ status: runtimeStatus }),
+      adapter: Object.freeze({ status: adapterStatus, registeredAdapters: adapters.length }),
+      audit: Object.freeze({
+        status: auditStatus,
+        outstandingWrites: sinkHealth.outstandingWrites,
+      }),
+      safety: Object.freeze({ ...this.#safety.status() }),
+    });
   }
 
   createLocalControlPlane(): BridgeLocalControlPlane {
@@ -221,12 +405,14 @@ export class GameBridge {
         }
       },
       getSafetyStatus: () => this.#safety.status(),
+      getHealthStatus: () => this.getHealthStatus(),
       getOutstandingAuditWrites: () => this.#auditWrites.size,
       waitForAuditIdle: async () => {
         while (this.#auditWrites.size > 0) {
           await Promise.allSettled([...this.#auditWrites]);
         }
       },
+      waitForMutationsIdle: () => this.waitForMutationsIdle(),
       resumeSafety: async (
         generation: number,
         options: { signal?: AbortSignal } = {},
@@ -358,7 +544,16 @@ export class GameBridge {
     this.#auditWrites.add(pending);
     void pending.then(
       () => this.#auditWrites.delete(pending),
-      () => this.#auditWrites.delete(pending),
+      () => {
+        this.#auditWrites.delete(pending);
+        this.#observedAuditHealth = captureAuditHealth(
+          this.#audit,
+          this.#auditWrites.size,
+        ).status;
+        if (this.#observedAuditHealth === "ready") {
+          this.#observedAuditHealth = "degraded";
+        }
+      },
     );
     return pending;
   }
@@ -381,6 +576,13 @@ export class GameBridge {
   }
 
   async handle(
+    raw: unknown,
+    context?: unknown,
+  ): Promise<BridgeResponse> {
+    return this.#handleRequest(raw, context);
+  }
+
+  async #handleRequest(
     raw: unknown,
     context?: unknown,
   ): Promise<BridgeResponse> {
@@ -413,8 +615,8 @@ export class GameBridge {
     if (request.action === "bridge.describe") {
       const params = emptyParamsSchema.safeParse(request.params);
       const response = params.success
-        ? successResponse(request, {
-            protocolVersion: "1.0",
+          ? successResponse(request, {
+            protocolVersion: PROTOCOL_VERSION,
             actions: knownBridgeActions,
             safetyStopped: this.#safety.isStopped(),
             adapters: this.#registry.list().map(describeAdapter),
@@ -498,13 +700,82 @@ export class GameBridge {
       await this.#record(request, response, false, adapter.id, undefined, callerOwnerKey);
       return response;
     }
+    if (request.mode === "commit") {
+      const health = this.getHealthStatus();
+      if (
+        health.runtime.status !== "ready" ||
+        health.adapter.status !== "ready" ||
+        health.audit.status === "full" ||
+        health.audit.status === "corrupt" ||
+        health.audit.status === "closed"
+      ) {
+        const response = errorResponse(
+          request,
+          "RUNTIME_UNAVAILABLE",
+          "Runtime health does not permit a new session.",
+          { operationPhase: "pre-dispatch" },
+        );
+        await this.#record(
+          request,
+          response,
+          false,
+          adapter.id,
+          undefined,
+          callerOwnerKey,
+        );
+        return response;
+      }
+    }
+    const grantRequest = {
+      adapter,
+      context,
+      requestedCapabilities: parsed.data.capabilities,
+      ...(parsed.data.ttlMs === undefined ? {} : { requestedTtlMs: parsed.data.ttlMs }),
+    };
+    let rawGrant: unknown;
+    try {
+      rawGrant = await this.#grantProvider.grant(grantRequest);
+    } catch {
+      rawGrant = undefined;
+    }
+    const grant = snapshotCapabilityGrant(rawGrant, grantRequest, available);
+    if (grant === undefined || !grant.allowed) {
+      const response = errorResponse(
+        request,
+        "AUTHORIZATION_DENIED",
+        "The trusted capability profile denied this session grant.",
+        { operationPhase: "pre-dispatch" },
+      );
+      await this.#record(request, response, false, adapter.id, undefined, callerOwnerKey);
+      return response;
+    }
     if (request.mode === "dry-run") {
       const response = successResponse(request, {
         wouldOpen: true,
         adapterId: adapter.id,
-        capabilities: [...new Set(parsed.data.capabilities)].sort(),
-        ttlMs: parsed.data.ttlMs ?? 15 * 60 * 1_000,
+        capabilities: grant.capabilities,
+        scope: grant.scope,
+        ttlMs: grant.ttlMs,
+        actionBudget: grant.totalActionBudget,
+        perActionBudgets: grant.perActionBudgets,
       });
+      await this.#record(request, response, false, adapter.id, undefined, callerOwnerKey);
+      return response;
+    }
+    const finalHealth = this.getHealthStatus();
+    if (
+      finalHealth.runtime.status !== "ready" ||
+      finalHealth.adapter.status !== "ready" ||
+      finalHealth.audit.status === "full" ||
+      finalHealth.audit.status === "corrupt" ||
+      finalHealth.audit.status === "closed"
+    ) {
+      const response = errorResponse(
+        request,
+        "RUNTIME_UNAVAILABLE",
+        "Runtime health no longer permits a new session.",
+        { operationPhase: "pre-dispatch" },
+      );
       await this.#record(request, response, false, adapter.id, undefined, callerOwnerKey);
       return response;
     }
@@ -521,8 +792,13 @@ export class GameBridge {
       session = this.#sessions.open(
         callerOwnerKey,
         adapter.id,
-        parsed.data.capabilities,
-        parsed.data.ttlMs,
+        grant.capabilities,
+        grant.ttlMs,
+        {
+          scope: grant.scope,
+          totalActionBudget: grant.totalActionBudget,
+          perActionBudgets: grant.perActionBudgets,
+        },
       );
     } catch (error) {
       const response =
@@ -552,6 +828,9 @@ export class GameBridge {
       sessionId: session.id,
       adapterId: session.adapterId,
       capabilities: [...session.capabilities].sort(),
+      scope: session.scope,
+      actionBudgetRemaining: session.actionBudgetRemaining,
+      perActionBudgetRemaining: Object.fromEntries(session.perActionBudgetRemaining),
       expiresAt: new Date(session.expiresAt).toISOString(),
     });
     await this.#record(request, response, false, adapter.id, {
@@ -615,7 +894,7 @@ export class GameBridge {
       return response;
     }
 
-    const fingerprint = stableStringify(request);
+    const fingerprint = canonicalJson(request);
     const cached = session.requests.get(request.requestId);
     if (cached !== undefined) {
       if (cached.fingerprint === fingerprint) {
@@ -713,17 +992,24 @@ export class GameBridge {
     session: Session,
     operation: (session: Session) => Promise<BridgeResponse>,
   ): Promise<BridgeResponse> {
-    try {
-      return await operation(session);
-    } catch (error) {
-      return error instanceof AdapterExecutionError
-        ? errorResponse(request, error.code, error.message)
-        : errorResponse(
-            request,
-            "INTERNAL_ERROR",
-            "The bridge could not complete the request.",
-          );
+    const execution = (async () => {
+      try {
+        return await operation(session);
+      } catch {
+        return errorResponse(
+          request,
+          "INTERNAL_ERROR",
+          "The bridge could not complete the request.",
+        );
+      }
+    })();
+    if (request.mode !== "commit" || request.action !== "game.act") {
+      return execution;
     }
+    let tracked!: Promise<BridgeResponse>;
+    tracked = execution.finally(() => this.#mutations.delete(tracked));
+    this.#mutations.add(tracked);
+    return tracked;
   }
 
   async #closeSession(request: RequestEnvelope, session: Session): Promise<BridgeResponse> {
@@ -750,14 +1036,59 @@ export class GameBridge {
     if ("response" in adapterCheck) {
       return adapterCheck.response;
     }
-    if (!session.capabilities.has(adapterCheck.adapter.observationCapability)) {
+    if (
+      adapterCheck.adapter.observation.requiredCapabilities.some(
+        (capability) => !session.capabilities.has(capability),
+      )
+    ) {
       return errorResponse(
         request,
         "CAPABILITY_DENIED",
         "The session does not grant observation capability.",
+        { operationPhase: "pre-dispatch" },
       );
     }
-    return successResponse(request, await adapterCheck.adapter.observe());
+    const concurrency = adapterCheck.adapter.observation.concurrency;
+    const observationPermit =
+      concurrency.kind === "parallel"
+        ? undefined
+        : this.#writeScheduler.tryAcquire(
+            `${adapterCheck.adapter.id}\u0000${session.scope.kind}\u0000${session.scope.resourceId}\u0000${
+              concurrency.kind === "serial" ? "__observation__" : concurrency.resourceKey
+            }`,
+          );
+    if (concurrency.kind !== "parallel" && observationPermit === undefined) {
+      return errorResponse(
+        request,
+        "RESOURCE_CAPACITY",
+        "The adapter observation concurrency limit is occupied.",
+        { operationPhase: "pre-dispatch" },
+      );
+    }
+    try {
+      const output = validateAdapterOutput(
+        adapterCheck.adapter.observation.outputSchema,
+        adapterCheck.adapter.observation.maxResultBytes,
+        await adapterCheck.adapter.observe(),
+      );
+      return output.valid
+        ? successResponse(request, output.result)
+        : errorResponse(
+            request,
+            output.code,
+            "The adapter observation did not satisfy its declared output contract.",
+            { operationPhase: "adapter-succeeded" },
+          );
+    } catch {
+      return errorResponse(
+        request,
+        "RUNTIME_UNAVAILABLE",
+        "The adapter is unavailable for observation.",
+        { operationPhase: "adapter-rejected" },
+      );
+    } finally {
+      observationPermit?.release();
+    }
   }
 
   async #act(request: RequestEnvelope, session: Session): Promise<BridgeResponse> {
@@ -780,40 +1111,233 @@ export class GameBridge {
       session.capabilities,
     );
     if (!decision.allowed) {
-      return errorResponse(request, decision.code, decision.message);
+      return errorResponse(request, decision.code, decision.message, {
+        operationPhase: "pre-dispatch",
+      });
     }
-    if (request.mode === "dry-run") {
-      const result = await adapterCheck.adapter.execute(
-        parsed.data.gameAction,
-        decision.parsedInput,
-        request.mode,
+    const definition = adapterCheck.adapter.actions[parsed.data.gameAction]!;
+    if (request.mode === "dry-run" && definition.dryRunSemantics === "unsupported") {
+      return errorResponse(
+        request,
+        "ACTION_NOT_ALLOWED",
+        "The adapter contract does not support dry-run for this action.",
+        { operationPhase: "pre-dispatch" },
       );
-      return successResponse(request, result);
+    }
+    if (request.mode === "commit" && definition.effectKind !== "write") {
+      return errorResponse(
+        request,
+        "ACTION_NOT_ALLOWED",
+        "Non-write actions cannot be invoked with commit mode.",
+        { operationPhase: "pre-dispatch" },
+      );
+    }
+    const executeAndValidate = async (): Promise<BridgeResponse> => {
+      try {
+        const result = await adapterCheck.adapter.execute!(
+          parsed.data.gameAction,
+          decision.parsedInput,
+          request.mode,
+          {
+            ...(parsed.data.expectedRevision === undefined
+              ? {}
+              : { expectedRevision: parsed.data.expectedRevision }),
+          },
+        );
+        const output = validateAdapterOutput(
+          definition.outputSchema,
+          definition.maxResultBytes,
+          result,
+        );
+        if (!output.valid) {
+          if (request.mode === "commit" && definition.effectKind === "write") {
+            this.#runtimeHealth = "faulted";
+          }
+          return errorResponse(
+            request,
+            output.code,
+            "The adapter result did not satisfy its declared output contract.",
+            {
+              operationPhase:
+                request.mode === "commit" && definition.effectKind === "write"
+                  ? "outcome-unknown"
+                  : "adapter-succeeded",
+            },
+          );
+        }
+        return successResponse(request, output.result);
+      } catch (error) {
+        if (error instanceof AdapterExecutionError) {
+          if (error.code === "REVISION_CONFLICT") {
+            return errorResponse(
+              request,
+              "REVISION_CONFLICT",
+              "The adapter state revision no longer matches the expected revision.",
+              { operationPhase: "adapter-rejected" },
+            );
+          }
+          if (definition.adapterErrorCodes.includes(error.code)) {
+            return errorResponse(
+              request,
+              "ADAPTER_REJECTED",
+              "The adapter explicitly rejected the operation.",
+              {
+                operationPhase: "adapter-rejected",
+                adapterError: { code: error.code },
+              },
+            );
+          }
+        }
+        const outcomeUnknown =
+          request.mode === "commit" &&
+          definition.effectKind === "write" &&
+          (!(error instanceof AdapterRuntimeError) || error.dispatch === "dispatched");
+        if (outcomeUnknown) {
+          this.#runtimeHealth = "faulted";
+          return errorResponse(
+            request,
+            "OUTCOME_UNKNOWN",
+            "The action was dispatched but its outcome could not be confirmed.",
+            { operationPhase: "outcome-unknown" },
+          );
+        }
+        return errorResponse(
+          request,
+          "RUNTIME_UNAVAILABLE",
+          "The adapter runtime is unavailable.",
+          {
+            operationPhase:
+              error instanceof AdapterRuntimeError && error.dispatch === "not-dispatched"
+                ? "pre-dispatch"
+                : "adapter-rejected",
+          },
+        );
+      }
+    };
+
+    if (request.mode !== "commit" || definition.effectKind !== "write") {
+      return executeAndValidate();
     }
 
+    const health = this.getHealthStatus();
+    if (
+      health.runtime.status !== "ready" ||
+      health.adapter.status !== "ready" ||
+      health.audit.status === "full" ||
+      health.audit.status === "corrupt" ||
+      health.audit.status === "closed"
+    ) {
+      return errorResponse(
+        request,
+        "RUNTIME_UNAVAILABLE",
+        "Runtime health does not permit a new state-changing action.",
+        { operationPhase: "pre-dispatch" },
+      );
+    }
+    const concurrency = definition.writeConcurrency;
+    if (concurrency.kind !== "resource-serial") {
+      return errorResponse(
+        request,
+        "INTERNAL_ERROR",
+        "The registered write action lacks a safe resource schedule.",
+        { operationPhase: "pre-dispatch" },
+      );
+    }
+    if (this.#safety.isStopped()) {
+      return errorResponse(
+        request,
+        "SAFETY_STOPPED",
+        "State-changing actions are disabled by the safety latch.",
+        { operationPhase: "pre-dispatch" },
+      );
+    }
+    const resourcePermit = this.#writeScheduler.tryAcquire(
+      `${adapterCheck.adapter.id}\u0000${session.scope.kind}\u0000${session.scope.resourceId}\u0000${concurrency.resourceKey}`,
+    );
+    if (resourcePermit === undefined) {
+      return errorResponse(
+        request,
+        "RESOURCE_CAPACITY",
+        "The target resource already has a write in flight.",
+        { operationPhase: "pre-dispatch" },
+      );
+    }
     const writePermit = this.#safety.beginWrite();
     if (!writePermit.allowed) {
+      resourcePermit.release();
       return writePermit.reason === "stopped"
         ? errorResponse(
             request,
             "SAFETY_STOPPED",
             "State-changing actions are disabled by the safety latch.",
+            { operationPhase: "pre-dispatch" },
           )
         : errorResponse(
             request,
             "RESOURCE_CAPACITY",
             "Concurrent write capacity is exhausted.",
+            { operationPhase: "pre-dispatch" },
           );
     }
     try {
-      const result = await adapterCheck.adapter.execute(
+      if (
+        definition.requiresExpectedRevision &&
+        parsed.data.expectedRevision === undefined
+      ) {
+        return errorResponse(
+          request,
+          "REVISION_REQUIRED",
+          "This write action requires an expected state revision.",
+          { operationPhase: "pre-dispatch" },
+        );
+      }
+      if (definition.requiresExpectedRevision) {
+        let currentRevision: number;
+        try {
+          currentRevision = await adapterCheck.adapter.getStateRevision!();
+        } catch {
+          return errorResponse(
+            request,
+            "RUNTIME_UNAVAILABLE",
+            "The adapter state revision is unavailable.",
+            { operationPhase: "pre-dispatch" },
+          );
+        }
+        if (
+          !Number.isSafeInteger(currentRevision) ||
+          currentRevision < 0 ||
+          parsed.data.expectedRevision !== currentRevision
+        ) {
+          return errorResponse(
+            request,
+            "REVISION_CONFLICT",
+            "The expected revision does not match the current adapter state.",
+            { operationPhase: "pre-dispatch" },
+          );
+        }
+      }
+      const budgetReservation = reserveSessionActionBudget(
+        session,
         parsed.data.gameAction,
-        decision.parsedInput,
-        request.mode,
       );
-      return successResponse(request, result);
+      if (budgetReservation === undefined) {
+        return errorResponse(
+          request,
+          "RESOURCE_CAPACITY",
+          "The session action budget is exhausted.",
+          { operationPhase: "pre-dispatch" },
+        );
+      }
+      const response = await executeAndValidate();
+      if (!response.ok && response.error.operationPhase === "pre-dispatch") {
+        budgetReservation.rollback();
+      } else {
+        budgetReservation.commit();
+      }
+      return response;
     } finally {
       writePermit.release();
+      resourcePermit.release();
     }
   }
 
@@ -905,7 +1429,17 @@ export class GameBridge {
         ...(metadata === undefined ? {} : { metadata: redactSensitive(metadata) }),
       };
       submitted = true;
-      await this.#writeAudit(event, auditReservation);
+      try {
+        await this.#writeAudit(event, auditReservation);
+      } catch (error) {
+        const auditIsSafetyCritical =
+          request.mode === "commit" &&
+          (request.action === "session.open" ||
+            request.action === "session.close" ||
+            request.action === "game.act" ||
+            request.action === "safety.stop");
+        if (auditIsSafetyCritical) throw error;
+      }
     } finally {
       if (!submitted) auditReservation?.release();
     }

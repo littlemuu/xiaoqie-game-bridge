@@ -47,7 +47,11 @@ async function handleFrame(frame: Buffer): Promise<void> {
     const result =
       message.operation === "observe"
         ? await adapter.observe()
-        : await adapter.execute(message.action, message.input, message.mode);
+        : await adapter.execute(message.action, message.input, message.mode, {
+            ...(message.expectedRevision === undefined
+              ? {}
+              : { expectedRevision: message.expectedRevision }),
+          });
     write({
       version: ADAPTER_IPC_VERSION,
       type: "result",

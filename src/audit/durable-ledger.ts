@@ -198,7 +198,9 @@ const ledgerRecordSchema = z
   })
   .strict();
 
-function stableStringify(value: unknown): string {
+// Audit frames intentionally use a ledger-specific canonical encoder because
+// their on-disk bytes are a versioned persistence contract.
+function canonicalAuditJson(value: unknown): string {
   if (value === null || typeof value === "boolean" || typeof value === "string") {
     return JSON.stringify(value);
   }
@@ -207,21 +209,21 @@ function stableStringify(value: unknown): string {
     return JSON.stringify(value);
   }
   if (Array.isArray(value)) {
-    return `[${value.map(stableStringify).join(",")}]`;
+    return `[${value.map(canonicalAuditJson).join(",")}]`;
   }
   if (typeof value === "object" && value !== null) {
     const entries = Object.entries(value as Record<string, unknown>).sort(([left], [right]) =>
       left < right ? -1 : left > right ? 1 : 0,
     );
     return `{${entries
-      .map(([key, child]) => `${JSON.stringify(key)}:${stableStringify(child)}`)
+      .map(([key, child]) => `${JSON.stringify(key)}:${canonicalAuditJson(child)}`)
       .join(",")}}`;
   }
   throw new AuditLedgerError("invalid-event");
 }
 
 function digestRecordBase(base: Omit<AuditLedgerRecord, "digest">): string {
-  return createHash("sha256").update(stableStringify(base), "utf8").digest("hex");
+  return createHash("sha256").update(canonicalAuditJson(base), "utf8").digest("hex");
 }
 
 function persistentEvent(event: AuditEvent): PersistentAuditEvent {
@@ -344,7 +346,7 @@ function parseSegment(
       payload: record.payload,
     };
     if (record.digest !== digestRecordBase(base)) throw new AuditLedgerError("corrupt");
-    if (encoded.toString("utf8") !== stableStringify(record)) {
+    if (encoded.toString("utf8") !== canonicalAuditJson(record)) {
       throw new AuditLedgerError("corrupt");
     }
     records.push({ record, frameEnd: offset + frameBytes });
@@ -632,8 +634,8 @@ export class DurableAuditLedger implements AuditSink {
         const firstPayload = parsed.records[0]!.record.payload;
         if (
           firstPayload.kind !== "recovery" ||
-          stableStringify(firstPayload.sourceSegments) !==
-            stableStringify(expectedRecoverySources) ||
+          canonicalAuditJson(firstPayload.sourceSegments) !==
+            canonicalAuditJson(expectedRecoverySources) ||
           firstPayload.confirmedSequence !== sequence - 1
         ) {
           throw new AuditLedgerError("corrupt");
@@ -849,7 +851,7 @@ export class DurableAuditLedger implements AuditSink {
         if (!parsed.success || parsed.data.sequence !== sequence) {
           throw new AuditLedgerError("corrupt");
         }
-        if (`${stableStringify(parsed.data)}\n` !== bytes.toString("utf8")) {
+        if (`${canonicalAuditJson(parsed.data)}\n` !== bytes.toString("utf8")) {
           throw new AuditLedgerError("corrupt");
         }
         return parsed.data;
@@ -924,7 +926,7 @@ export class DurableAuditLedger implements AuditSink {
       payload,
     };
     const record: AuditLedgerRecord = { ...base, digest: digestRecordBase(base) };
-    const encoded = Buffer.from(stableStringify(record), "utf8");
+    const encoded = Buffer.from(canonicalAuditJson(record), "utf8");
     const frameBytes = FRAME_PREFIX_BYTES + encoded.byteLength + 1;
     if (frameBytes > this.#limits.maxRecordBytes) {
       encoded.fill(0);
@@ -1037,7 +1039,7 @@ export class DurableAuditLedger implements AuditSink {
       throw new AuditLedgerError("object-identity");
     });
     let syncCompleted = false;
-    const bytes = Buffer.from(`${stableStringify(evidence)}\n`, "utf8");
+    const bytes = Buffer.from(`${canonicalAuditJson(evidence)}\n`, "utf8");
     try {
       if (bytes.byteLength > maxBytes) {
         throw new AuditLedgerError("invalid-event");

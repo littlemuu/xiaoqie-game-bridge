@@ -2,20 +2,21 @@ import { z } from "zod";
 import {
   AdapterExecutionError,
   type AdapterActionDefinition,
+  type AdapterExecutionOptions,
+  type AdapterObservationDefinition,
   type GameAdapter,
 } from "../../core/adapter.js";
 import type { BridgeMode } from "../../core/protocol.js";
 
 const coordinateSchema = z.number().int().min(-8).max(8);
 const heightSchema = z.number().int().min(0).max(4);
-export const mockMoveInputSchema = z
-  .object({
-    dx: z.number().int().min(-1).max(1),
-    dy: z.number().int().min(-1).max(1),
-    dz: z.number().int().min(-1).max(1),
-  })
-  .strict()
-  .refine(({ dx, dy, dz }) => dx !== 0 || dy !== 0 || dz !== 0);
+const deltaSchema = z.number().int().min(-1).max(1);
+const nonZeroDeltaSchema = z.union([z.literal(-1), z.literal(1)]);
+export const mockMoveInputSchema = z.union([
+  z.object({ dx: nonZeroDeltaSchema, dy: deltaSchema, dz: deltaSchema }).strict(),
+  z.object({ dx: z.literal(0), dy: nonZeroDeltaSchema, dz: deltaSchema }).strict(),
+  z.object({ dx: z.literal(0), dy: z.literal(0), dz: nonZeroDeltaSchema }).strict(),
+]);
 export const mockPlaceBlockInputSchema = z
   .object({
     x: coordinateSchema,
@@ -41,6 +42,7 @@ const positionSchema = z
 
 export const mockObservationResultSchema = z
   .object({
+    stateRevision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
     player: positionSchema,
     nearbyBlocks: z.array(
       z
@@ -56,6 +58,7 @@ export const mockObservationResultSchema = z
 export const mockMoveResultSchema = z
   .object({
     applied: z.boolean(),
+    stateRevision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
     change: z
       .object({
         type: z.literal("move"),
@@ -69,6 +72,7 @@ export const mockMoveResultSchema = z
 export const mockPlaceBlockResultSchema = z
   .object({
     applied: z.boolean(),
+    stateRevision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
     change: z
       .object({
         type: z.literal("place_block"),
@@ -95,17 +99,40 @@ function clonePosition(position: Position): Position {
 export class MockGameAdapter implements GameAdapter {
   readonly id: string;
   readonly displayName = "Deterministic in-memory mock world";
-  readonly observationCapability = "game.observe";
+  readonly observation: AdapterObservationDefinition = {
+    description: "Observe the bounded mock player and nearby allowlisted blocks.",
+    outputSchema: mockObservationResultSchema,
+    effectKind: "read",
+    concurrency: { kind: "parallel" },
+    requiredCapabilities: ["game.observe"],
+    maxResultBytes: 8 * 1_024,
+  };
   readonly actions: Readonly<Record<string, AdapterActionDefinition>> = {
     move: {
       description: "Move the mock player by at most one unit per axis.",
-      capability: "game.act.move",
       inputSchema: mockMoveInputSchema,
+      outputSchema: mockMoveResultSchema,
+      effectKind: "write",
+      dryRunSemantics: "exact",
+      requiredCapabilities: ["game.act.move"],
+      maxResultBytes: 4 * 1_024,
+      writeConcurrency: { kind: "resource-serial", resourceKey: "world" },
+      adapterErrorCodes: ["OUT_OF_BOUNDS"],
+      requiresExpectedRevision: true,
+      reconciliation: "future",
     },
     place_block: {
       description: "Place one allowlisted block inside the mock-world bounds.",
-      capability: "game.act.place_block",
       inputSchema: mockPlaceBlockInputSchema,
+      outputSchema: mockPlaceBlockResultSchema,
+      effectKind: "write",
+      dryRunSemantics: "exact",
+      requiredCapabilities: ["game.act.place_block"],
+      maxResultBytes: 4 * 1_024,
+      writeConcurrency: { kind: "resource-serial", resourceKey: "world" },
+      adapterErrorCodes: ["BLOCK_NOT_ALLOWED", "TARGET_OCCUPIED"],
+      requiresExpectedRevision: true,
+      reconciliation: "future",
     },
   };
 
@@ -113,6 +140,7 @@ export class MockGameAdapter implements GameAdapter {
     player: { x: 0, y: 1, z: 0 },
     blocks: new Map(),
   };
+  #stateRevision = 0;
 
   constructor(id = "mock-world") {
     this.id = id;
@@ -120,6 +148,7 @@ export class MockGameAdapter implements GameAdapter {
 
   async observe(): Promise<unknown> {
     return {
+      stateRevision: this.#stateRevision,
       player: clonePosition(this.#state.player),
       nearbyBlocks: [...this.#state.blocks.entries()]
         .map(([coordinates, blockType]) => ({ coordinates, blockType }))
@@ -127,7 +156,19 @@ export class MockGameAdapter implements GameAdapter {
     };
   }
 
-  async execute(action: string, input: unknown, mode: BridgeMode): Promise<unknown> {
+  async getStateRevision(): Promise<number> {
+    return this.#stateRevision;
+  }
+
+  async execute(
+    action: string,
+    input: unknown,
+    mode: BridgeMode,
+    options: AdapterExecutionOptions = {},
+  ): Promise<unknown> {
+    if (mode === "commit" && options.expectedRevision !== this.#stateRevision) {
+      throw new AdapterExecutionError("REVISION_CONFLICT");
+    }
     switch (action) {
       case "move":
         return this.#move(input as z.infer<typeof mockMoveInputSchema>, mode);
@@ -146,13 +187,15 @@ export class MockGameAdapter implements GameAdapter {
       z: from.z + input.dz,
     };
     if (Math.abs(to.x) > 8 || to.y < 0 || to.y > 4 || Math.abs(to.z) > 8) {
-      throw new AdapterExecutionError("OUT_OF_BOUNDS", "The requested move leaves the mock world.");
+      throw new AdapterExecutionError("OUT_OF_BOUNDS");
     }
     if (mode === "commit") {
       this.#state.player = to;
+      this.#stateRevision += 1;
     }
     return {
       applied: mode === "commit",
+      stateRevision: this.#stateRevision,
       change: { type: "move", from, to },
     };
   }
@@ -161,14 +204,20 @@ export class MockGameAdapter implements GameAdapter {
     const position = { x: input.x, y: input.y, z: input.z };
     const key = blockKey(position);
     if (this.#state.blocks.has(key)) {
-      throw new AdapterExecutionError("TARGET_OCCUPIED", "The mock-world target is occupied.");
+      throw new AdapterExecutionError("TARGET_OCCUPIED");
     }
     if (mode === "commit") {
       this.#state.blocks.set(key, input.blockType);
+      this.#stateRevision += 1;
     }
     return {
       applied: mode === "commit",
+      stateRevision: this.#stateRevision,
       change: { type: "place_block", position, blockType: input.blockType },
     };
+  }
+
+  health(): "ready" {
+    return "ready";
   }
 }

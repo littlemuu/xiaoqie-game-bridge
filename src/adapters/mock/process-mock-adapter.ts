@@ -4,7 +4,10 @@ import { fileURLToPath } from "node:url";
 import type { ZodType } from "zod";
 import {
   AdapterExecutionError,
+  AdapterRuntimeError,
   type AdapterActionDefinition,
+  type AdapterExecutionOptions,
+  type AdapterObservationDefinition,
   type GameAdapter,
 } from "../../core/adapter.js";
 import type { BridgeMode } from "../../core/protocol.js";
@@ -38,9 +41,12 @@ export type AdapterRunnerFailure =
   | "timeout"
   | "worker-exit";
 
-export class AdapterRunnerError extends Error {
-  constructor(readonly category: AdapterRunnerFailure) {
-    super("The isolated mock adapter could not complete the call.");
+export class AdapterRunnerError extends AdapterRuntimeError {
+  constructor(
+    readonly category: AdapterRunnerFailure,
+    dispatch: "not-dispatched" | "dispatched" = "not-dispatched",
+  ) {
+    super("unavailable", dispatch);
     this.name = "AdapterRunnerError";
   }
 }
@@ -84,9 +90,11 @@ export type ContainmentFaultStage =
 
 interface PendingCall {
   resolve(value: unknown): void;
-  reject(error: AdapterRunnerError | AdapterExecutionError): void;
+  reject(error: AdapterRunnerError | AdapterExecutionError | AdapterRuntimeError): void;
   resultSchema: ZodType<unknown>;
   timer: NodeJS.Timeout;
+  outcomeUnknownOnFailure: boolean;
+  dispatched: boolean;
 }
 
 const staticAdapter = new MockGameAdapter();
@@ -137,7 +145,7 @@ export function fixedWorkerLaunchSpec(options: ProcessMockAdapterOptions = {}) {
 export class ProcessMockAdapter implements GameAdapter {
   readonly id = staticAdapter.id;
   readonly displayName = staticAdapter.displayName;
-  readonly observationCapability = staticAdapter.observationCapability;
+  readonly observation: AdapterObservationDefinition = staticAdapter.observation;
   readonly actions: Readonly<Record<string, AdapterActionDefinition>> = staticAdapter.actions;
 
   readonly #options: Required<Omit<ProcessMockAdapterOptions, "testOnly">> &
@@ -214,10 +222,20 @@ export class ProcessMockAdapter implements GameAdapter {
   }
 
   async observe(): Promise<unknown> {
-    return this.#call({ operation: "observe" }, mockObservationResultSchema);
+    return this.#call({ operation: "observe" }, mockObservationResultSchema, false);
   }
 
-  async execute(action: string, input: unknown, mode: BridgeMode): Promise<unknown> {
+  async getStateRevision(): Promise<number> {
+    const observation = mockObservationResultSchema.parse(await this.observe());
+    return observation.stateRevision;
+  }
+
+  async execute(
+    action: string,
+    input: unknown,
+    mode: BridgeMode,
+    options: AdapterExecutionOptions = {},
+  ): Promise<unknown> {
     const definition = this.actions[action];
     const parsed = definition?.inputSchema.safeParse(input);
     if (definition === undefined || parsed === undefined || !parsed.success) {
@@ -227,8 +245,17 @@ export class ProcessMockAdapter implements GameAdapter {
       ? mockMoveResultSchema
       : mockPlaceBlockResultSchema;
     return this.#call(
-      { operation: "execute", action, input: parsed.data, mode },
+      {
+        operation: "execute",
+        action,
+        input: parsed.data,
+        mode,
+        ...(options.expectedRevision === undefined
+          ? {}
+          : { expectedRevision: options.expectedRevision }),
+      },
       resultSchema,
+      mode === "commit",
     );
   }
 
@@ -287,7 +314,17 @@ export class ProcessMockAdapter implements GameAdapter {
       : Object.freeze({ ...this.#containmentAttestation });
   }
 
-  async #call(call: Record<string, unknown>, resultSchema: ZodType<unknown>): Promise<unknown> {
+  health(): "ready" | "unavailable" | "faulted" {
+    if (this.#state === "running") return "ready";
+    if (this.#state === "failed") return "faulted";
+    return "unavailable";
+  }
+
+  async #call(
+    call: Record<string, unknown>,
+    resultSchema: ZodType<unknown>,
+    outcomeUnknownOnFailure: boolean,
+  ): Promise<unknown> {
     await this.start();
     if (this.#state !== "running") throw new AdapterRunnerError("closed");
     if (this.#pending.size >= this.#options.maxPendingCalls) {
@@ -297,10 +334,21 @@ export class ProcessMockAdapter implements GameAdapter {
     return new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.#pending.delete(callId);
-        reject(new AdapterRunnerError("timeout"));
+        reject(
+          outcomeUnknownOnFailure
+            ? new AdapterRuntimeError("outcome-unknown")
+            : new AdapterRunnerError("timeout", "dispatched"),
+        );
         this.#fail("timeout");
       }, this.#options.callTimeoutMs);
-      this.#pending.set(callId, { resolve, reject, resultSchema, timer });
+      this.#pending.set(callId, {
+        resolve,
+        reject,
+        resultSchema,
+        timer,
+        outcomeUnknownOnFailure,
+        dispatched: false,
+      });
       try {
         this.#write({
           version: ADAPTER_IPC_VERSION,
@@ -308,6 +356,7 @@ export class ProcessMockAdapter implements GameAdapter {
           callId,
           ...call,
         });
+        this.#pending.get(callId)!.dispatched = true;
       } catch {
         this.#fail("protocol");
       }
@@ -319,8 +368,7 @@ export class ProcessMockAdapter implements GameAdapter {
     if (child?.stdin === null || child?.stdin === undefined || child.stdin.destroyed) {
       throw new AdapterRunnerError("worker-exit");
     }
-    const accepted = child.stdin.write(encodeAdapterFrame(message));
-    if (!accepted) throw new AdapterRunnerError("capacity");
+    child.stdin.write(encodeAdapterFrame(message));
   }
 
   #consume(chunk: Buffer): void {
@@ -423,7 +471,14 @@ export class ProcessMockAdapter implements GameAdapter {
     if (message.ok) {
       const parsedResult = pending.resultSchema.safeParse(message.result);
       if (!parsedResult.success) {
-        pending.reject(new AdapterRunnerError("protocol"));
+        pending.reject(
+          pending.outcomeUnknownOnFailure && pending.dispatched
+            ? new AdapterRuntimeError("outcome-unknown")
+            : new AdapterRunnerError(
+                "protocol",
+                pending.dispatched ? "dispatched" : "not-dispatched",
+              ),
+        );
         this.#fail("protocol");
         return;
       }
@@ -431,15 +486,17 @@ export class ProcessMockAdapter implements GameAdapter {
       return;
     }
     if (message.error.code === "ADAPTER_FAILURE") {
-      pending.reject(new AdapterRunnerError("protocol"));
+      pending.reject(
+        pending.outcomeUnknownOnFailure && pending.dispatched
+          ? new AdapterRuntimeError("outcome-unknown")
+          : new AdapterRunnerError(
+              "protocol",
+              pending.dispatched ? "dispatched" : "not-dispatched",
+            ),
+      );
       return;
     }
-    const messages = {
-      OUT_OF_BOUNDS: "The requested move leaves the mock world.",
-      BLOCK_NOT_ALLOWED: "The requested block type is not allowed.",
-      TARGET_OCCUPIED: "The mock-world target is occupied.",
-    } as const;
-    pending.reject(new AdapterExecutionError(message.error.code, messages[message.error.code]));
+    pending.reject(new AdapterExecutionError(message.error.code));
   }
 
   #onProcessClose(code: number | null): void {
@@ -481,7 +538,14 @@ export class ProcessMockAdapter implements GameAdapter {
   #failPending(category: AdapterRunnerFailure): void {
     for (const pending of this.#pending.values()) {
       clearTimeout(pending.timer);
-      pending.reject(new AdapterRunnerError(category));
+      pending.reject(
+        pending.outcomeUnknownOnFailure && pending.dispatched
+          ? new AdapterRuntimeError("outcome-unknown")
+          : new AdapterRunnerError(
+              category,
+              pending.dispatched ? "dispatched" : "not-dispatched",
+            ),
+      );
     }
     this.#pending.clear();
   }

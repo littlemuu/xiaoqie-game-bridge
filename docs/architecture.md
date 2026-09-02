@@ -55,13 +55,22 @@ not bypass the core.
 - `protocol.ts` owns the versioned, strict request and response contracts and
   stable error codes.
 - `session.ts` owns memory-only, expiring, closeable, adapter-bound sessions,
-  immutable caller-owner bindings, bounded per-session idempotency caches, and
-  deterministic terminal cleanup.
+  immutable caller-owner bindings, safe resource-scope summaries, bounded
+  action budgets, bounded per-session idempotency caches, and deterministic
+  terminal cleanup.
 - `request-context.ts` synchronously validates and snapshots trusted caller
   context, then derives domain-separated, length-prefixed SHA-256 owner keys
   and keyed, domain-separated short audit tags.
-- `policy.ts` default-denies unknown game actions, enforces action capability,
-  and validates the adapter's strict input schema.
+- `adapter.ts` and `adapter-registry.ts` validate, snapshot, and freeze Adapter
+  Contract v2 manifests before use; descriptions contain JSON Schema and fixed
+  metadata rather than Zod instances or functions.
+- `grant.ts` owns the explicit trusted mock profile. Requested capability is
+  intersected with that profile, the registered manifest, and the fixed scope;
+  caller locality alone is not an implicit full grant.
+- `policy.ts` default-denies unknown game actions, enforces every required
+  capability, and validates the adapter's strict input schema.
+- `write-scheduler.ts` owns the no-queue permit that serializes writes to one
+  registered adapter/scope/resource key.
 - `safety-latch.ts` owns a process-wide stop state and an atomic bounded-write
   gate. Stop/status/resume are available through an explicit in-process local
   control-plane object created by the bridge.
@@ -71,7 +80,8 @@ not bypass the core.
   versioned frame/record format, serial append-and-sync queue, segment limits,
   startup verification, and conservative torn-tail recovery.
 - `bridge.ts` is the only orchestration path. It composes all checks before an
-  adapter call and records both allowed and denied outcomes.
+  adapter call, validates output schema/result bytes, classifies dispatch
+  outcomes, and records both allowed and denied outcomes.
 - `mcp/server.ts` owns the pure, bridge-injected MCP server factory, its single
   tool, deterministic response mapping, logical byte limit, and bounded handler
   gate.
@@ -119,13 +129,74 @@ sessions are not persisted or shared, it conveys no cross-process authority.
 Minecraft and Stardew Valley expose different state models, mod APIs, failure
 modes, and save-integrity risks. Putting those details in the core would make a
 generic bridge accidentally inherit the broadest adapter's authority. Each
-adapter therefore declares only its own observation capability, action names,
-and strict input schemas. A session binds to one adapter, so a granted
-capability cannot be redirected to another adapter.
+adapter therefore declares a closed observation contract and per-action
+input/output schemas, effect kind, dry-run semantics, required capabilities,
+result limit, resource scheduling, adapter error namespace, revision rule, and
+future reconciliation support. Registration captures an immutable snapshot;
+later replacement of actions, schemas, capability arrays, or metadata cannot
+change the active permission surface. A session binds to one adapter, so a
+granted capability cannot be redirected to another adapter.
+
+Schemas are restricted by a positive allowlist of Zod nodes, checks, and exact
+definition fields that round-trip through JSON Schema. Registration first
+captures a bounded, immutable, own-data-only declarative AST; accessors, holes,
+symbol/extra keys, proxy failures, custom `_zod.toJSONSchema` or
+`_zod.processJSONSchema` emitters, non-finite/lossy numbers, and unknown nodes,
+checks or options fail closed. The one Zod built-in lazy object-shape getter is
+identified by its locked implementation and read exactly once. A trusted schema
+is rebuilt from the captured AST and emitted with a fresh empty metadata registry,
+so neither a live definition graph nor global metadata can rewrite the contract.
+Registration deep-freezes the JSON snapshot, rebuilds the active validator from
+an isolated clone, and exposes only a frozen `safeParse` wrapper. Schema scalar
+values are limited to 1 KiB UTF-8, each JSON Schema snapshot to 16 KiB, each
+adapter catalog to 24 KiB, and the 64-adapter registry catalog to 32 KiB;
+oversized literals, property names, enum values, or regular expressions fail
+during registration. The optional health member is read once during snapshot;
+only an actually absent member defaults to ready, while defined non-functions,
+promises/thenables, or throwing accessors reject registration.
 
 The mock adapter is a proof of this boundary, not a placeholder shell: it has a
 deterministic state, validates movement and block placement, previews changes
 without mutation, and applies authorized commits in memory only.
+
+### Adapter Contract v2、授权与状态一致性
+
+模型只能请求 capability，不能批准 capability。当前产品 profile 只为固定
+`mock-world` 批准 allowlist 能力和 `tiny-world-v1` scope；session 保存实际
+grant、scope 摘要、总动作预算与 per-action 预算。owner key 只证明调用者与
+session 的绑定，不参与 grant 推导，也不作为资源标识。
+
+Provider 返回值在任何 session 或 audit-reservation 副作用前经过 closed-world
+运行时快照：TTL 是受请求与全局上限约束的正 safe integer，capabilities 是请求与
+manifest 的去重子集，scope kind 必须位于 adapter 自身 namespace，resource ID
+有界且无额外字段，per-action budget 只能引用 manifest 中的 write action。异步
+provider 返回并完成快照后，commit admission 会在无后续 `await` 的临界段再次检查
+runtime、adapter 与 audit health，才允许 audit reservation 和 session insertion。
+capability 数组只从 own `length` data descriptor 读取一次，再按该快照捕获 dense
+own-data index；live `length` getter/Proxy 读取不能改变 64 项上限或循环边界。
+
+adapter 与 audit health 也在一个运行时 capture 中收敛到闭集。callback throw、
+Promise/thenable、未知 status、accessor、`NaN` 或负 outstanding count 都不会穿透
+operator 或 admission；异常 adapter 固定映射为 `faulted`，异常 audit 固定映射为
+`corrupt`，并且不回显异常文本。commit 因而在 session/world 副作用前 fail closed。
+
+mock observation 与 dry-run preview 返回当前 `stateRevision`。声明
+`requiresExpectedRevision` 的 commit 必须提供 `expectedRevision`；core 在持有
+同资源单写 permit 与全局 safety write permit 时读取并比较 revision，只有匹配
+才预留一次动作预算并 dispatch。成功写只递增一次；dry-run、stale/future
+revision、容量拒绝和幂等重放不递增。预算先预留；adapter 明确报告
+`not-dispatched` 时回滚，明确拒绝和 dispatch 后结果未知则消耗一次 attempt。
+因此 worker 侧 revision conflict 计费一次，而 core 自己发现的 stale revision
+仍是零计费。
+
+observation contract 固定标注 `effectKind: read`，并显式选择 `parallel`、
+`serial` 或 `resource-serial`；preview action 则通过 `effectKind` 和
+`writeConcurrency: none` 明确不进入写锁。effect × mode 合法矩阵不允许 non-write
+action 接收 commit：read/preview 只能 dry-run，并且注册时必须声明 `none`，不能
+公开未兑现的 `resource-serial`；合法 non-write dry-run 可与 write 并发。write 才能
+在 health、safety、资源调度、revision 与预算门禁后 commit。纯只读 adapter 可以拥有零个 action，此时不
+要求 `execute` 或 revision provider。只有声明 revision-required action 时才要求
+`getStateRevision`。当前 mock 的 read/preview 可以并发且不得修改 world。
 
 ## Adapter process lifecycle
 
@@ -201,11 +272,13 @@ plus enabled non-privileged source groups as restricting SIDs. That latter
 choice keeps fixed Node/repository ACL access portable across managed Windows
 hosts; it is not claimed to isolate files.
 
-At most eight calls are pending and there is no application wait queue. Strict
-64 KiB frame and 32 KiB message limits apply. Malformed JSON, unknown
+At most eight calls are pending and there is no application-level wait queue.
+Strict 64 KiB frame and 32 KiB message limits bound the bytes Node may buffer
+after `Writable.write()` accepts a frame; a `false` return is treated as accepted
+backpressure rather than an undispatched failure. Malformed JSON, unknown
 fields/types, oversized output, identity mismatch, wrong/duplicate/late call
-ID, backpressure, timeout, EOF, crash, or non-zero exit fail closed, settle every
-pending promise once, release timers/capacity, and terminate the child. Normal
+ID, timeout, EOF, crash, or non-zero exit fail closed, settle every pending
+promise once, release timers/capacity, and terminate the child. Normal
 close waits for shutdown acknowledgement and zero exit; close with pending work
 settles that work before termination.
 
@@ -229,15 +302,20 @@ file, registry key, or network destination and is not a hostile-code sandbox.
    the request-cache hard limit. Reserve a new request ID with an in-flight
    promise before awaiting adapter completion. Concurrent identical requests
    await that same promise; conflicting content is rejected.
-6. Reject adapter mismatches, missing capabilities, unknown game actions, and
-   invalid action inputs.
-7. For commit writes, reject known unavailable durable-audit capacity, then
-   synchronously check stop/write capacity and increment the global in-flight
-   count in one `beginWrite()` operation. Dry-runs skip the write gate and
-   remain non-mutating.
-8. Execute the adapter and release the in-flight count in `finally`, including
-   known and unknown adapter failures.
-9. Replace the in-flight entry with the completed response and record a
+6. Reject adapter mismatches, missing required capabilities, unknown game
+   actions, invalid action inputs, and unsupported dry-run modes.
+7. For commit writes, reject unavailable runtime/adapter/audit health, check
+   stopped state, acquire the exact resource-serial permit, and use atomic
+   `beginWrite()` as the second stop/capacity check. Dry-runs skip both write
+   gates and remain non-mutating.
+8. While both permits are held, require and compare revision where declared,
+   reserve the bounded session/action attempt budget, and dispatch exactly
+   once. Release both permits in `finally` on every outcome.
+9. Validate observation/action output schema and deterministic UTF-8 result
+   size before constructing `BridgeResponse`. Adapter-declared rejection uses
+   fixed `ADAPTER_REJECTED` plus its allowlisted code; an unexpected
+   post-dispatch failure uses `OUTCOME_UNKNOWN` and faults later commit health.
+10. Replace the in-flight entry with the completed response and record a
    sanitized audit event. Unknown action and unregistered adapter values are
    represented only by fixed categories and hashed tags. Valid session calls
    and cross-owner denials carry only a short caller tag derived with HMAC-SHA-256.
@@ -250,9 +328,17 @@ testing low-entropy subject/method candidates with the public owner derivation.
 
 `session.open` is necessarily the one pre-session lifecycle operation. In
 `dry-run` mode it only describes the session that would be opened. A committed
-session is created only after the adapter, requested capabilities, and injected
-authorizer approve it, and `SessionManager.open` requires the caller owner key
-explicitly. Dry-run creates neither session nor owner state.
+session is created only after the adapter manifest, injected authorizer, and
+trusted grant provider approve it. `SessionManager.open` requires the caller
+owner key and exact grant explicitly. After an asynchronous grant settles, a
+final synchronous health admission prevents quiescing or faulted state from
+racing audit reservation and session insertion. Dry-run creates neither session
+nor owner state.
+
+普通 observation/dry-run 的审计写入失败不会把已经验证的安全结果静默改成
+内部错误；健康状态转为 `degraded` 并保持可观察。commit 仍需在副作用前获得
+durable audit reservation。普通 audit 与未来安全关键 operation journal 的
+持久语义仍留给阶段 B。
 
 ## MCP boundary lifecycle
 
@@ -271,13 +357,25 @@ explicitly. Dry-run creates neither session nor owner state.
    original request ID/action/mode/session. Invalid output or any exception is
    replaced by one fixed `INTERNAL_ERROR`; raw values and stacks never reach the
    protocol stream.
-6. The sanitized response becomes complete `structuredContent`; deterministic
+6. The validated response becomes complete `structuredContent`; deterministic
    JSON of that same response is the only text content. Bridge failures set MCP
    `isError: true` while preserving the stable bridge envelope and error code.
-7. Handler capacity is released in `finally`, including errors, invalid output,
+   Audit-oriented key-name redaction is not applied to protocol output: trusted
+   JSON Schema and already output-schema-validated adapter results keep their
+   field names, structure, and scalar types.
+7. The stdio transport accepts only safe-integer IDs or strings whose JSON
+   encoding is at most 8 KiB. A larger ID receives a fixed `-32600` response
+   with `id: null`, so attacker bytes are not reflected and the connection stays
+   open. The complete duplicated tool result is limited to 112 KiB; another
+   8 KiB remains for outer JSON-RPC fields and escaping inside the 128 KiB frame.
+   Every outbound frame is measured again before the underlying SDK transport.
+8. An oversized tool result becomes fixed `RESOURCE_CAPACITY`; any unexpected
+   oversized outer response becomes a fixed bounded JSON-RPC error rather than
+   a passive client-buffer disconnect.
+9. Handler capacity is released in `finally`, including errors, invalid output,
    and client-disconnect completion paths.
 
-The MCP JSON-RPC ID belongs to the SDK transport. The bridge `requestId` lives
+The bounded MCP JSON-RPC ID belongs to the SDK transport. The bridge `requestId` lives
 inside tool arguments and is the core idempotency key; the two are deliberately
 not mapped to each other. A transport-level size/concurrency refusal never
 enters the session request cache, so a later retry with the same bridge ID may
@@ -324,7 +422,9 @@ new fixed-name segment is exclusively created after identity checks. Once
 conservative physical capacity is unavailable, the ledger reports `full`,
 performs no eviction, and refuses ordinary commit/resume admission. The internal health snapshot is closed-world:
 `ready`, `degraded`, `full`, `corrupt`, or `closed`, plus outstanding/segment/
-sequence counters. It is not exposed as an MCP log or file resource.
+sequence counters. The bridge captures only validated status/outstanding values;
+malformed or throwing sink health becomes `corrupt`. It is not exposed as an MCP
+log or file resource.
 
 `write()` first appends and syncs the full data frame. It then exclusively
 creates and syncs a strict `confirmation-NNNNNNNNNNNNNNNN.audit`, followed by a
@@ -401,9 +501,12 @@ Async `createProductRuntime()` is the single construction seam. It verifies or
 creates the durable ledger before returning a bridge/control object. The stdio
 entrypoint then starts `LocalOperatorServer` before calling `serveStdio`; any
 ledger, runtime-directory, descriptor, or listener failure writes one fixed
-stderr category and returns without accepting MCP. Shutdown first starts
-closing MCP, then closes operator connections/listener, ledger, and adapter
-with bounded waits, and finally waits briefly for MCP transport completion. A
+stderr category and returns without accepting MCP. Shutdown first marks bridge
+health `quiescing`; this refuses new session opens and commit writes while
+retaining stop, close, and read admission. It separately tracks adapter mutation
+settlement (excluding audit), waits only to a fixed deadline, closes the adapter,
+then invokes durable-ledger close so the ledger's own bounded drain/abort handles
+pending native writes. Ledger close is attempted even if adapter close rejects. A
 process-exit fallback performs the same identity-checked descriptor cleanup
 synchronously.
 
@@ -432,6 +535,12 @@ and token are read from the fixed descriptor and cannot be selected by CLI,
 MCP, bridge params, or environment. Malformed, unknown, repeated, coalesced,
 oversized, unauthenticated, late, or disconnected traffic produces fixed
 failure categories and never enters the bridge action protocol.
+
+`status` 返回并由 CLI 显示 closed-world 的 runtime（`ready`/`degraded`/
+`quiescing`/`faulted`）、adapter（`ready`/`unavailable`/`faulted`）、audit
+（`ready`/`degraded`/`full`/`corrupt`/`closed`）和既有 safety 类别及有界
+计数。它不返回 path、endpoint、token、PID、异常文本、audit 内容、adapter
+payload 或任意 metadata。
 
 Resume uses an abort-aware two-phase path. The bridge first verifies generation,
 stopped state, in-flight writes, and single-resume admission while leaving the

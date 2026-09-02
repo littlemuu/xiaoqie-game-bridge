@@ -16,6 +16,9 @@
 - 严格、版本化、closed-world 的 bridge 请求与响应协议；
 - memory-only、adapter-bound、caller-owned 的 session；
 - capability、policy、dry-run、幂等缓存和有界并发写入；
+- Adapter Contract v2：严格输入/输出 schema、效果类型、dry-run 语义、结果上限、错误集合与 revision 要求；
+- 可信本地 grant profile、固定 tiny-world scope、session/action 预算与资源级单写调度；
+- runtime / adapter / audit / safety 的 closed-world 健康状态与显式 `OUTCOME_UNKNOWN`；
 - 模型可触发、但不能自行解除的全局 safety latch；
 - 独立于 MCP 的本地 Windows named-pipe operator；
 - 固定目录、追加式、有界、可恢复的本地安全审计账本；
@@ -25,7 +28,7 @@
 
 这些能力构成安全地基，但不代表项目已经适合真实游戏。当前路线已经调整：**冻结发布、审计和 Windows containment 的继续扩张，优先修正 adapter 领域契约、可信授权、状态一致性、动作结果对账和运行恢复。**
 
-完整路线见 [`docs/ROADMAP.md`](docs/ROADMAP.md)。当前下一张工单是 [Issue #19：Adapter Contract v2、可信授权与运行健康基础](https://github.com/littlemuu/xiaoqie-game-bridge/issues/19)。
+完整路线见 [`docs/ROADMAP.md`](docs/ROADMAP.md)。本分支实现 [Issue #19：Adapter Contract v2、可信授权与运行健康基础](https://github.com/littlemuu/xiaoqie-game-bridge/issues/19)；合并复审通过后，下一阶段才是独立的 operation journal / reconciliation 工单。
 
 ## 当前不提供的能力
 
@@ -47,7 +50,7 @@
                      | stdin/stdout 上的本地 MCP
                      v
            stdio 边界：一个 tool
-          64 KiB frame / 32 KiB envelope
+         128 KiB frame / 32 KiB envelope
                      |
                      | 固定 local context
                      v
@@ -138,7 +141,7 @@ session：
 
 owner 来自可信 transport context，不来自请求参数。当前 local stdio 注入精确的 `{ transport: "local" }`；未来 remote seam 只是一份严格接口，生产环境尚无 remote credential verification。
 
-需要特别说明：**当前代码只验证调用方请求的 capability 是否由 adapter 声明，尚未实现可信本地 grant profile。** 因此，真实 adapter 接入前必须先完成 Issue #19，使实际授权成为“请求能力、可信 profile、adapter manifest 与资源 scope 的交集”。
+capability 请求不等于授权。当前产品只使用可信代码中的 fixed mock profile，实际 grant 是“请求能力、可信 profile、注册时冻结的 adapter manifest 与 fixed tiny-world scope”的交集。session response 只返回实际批准能力、安全 scope 摘要和剩余有界预算，不返回 profile 内部结构或授权秘密。owner binding 回答“谁在使用 session”，grant 回答“该主体能做什么”，两者不互相替代。
 
 ## 幂等与并发
 
@@ -148,9 +151,10 @@ owner 来自可信 transport context，不来自请求参数。当前 local stdi
 - 全局默认最多同时有 4 个 commit write；
 - MCP 默认最多同时有 8 个 handler；
 - adapter IPC 默认最多有 8 个 pending call；
+- registry 最多注册 64 个 adapter，聚合 catalog 最多 32 KiB；
 - 达到容量时在 adapter 副作用前拒绝，不建立无界等待队列。
 
-这些限制只能证明资源有界，不能证明真实游戏状态并发安全。新的路线要求同一游戏资源的写入默认串行，并引入 state revision 与 `expectedRevision`。
+这些限制只能证明资源有界，不能单独证明状态安全。Adapter Contract v2 另外要求同一 adapter/scope/resource 的写入默认单写；observation 必须显式声明 `parallel`、`serial` 或 `resource-serial`，纯只读 adapter 可以声明零个 action，也不需要 revision provider。`game.act` 的 effect × mode 矩阵是封闭的：write action 可按声明接受 commit 或 dry-run，read/preview action 只能使用 dry-run且必须声明 `writeConcurrency: none`，不能声称未执行的资源串行保证；任何 non-write commit 都在 adapter dispatch、写调度和预算预留前固定拒绝。mock observation 和 preview 返回 `stateRevision`，声明需要 revision 的 commit 必须携带 `expectedRevision`。core 在派发前发现的 stale/future revision、预算耗尽、stop 和并发占用均不扣预算；已派发到 worker 的明确拒绝（包括 worker 侧 revision conflict）扣一次，幂等重放不重复扣减。成功 commit 只递增一次。
 
 ## Safety latch 与本地 operator
 
@@ -173,6 +177,7 @@ operator：
 - resume 必须携带当前 stop generation；
 - 有 in-flight write、generation 不匹配、deadline、disconnect、后发 stop 或 audit 未确认时均拒绝恢复；
 - status 当前只暴露安全状态和非敏感计数，不读取审计内容。
+- status 同时返回并由 CLI 显示固定的 runtime / adapter / audit / safety 健康类别及非敏感计数。
 
 现有限制：safety latch 状态不持久化，产品重启后会创建新的 running latch。真实 adapter 启动前必须决定“启动默认 stopped”或持久安全状态的恢复语义。
 
@@ -198,10 +203,11 @@ MCP surface：
 - MCP JSON-RPC ID 与 bridge `requestId` 是两层不同标识；
 - wrapper 不替换 request ID、不自动重试；
 - stdout 只承载 MCP 协议，固定脱敏诊断写入 stderr；
-- bridge 输出会再次经过 schema、请求身份和脱敏验证；
+- bridge 输出会再次经过 envelope schema 与请求身份验证；审计用字段名脱敏不会改写协议响应；
+- 完整 tool result 最多 112 KiB，并为 128 KiB stdio frame 保留 16 KiB JSON-RPC 预算：request ID 的 JSON 编码最多 8 KiB，剩余 8 KiB 用于外层字段与转义。ID 仅接受 safe integer 或该上限内的字符串；超界 ID 返回不回显原 ID 的固定 `-32600`。出站完整 frame 还会再次测量，超限不会被动关闭连接；
 - client disconnect 不被描述成已经取消或回滚进入 core/worker 的动作。
 
-当前 MCP 仍使用一个通用 tool，action 的输入/输出 schema、效果类型和 dry-run 精确度还没有完整暴露给模型。这也是 Issue #19 的范围。
+MCP 仍只使用一个通用 tool；`bridge.describe` 现在返回纯 JSON action catalog，包含输入/输出 JSON Schema、read/preview/write、dry-run 精确度、required capabilities、revision、结果上限、资源调度与 adapter error namespace，不返回 Zod 实例或函数。注册先把 Zod node/check/options 捕获为有界、own-data-only、不可变的声明式 AST；hole、accessor、symbol/extra key、Proxy 异常、自定义 `_zod.toJSONSchema` / `_zod.processJSONSchema`、非有限或有损 JSON number 与任何未知定义均拒绝。只有 Zod 内建 object lazy-shape getter 按固定实现身份读取恰好一次；snapshot 从该 AST 重建的可信 schema 发射，并使用独有空 metadata registry，源 definition graph、hook 或 global metadata 都不能形成 check/use gap。schema 标量、单份 snapshot、单 adapter catalog 与 registry 聚合 catalog 分别限制为 1 KiB、16 KiB、24 KiB 与 32 KiB；registry 同时限制为 64 个 adapter。活动 validator 由不可变 JSON 快照重建并隐藏在闭包中。可选 `health` member 在注册时只读取一次；真正缺省才使用 ready 默认值，已定义的非函数、Promise/thenable 或 getter 异常均拒绝注册。required capabilities、adapter error codes 与 grant capabilities 都只接受 dense own-data string array，长度只从 own data descriptor 捕获一次。MCP 保持已验证 catalog/result 的结构与类型，不按 `path`、`token`、`password` 等普通领域字段名做静默替换。MCP server version 从 `package.json` 单一来源读取，协议版本只使用 `PROTOCOL_VERSION`。
 
 ## 持久审计账本
 
@@ -275,13 +281,12 @@ MCP surface：
 
 ## 新路线
 
-项目接下来严格按以下顺序推进：
+阶段 A 已由 Issue #19 本分支实现。后续仍严格按以下顺序推进：
 
-1. **Adapter Contract v2、可信 grant、revision、资源级写入串行化与运行健康**；
-2. **operation journal、`OUTCOME_UNKNOWN` 与 reconciliation**；
-3. **首个真实 adapter 的只读 vertical slice**；
-4. **一个具备 revision、journal、对账和恢复证据的最小写动作**；
-5. **完成上述证据后，再评估远程传输和更强 OS 权限边界**。
+1. **operation journal、durable `operationId` 与 reconciliation**；
+2. **首个真实 adapter 的只读 vertical slice**；
+3. **一个具备 revision、journal、对账和恢复证据的最小写动作**；
+4. **完成上述证据后，再评估远程传输和更强 OS 权限边界**。
 
 在只读真实 adapter 完成前，release、ledger、containment 和 remote transport 均保持冻结。
 
@@ -289,12 +294,10 @@ MCP surface：
 
 ## 当前关键限制
 
-- capability 尚无可信本地 grant profile；
-- adapter contract 尚缺通用 output schema、effect kind、revision、资源级并发和 adapter error namespace；
 - session/idempotency 只在活进程内成立；
-- dispatch 后 timeout/worker exit 的动作结果尚不能对账；
+- dispatch 后 timeout/worker exit 现在会保守返回 `OUTCOME_UNKNOWN`，但尚无 durable operation journal、内部 `operationId` 或 reconciliation；
 - safety latch 不跨重启持久；
-- operator health 尚不能完整表达 runtime/adapter/audit fault；
+- operator 能表达固定健康类别，但尚无 stale runtime、audit full/corrupt 或 adapter fault 的受支持恢复命令；
 - audit 与未来 operation journal 尚未分层；
 - stale descriptor、audit full/corrupt 尚缺受支持的 operator 恢复流程；
 - observation 尚缺真实游戏所需的分页、freshness、revision 和不可信文本标记；

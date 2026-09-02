@@ -1,3 +1,5 @@
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -5,21 +7,36 @@ import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { InMemoryTransport, type McpServer } from "@modelcontextprotocol/server";
 import { afterEach, describe, expect, it } from "vitest";
+import { z } from "zod";
 import {
+  ADAPTER_MAX_RESULT_BYTES,
+  ADAPTER_REGISTRY_MAX_ADAPTERS,
+  ADAPTER_REGISTRY_MAX_CATALOG_BYTES,
+  MCP_MAX_JSON_RPC_ID_BYTES,
+  MCP_JSON_RPC_WRAPPER_BYTES,
+  type AdapterActionDefinition,
+  type AdapterObservationDefinition,
   AdapterRegistry,
+  type BridgeMode,
   type BridgeResponse,
+  type CapabilityGrantProvider,
   GameBridge,
+  type GameAdapter,
   MockGameAdapter,
+  PACKAGE_VERSION,
   SessionManager,
   errorResponse,
   responseEnvelopeSchema,
   successResponse,
   type RequestContext,
   type RequestEnvelope,
+  canonicalJson,
 } from "../src/index.js";
 import {
   GAME_BRIDGE_TOOL_NAME,
   HandlerConcurrencyGate,
+  MCP_JSON_RPC_RESERVE_BYTES,
+  MCP_MAX_TOOL_RESULT_BYTES,
   STDIO_LOCAL_CONTEXT,
   STDIO_MAX_BUFFER_BYTES,
   createGameBridgeMcpServer,
@@ -142,6 +159,140 @@ function createMockBridge(options: { sessions?: SessionManager } = {}): GameBrid
   });
 }
 
+interface RawStdioLine {
+  bytes: number;
+  message: Record<string, unknown>;
+}
+
+async function rawStdioConnection(
+  entrypoint: string,
+  env: Record<string, string>,
+): Promise<{
+  send(message: Record<string, unknown>): void;
+  read(): Promise<RawStdioLine>;
+  stderr(): string;
+  close(): Promise<void>;
+}> {
+  const child = spawn(process.execPath, [entrypoint], {
+    cwd: process.cwd(),
+    env,
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  let stdout = Buffer.alloc(0);
+  let stderr = "";
+  const lines: Buffer[] = [];
+  const readers: Array<(line: Buffer) => void> = [];
+  child.stdout.on("data", (chunk: Buffer) => {
+    stdout = Buffer.concat([stdout, chunk]);
+    while (true) {
+      const newline = stdout.indexOf(0x0a);
+      if (newline < 0) break;
+      const line = stdout.subarray(0, newline);
+      stdout = stdout.subarray(newline + 1);
+      const reader = readers.shift();
+      if (reader === undefined) lines.push(line);
+      else reader(line);
+    }
+  });
+  child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString("utf8")));
+
+  return {
+    send(message) {
+      child.stdin.write(`${JSON.stringify(message)}\n`);
+    },
+    async read() {
+      const line =
+        lines.shift() ??
+        (await new Promise<Buffer>((resolveLine, reject) => {
+          const timer = setTimeout(() => reject(new Error("raw-stdio-timeout")), 3_000);
+          readers.push((value) => {
+            clearTimeout(timer);
+            resolveLine(value);
+          });
+        }));
+      return {
+        bytes: line.byteLength + 1,
+        message: JSON.parse(line.toString("utf8")) as Record<string, unknown>,
+      };
+    },
+    stderr: () => stderr,
+    async close() {
+      child.stdin.end();
+      await Promise.race([
+        once(child, "exit"),
+        new Promise<void>((resolveClose) => setTimeout(resolveClose, 1_000)),
+      ]);
+      if (child.exitCode === null) child.kill();
+    },
+  };
+}
+
+class DomainFieldAdapter implements GameAdapter {
+  readonly id = "domain-fields";
+  readonly displayName = "Domain field contract adapter";
+  readonly observation: AdapterObservationDefinition = {
+    description: "Return one harmless domain token value.",
+    outputSchema: z.object({ token: z.number() }).strict(),
+    effectKind: "read",
+    concurrency: { kind: "parallel" },
+    requiredCapabilities: ["game.observe"],
+    maxResultBytes: 128,
+  };
+  readonly actions: Readonly<Record<string, AdapterActionDefinition>> = {
+    inspect: {
+      description: "Validate ordinary domain field names.",
+      inputSchema: z
+        .object({ path: z.string(), token: z.number(), password: z.string() })
+        .strict(),
+      outputSchema: z.object({ token: z.number() }).strict(),
+      effectKind: "preview",
+      dryRunSemantics: "exact",
+      requiredCapabilities: ["game.act.inspect"],
+      maxResultBytes: 128,
+      writeConcurrency: { kind: "none" },
+      adapterErrorCodes: [],
+      requiresExpectedRevision: false,
+      reconciliation: "unsupported",
+    },
+  };
+
+  async observe(): Promise<unknown> {
+    return { token: 7 };
+  }
+
+  async execute(
+    _action: string,
+    _input: unknown,
+    _mode: BridgeMode,
+  ): Promise<unknown> {
+    return { token: 7 };
+  }
+}
+
+function createDomainFieldBridge(): GameBridge {
+  const adapter = new DomainFieldAdapter();
+  const registry = new AdapterRegistry();
+  registry.register(adapter);
+  const grantProvider: CapabilityGrantProvider = {
+    grant(grantRequest) {
+      return {
+        allowed: true,
+        capabilities: [...grantRequest.requestedCapabilities],
+        scope: { kind: adapter.id, resourceId: "domain-world" },
+        ttlMs: grantRequest.requestedTtlMs ?? 60_000,
+        totalActionBudget: 0,
+        perActionBudgets: {},
+      };
+    },
+  };
+  return new GameBridge({
+    registry,
+    sessions: new SessionManager({ idGenerator: () => "domain-session" }),
+    grantProvider,
+  });
+}
+
 async function callBridge(client: Client, envelope: RequestEnvelope) {
   return client.callTool({
     name: GAME_BRIDGE_TOOL_NAME,
@@ -173,11 +324,74 @@ describe("local MCP contract", () => {
     expect(listed.tools.map((tool) => tool.name)).not.toContain("safety.status");
   });
 
+  it("preserves validated domain field names and number outputs across the real MCP boundary", async () => {
+    const { client } = await connectInMemory(
+      createGameBridgeMcpServer({ bridge: createDomainFieldBridge() }),
+    );
+
+    const describeResult = await callBridge(
+      client,
+      request("domain-describe", "bridge.describe", {}),
+    );
+    const described = parseBridgeResponse(describeResult);
+    expect(described.ok).toBe(true);
+    expect(JSON.parse(textContent(describeResult))).toEqual(described);
+    const inputSchema = (
+      described as {
+        result: {
+          adapters: Array<{
+            actions: { inspect: { inputSchema: { properties: Record<string, unknown> } } };
+          }>;
+        };
+      }
+    ).result.adapters[0]!.actions.inspect.inputSchema;
+    expect(inputSchema.properties).toMatchObject({
+      path: { type: "string" },
+      token: { type: "number" },
+      password: { type: "string" },
+    });
+
+    const opened = parseBridgeResponse(
+      await callBridge(
+        client,
+        request("domain-open", "session.open", {
+          adapterId: "domain-fields",
+          capabilities: ["game.act.inspect"],
+        }),
+      ),
+    );
+    expect(opened.ok).toBe(true);
+    const sessionId = (opened as { result: { sessionId: string } }).result.sessionId;
+    const actionResult = await callBridge(
+      client,
+      request(
+        "domain-result",
+        "game.act",
+        {
+          adapterId: "domain-fields",
+          gameAction: "inspect",
+          input: { path: "inventory.slot", token: 42, password: "puzzle-answer" },
+        },
+        { sessionId, mode: "dry-run" },
+      ),
+    );
+    const actionResponse = parseBridgeResponse(actionResult);
+    expect(actionResponse).toMatchObject({ ok: true, result: { token: 7 } });
+    expect(typeof (actionResponse as { result: { token: unknown } }).result.token).toBe(
+      "number",
+    );
+    expect(JSON.parse(textContent(actionResult))).toEqual(actionResponse);
+  });
+
   it("injects frozen local context and rejects caller-supplied identity fields", async () => {
     const sessions = new SessionManager({ idGenerator: () => "mcp-session" });
     const { client } = await connectInMemory(
       createGameBridgeMcpServer({ bridge: createMockBridge({ sessions }) }),
     );
+    expect(client.getServerVersion()).toEqual({
+      name: "xiaoqie-game-bridge",
+      version: PACKAGE_VERSION,
+    });
 
     const opened = parseBridgeResponse(
       await callBridge(
@@ -257,6 +471,7 @@ describe("local MCP contract", () => {
           adapterId: "mock-world",
           gameAction: "move",
           input: { dx, dy: 0, dz: 0 },
+          expectedRevision: 0,
         },
         { sessionId, mode },
       );
@@ -335,6 +550,23 @@ describe("local MCP contract", () => {
     expect(result.isError).toBe(true);
     expect(bridgeCalls).toBe(0);
     expect(JSON.stringify(result)).not.toContain(injectedSecret);
+  });
+
+  it("replaces an oversized MCP tool result with one fixed capacity response", async () => {
+    const oversized = "x".repeat(STDIO_MAX_BUFFER_BYTES * 2);
+    const bridge: BridgeRequestHandler = {
+      async handle(envelope) {
+        return successResponse(envelope as RequestEnvelope, { payload: oversized });
+      },
+    };
+    const { client } = await connectInMemory(createGameBridgeMcpServer({ bridge }));
+    const result = await callBridge(
+      client,
+      request("oversized-tool-result", "bridge.describe", {}),
+    );
+    expectBridgeError(parseBridgeResponse(result), "RESOURCE_CAPACITY");
+    expect(result.isError).toBe(true);
+    expect(JSON.stringify(result)).not.toContain(oversized.slice(0, 1_024));
   });
 
   it("bounds concurrent handlers and releases permits after all outcomes", async () => {
@@ -426,6 +658,268 @@ describe("local MCP contract", () => {
   });
 
   it.runIf(process.platform === "win32")(
+    "bounds raw JSON-RPC IDs while maximum stdio results and catalogs stay in frame",
+    async () => {
+      const entrypoint = resolve(
+        process.cwd(),
+        "dist",
+        "tests",
+        "fixtures",
+        "mcp-wire-boundary-child.js",
+      );
+      const connection = await rawStdioConnection(
+        entrypoint,
+        await isolatedChildEnvironment(),
+      );
+      const maximumId = (prefix: string) =>
+        prefix.repeat(MCP_MAX_JSON_RPC_ID_BYTES - 2);
+      expect(MCP_MAX_JSON_RPC_ID_BYTES + MCP_JSON_RPC_WRAPPER_BYTES).toBe(
+        MCP_JSON_RPC_RESERVE_BYTES,
+      );
+      expect(MCP_MAX_TOOL_RESULT_BYTES + MCP_JSON_RPC_RESERVE_BYTES).toBe(
+        STDIO_MAX_BUFFER_BYTES,
+      );
+      const requestMessage = (
+        id: string,
+        action: string,
+        params: Record<string, unknown>,
+        options: { sessionId?: string } = {},
+      ) => ({
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call",
+        params: {
+          name: GAME_BRIDGE_TOOL_NAME,
+          arguments: toolArguments(
+            request(`raw-${action}`, action, params, {
+              ...(options.sessionId === undefined
+                ? {}
+                : { sessionId: options.sessionId }),
+            }),
+          ),
+        },
+      });
+
+      try {
+        connection.send({
+          jsonrpc: "2.0",
+          id: "initialize",
+          method: "initialize",
+          params: {
+            protocolVersion: "2025-11-25",
+            capabilities: {},
+            clientInfo: { name: "raw-wire-test", version: "1.0.0" },
+          },
+        });
+        expect((await connection.read()).message).toMatchObject({
+          jsonrpc: "2.0",
+          id: "initialize",
+          result: { protocolVersion: "2025-11-25" },
+        });
+        connection.send({
+          jsonrpc: "2.0",
+          method: "notifications/initialized",
+        });
+
+        const catalogId = maximumId("c");
+        expect(Buffer.byteLength(JSON.stringify(catalogId), "utf8")).toBe(
+          MCP_MAX_JSON_RPC_ID_BYTES,
+        );
+        connection.send(requestMessage(catalogId, "bridge.describe", {}));
+        const catalog = await connection.read();
+        expect(catalog.bytes).toBeLessThanOrEqual(STDIO_MAX_BUFFER_BYTES);
+        expect(catalog.message.id).toBe(catalogId);
+        expect(
+          (
+            catalog.message.result as {
+              structuredContent: { result: { adapters: unknown[] } };
+            }
+          ).structuredContent.result.adapters,
+        ).toHaveLength(ADAPTER_REGISTRY_MAX_ADAPTERS);
+
+        connection.send(
+          requestMessage("open", "session.open", {
+            adapterId: "wire-00",
+            capabilities: ["game.observe"],
+          }),
+        );
+        const opened = await connection.read();
+        const sessionId = (
+          opened.message.result as {
+            structuredContent: { result: { sessionId: string } };
+          }
+        ).structuredContent.result.sessionId;
+
+        const resultId = maximumId("r");
+        connection.send(
+          requestMessage(
+            resultId,
+            "game.observe",
+            { adapterId: "wire-00" },
+            { sessionId },
+          ),
+        );
+        const result = await connection.read();
+        expect(result.bytes).toBeLessThanOrEqual(STDIO_MAX_BUFFER_BYTES);
+        expect(result.message.id).toBe(resultId);
+        const observed = (
+          result.message.result as { structuredContent: { result: unknown } }
+        ).structuredContent.result;
+        expect(Buffer.byteLength(canonicalJson(observed), "utf8")).toBe(
+          ADAPTER_MAX_RESULT_BYTES,
+        );
+
+        const oversizedId = "x".repeat(MCP_MAX_JSON_RPC_ID_BYTES - 1);
+        expect(Buffer.byteLength(JSON.stringify(oversizedId), "utf8")).toBe(
+          MCP_MAX_JSON_RPC_ID_BYTES + 1,
+        );
+        connection.send(requestMessage(oversizedId, "bridge.describe", {}));
+        const rejected = await connection.read();
+        expect(rejected.message).toMatchObject({
+          jsonrpc: "2.0",
+          id: null,
+          error: {
+            code: -32600,
+            message: "The JSON-RPC request ID exceeds the local wire budget.",
+          },
+        });
+        expect(JSON.stringify(rejected.message)).not.toContain(oversizedId.slice(0, 128));
+
+        connection.send({
+          jsonrpc: "2.0",
+          id: "after-rejection",
+          method: "tools/list",
+          params: {},
+        });
+        expect((await connection.read()).message).toMatchObject({
+          id: "after-rejection",
+          result: { tools: [{ name: GAME_BRIDGE_TOOL_NAME }] },
+        });
+      } finally {
+        await connection.close();
+      }
+      expect(connection.stderr()).toBe("");
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
+    "carries the maximum core result and near-limit capacity catalog through built stdio",
+    async () => {
+      const entrypoint = resolve(
+        process.cwd(),
+        "dist",
+        "tests",
+        "fixtures",
+        "mcp-wire-boundary-child.js",
+      );
+      const env = await isolatedChildEnvironment();
+      const transport = new StdioClientTransport({
+        command: process.execPath,
+        args: [entrypoint],
+        cwd: process.cwd(),
+        env,
+        stderr: "pipe",
+        maxBufferSize: STDIO_MAX_BUFFER_BYTES,
+      });
+      let stderr = "";
+      transport.stderr?.on("data", (chunk: Buffer) => (stderr += chunk.toString("utf8")));
+      const client = new Client({ name: "wire-boundary-test", version: "1.0.0" });
+
+      try {
+        await client.connect(transport);
+        const described = parseBridgeResponse(
+          await callBridge(client, request("wire-describe", "bridge.describe", {})),
+        );
+        expect(described.ok).toBe(true);
+        const adapters = (described as { result: { adapters: unknown[] } }).result.adapters;
+        expect(adapters).toHaveLength(ADAPTER_REGISTRY_MAX_ADAPTERS);
+        const catalogBytes = Buffer.byteLength(canonicalJson(adapters), "utf8");
+        expect(catalogBytes).toBeLessThanOrEqual(ADAPTER_REGISTRY_MAX_CATALOG_BYTES);
+        expect(catalogBytes).toBeGreaterThan(
+          ADAPTER_REGISTRY_MAX_CATALOG_BYTES - ADAPTER_REGISTRY_MAX_ADAPTERS - 512,
+        );
+
+        const opened = parseBridgeResponse(
+          await callBridge(
+            client,
+            request("wire-open", "session.open", {
+              adapterId: "wire-00",
+              capabilities: ["game.observe"],
+            }),
+          ),
+        );
+        expect(opened.ok).toBe(true);
+        const sessionId = (opened as { result: { sessionId: string } }).result.sessionId;
+        const observed = parseBridgeResponse(
+          await callBridge(
+            client,
+            request(
+              "wire-observe",
+              "game.observe",
+              { adapterId: "wire-00" },
+              { sessionId },
+            ),
+          ),
+        );
+        expect(observed.ok).toBe(true);
+        expect(
+          Buffer.byteLength(
+            canonicalJson((observed as { result: unknown }).result),
+            "utf8",
+          ),
+        ).toBe(ADAPTER_MAX_RESULT_BYTES);
+      } finally {
+        await client.close().catch(() => undefined);
+        await transport.close().catch(() => undefined);
+      }
+      expect(stderr).toBe("");
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
+    "returns a fixed protocol error for oversized built stdio output and keeps the connection",
+    async () => {
+      const entrypoint = resolve(
+        process.cwd(),
+        "dist",
+        "tests",
+        "fixtures",
+        "mcp-wire-boundary-child.js",
+      );
+      const env = {
+        ...(await isolatedChildEnvironment()),
+        XIAOQIE_TEST_MCP_WIRE_SCENARIO: "oversize",
+      };
+      const transport = new StdioClientTransport({
+        command: process.execPath,
+        args: [entrypoint],
+        cwd: process.cwd(),
+        env,
+        stderr: "pipe",
+        maxBufferSize: STDIO_MAX_BUFFER_BYTES,
+      });
+      let stderr = "";
+      transport.stderr?.on("data", (chunk: Buffer) => (stderr += chunk.toString("utf8")));
+      const client = new Client({ name: "wire-oversize-test", version: "1.0.0" });
+
+      try {
+        await client.connect(transport);
+        const result = await callBridge(
+          client,
+          request("wire-oversize", "bridge.describe", {}),
+        );
+        expectBridgeError(parseBridgeResponse(result), "RESOURCE_CAPACITY");
+        expect(result.isError).toBe(true);
+        expect((await client.listTools()).tools).toHaveLength(1);
+      } finally {
+        await client.close().catch(() => undefined);
+        await transport.close().catch(() => undefined);
+      }
+      expect(stderr).toBe("");
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
     "round-trips through the built stdio child with the official client",
     async () => {
     const entrypoint = resolve(process.cwd(), "dist", "src", "mcp", "stdio-server.js");
@@ -480,6 +974,7 @@ describe("local MCP contract", () => {
           adapterId: "mock-world",
           gameAction: "move",
           input: { dx: 1, dy: 0, dz: 0 },
+          expectedRevision: 0,
         },
         { sessionId },
       );
@@ -538,7 +1033,9 @@ describe("local MCP contract", () => {
             name: GAME_BRIDGE_TOOL_NAME,
             arguments: toolArguments(
               request("stdio-oversize", "bridge.describe", {
-                payload: injectedSecret.repeat(3_000),
+                payload: injectedSecret.repeat(
+                  Math.ceil((STDIO_MAX_BUFFER_BYTES + 1) / injectedSecret.length),
+                ),
               }),
             ),
           },

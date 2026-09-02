@@ -5,6 +5,7 @@ import {
   STDIO_MAX_BUFFER_BYTES,
   createGameBridgeMcpServer,
 } from "./server.js";
+import { BoundedStdioServerTransport } from "./bounded-stdio-transport.js";
 
 async function run(): Promise<void> {
   let runtime;
@@ -34,9 +35,11 @@ async function run(): Promise<void> {
   }
   process.once("exit", () => operator.cleanupRuntimeObjectsForProcessExit());
 
-  const transport = new StdioServerTransport(process.stdin, process.stdout, {
-    maxBufferSize: STDIO_MAX_BUFFER_BYTES,
-  });
+  const transport = new BoundedStdioServerTransport(
+    new StdioServerTransport(process.stdin, process.stdout, {
+      maxBufferSize: STDIO_MAX_BUFFER_BYTES,
+    }),
+  );
   const handle = serveStdio(() => createGameBridgeMcpServer({ bridge: runtime.bridge }), {
     transport,
     onerror: () => {
