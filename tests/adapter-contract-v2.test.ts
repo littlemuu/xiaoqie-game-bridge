@@ -559,6 +559,59 @@ describe("Adapter Contract v2", () => {
     expect(malformedAccessorReads).toBe(0);
   });
 
+  it("captures one health member and rejects defined non-function values", () => {
+    for (const malformed of [
+      "ready",
+      Promise.resolve("ready"),
+      { then: () => undefined },
+    ]) {
+      const adapter = new ContractTestAdapter();
+      Object.defineProperty(adapter, "health", {
+        configurable: true,
+        enumerable: true,
+        value: malformed,
+      });
+      expect(() => new AdapterRegistry().register(adapter)).toThrow(/health/u);
+    }
+
+    const stateful = new ContractTestAdapter();
+    let healthReads = 0;
+    Object.defineProperty(stateful, "health", {
+      configurable: true,
+      get: () => {
+        healthReads += 1;
+        return healthReads === 1 ? () => "ready" as const : Promise.resolve("ready");
+      },
+    });
+    const registry = new AdapterRegistry();
+    registry.register(stateful);
+    expect(healthReads).toBe(1);
+    expect(registry.get(stateful.id)!.health!()).toBe("ready");
+    expect(healthReads).toBe(1);
+  });
+
+  it("bounds the registry at the operator-visible adapter capacity before insertion", () => {
+    const registry = new AdapterRegistry();
+    const adapter = (index: number): GameAdapter => ({
+      id: `capacity-${index.toString().padStart(2, "0")}`,
+      displayName: "a",
+      observation: {
+        description: "o",
+        outputSchema: z.boolean(),
+        effectKind: "read",
+        concurrency: { kind: "parallel" },
+        requiredCapabilities: ["game.observe"],
+        maxResultBytes: 1,
+      },
+      actions: {},
+      observe: async () => true,
+    });
+    for (let index = 0; index < 64; index += 1) registry.register(adapter(index));
+    expect(registry.list()).toHaveLength(64);
+    expect(() => registry.register(adapter(64))).toThrow(/capacity/u);
+    expect(registry.list()).toHaveLength(64);
+  });
+
   it("isolates JSON snapshots from metadata and rejects custom or lossy emitters", () => {
     const defaultSchema = z.string().meta({ default: "injected" });
     const defaultAdapter = new ContractTestAdapter();

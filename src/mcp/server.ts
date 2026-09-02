@@ -12,7 +12,10 @@ import {
 import { PACKAGE_VERSION } from "../package-version.js";
 
 export const GAME_BRIDGE_TOOL_NAME = "game_bridge_request";
-export const STDIO_MAX_BUFFER_BYTES = 64 * 1_024;
+export const STDIO_MAX_BUFFER_BYTES = 128 * 1_024;
+export const MCP_JSON_RPC_RESERVE_BYTES = 16 * 1_024;
+export const MCP_MAX_TOOL_RESULT_BYTES =
+  STDIO_MAX_BUFFER_BYTES - MCP_JSON_RPC_RESERVE_BYTES;
 export const MCP_MAX_ENVELOPE_BYTES = 32 * 1_024;
 export const MCP_MAX_CONCURRENT_HANDLERS = 8;
 
@@ -86,6 +89,21 @@ function fixedInternalResponse(request: RequestEnvelope): BridgeResponse {
   );
 }
 
+class McpToolResultCapacityError extends Error {
+  constructor() {
+    super("The MCP tool result exceeds its supported wire budget.");
+    this.name = "McpToolResultCapacityError";
+  }
+}
+
+function fixedCapacityResponse(request: RequestEnvelope): BridgeResponse {
+  return errorResponse(
+    request,
+    "RESOURCE_CAPACITY",
+    "The local MCP response exceeds its supported wire budget.",
+  );
+}
+
 function responseMatchesRequest(
   response: BridgeResponse,
   request: RequestEnvelope,
@@ -105,18 +123,29 @@ function toolResult(response: BridgeResponse): CallToolResult {
   }
   const validated = parsed.data as BridgeResponse;
   const text = canonicalJson(validated);
-  return {
+  const candidate: CallToolResult = {
     content: [{ type: "text", text }],
     structuredContent: validated,
     ...(!validated.ok ? { isError: true } : {}),
   };
+  if (
+    Buffer.byteLength(canonicalJson(candidate), "utf8") >
+    MCP_MAX_TOOL_RESULT_BYTES
+  ) {
+    throw new McpToolResultCapacityError();
+  }
+  return candidate;
 }
 
 function safeToolResult(response: BridgeResponse, request: RequestEnvelope): CallToolResult {
   try {
     return toolResult(response);
-  } catch {
-    return toolResult(fixedInternalResponse(request));
+  } catch (error) {
+    return toolResult(
+      error instanceof McpToolResultCapacityError
+        ? fixedCapacityResponse(request)
+        : fixedInternalResponse(request),
+    );
   }
 }
 

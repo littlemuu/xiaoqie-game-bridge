@@ -6,7 +6,7 @@ import type { AdapterHealthStatus } from "./health.js";
 export const ADAPTER_MAX_RESULT_BYTES = 32 * 1_024;
 export const ADAPTER_MAX_SCHEMA_SCALAR_BYTES = 1_024;
 export const ADAPTER_MAX_SCHEMA_SNAPSHOT_BYTES = 16 * 1_024;
-export const ADAPTER_MAX_CATALOG_BYTES = 128 * 1_024;
+export const ADAPTER_MAX_CATALOG_BYTES = 24 * 1_024;
 const ADAPTER_ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/u;
 const MANIFEST_NAME_PATTERN = /^[a-z][a-z0-9_.-]{0,127}$/u;
 
@@ -939,6 +939,15 @@ export function snapshotAdapter(adapter: GameAdapter): GameAdapter {
   if (requiresRevision && typeof adapter.getStateRevision !== "function") {
     throw new TypeError("Adapter revision provider is required by a write action.");
   }
+  let healthMember: unknown;
+  try {
+    healthMember = adapter.health;
+  } catch {
+    throw new TypeError("Adapter health member could not be captured.");
+  }
+  if (healthMember !== undefined && typeof healthMember !== "function") {
+    throw new TypeError("Adapter health member must be a function when defined.");
+  }
   const snapshot = Object.freeze({
     id,
     displayName,
@@ -949,7 +958,7 @@ export function snapshotAdapter(adapter: GameAdapter): GameAdapter {
       ? { getStateRevision: adapter.getStateRevision.bind(adapter) }
       : {}),
     ...(typeof adapter.execute === "function" ? { execute: adapter.execute.bind(adapter) } : {}),
-    ...(typeof adapter.health === "function" ? { health: adapter.health.bind(adapter) } : {}),
+    ...(healthMember === undefined ? {} : { health: healthMember.bind(adapter) }),
   });
   if (
     Buffer.byteLength(JSON.stringify(describeAdapter(snapshot)), "utf8") >

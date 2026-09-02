@@ -16,8 +16,11 @@
   by an action, and parallel/serial/resource-serial observation scheduling
 - Pure-JSON `bridge.describe` catalog with input/output JSON Schema and no Zod
   instances, functions, or arbitrary adapter objects
-- Fixed 1 KiB schema-scalar, 16 KiB schema-snapshot, and 128 KiB adapter-catalog
-  UTF-8 limits enforced during registration
+- Fixed 1 KiB schema-scalar, 16 KiB schema-snapshot, 24 KiB adapter-catalog,
+  32 KiB aggregate catalog, and 64-adapter limits enforced before insertion
+- Optional adapter health is captured exactly once during registration; only
+  genuine absence defaults ready, while defined non-functions, promises,
+  thenables, and throwing getters fail closed
 - Explicit trusted mock grant provider with fixed tiny-world scope, actual
   requested/profile/manifest intersection, TTL cap, session action budget, and
   per-action budgets; owner binding remains independent from authorization
@@ -119,9 +122,12 @@
   breakaway; bounded probes cover child denial, memory/CPU and all setup stages
 - Pure bridge-injected MCP server factory with exactly one
   `game_bridge_request` tool and no resource, prompt, or control-plane surface
-- Client-spawned stdio entrypoint with a 64 KiB frame limit, 32 KiB logical
-  envelope limit, and default maximum of eight concurrent handlers
-- Official MCP client contract tests against the built Node child process
+- Client-spawned stdio entrypoint with a 128 KiB frame limit, 32 KiB logical
+  envelope limit, 112 KiB complete-result limit, fixed 16 KiB JSON-RPC reserve,
+  and default maximum of eight concurrent handlers
+- Official MCP client contract tests against the built Node child process,
+  including exact 32 KiB core results, near-limit 64-adapter catalogs, and a
+  fixed oversize protocol error that preserves the connection
 - Acceptance tests, deterministic demo, and Node 22 GitHub Actions workflow
 - Architecture, threat model, handoff, and open-question documentation
 
@@ -213,15 +219,15 @@ npm run release:verify
 git diff --check
 ```
 
-Actual local results on 2026-09-01 with Node.js `v22.23.1` and npm `10.9.8`:
+Actual local results on 2026-09-02 with Node.js `v22.23.1` and npm `10.9.8`:
 
 - `npm ci` — passed; 73 packages installed, 74 audited, 0 vulnerabilities
 - `npm audit` — passed; 0 vulnerabilities
 - `npm run check` — passed
-- `npm test` — passed; 10 files, 158 tests passed and 2 explicitly inapplicable
-  Windows gates skipped (160 registered assertions) in 40.05 s. The first full
-  run hit only the existing 5 s release-clone and 10 s ledger-prefix timeouts;
-  both passed unchanged in isolation (2.83 s / 7.72 s), then the final default
+- `npm test` — passed; 10 files, 163 tests passed and 2 explicitly inapplicable
+  Windows gates skipped (165 registered assertions) in 39.00 s. The first full
+  run hit only the existing 5 s release-clone timeout; the unchanged release
+  file passed in isolation (19/19, clone case 2.66 s), then the final default
   full run passed. All prior
   protocol, MCP, operator, audit, safety, idempotency, capacity and containment
   regressions remain green. Adapter Contract v2 coverage now includes the Zod
@@ -229,8 +235,10 @@ Actual local results on 2026-09-01 with Node.js `v22.23.1` and npm `10.9.8`:
   isolated metadata and finite numeric literals, dense manifest string arrays,
   async grant final admission, the closed effect/mode/scheduling matrix,
   malformed runtime grants before side effects, closed-world runtime health,
-  schema/catalog byte limits, descriptor-captured grant arrays, MCP catalog/result
-  type preservation, separate mutation/audit shutdown phases, adapter-close
+  schema/catalog/registry byte and count limits, one-read health-member capture,
+  descriptor-captured grant arrays, MCP catalog/result type preservation,
+  built-stdio maximum result/catalog and fixed oversize response behavior,
+  separate mutation/audit shutdown phases, adapter-close
   failure cleanup, immutable catalogs, revisions, budgets, output validation,
   and outcome-unknown handling.
 - Real stdio contract — passed inside `npm test`; official

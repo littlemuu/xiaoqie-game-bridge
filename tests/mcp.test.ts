@@ -7,6 +7,9 @@ import { InMemoryTransport, type McpServer } from "@modelcontextprotocol/server"
 import { afterEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 import {
+  ADAPTER_MAX_RESULT_BYTES,
+  ADAPTER_REGISTRY_MAX_ADAPTERS,
+  ADAPTER_REGISTRY_MAX_CATALOG_BYTES,
   type AdapterActionDefinition,
   type AdapterObservationDefinition,
   AdapterRegistry,
@@ -23,6 +26,7 @@ import {
   successResponse,
   type RequestContext,
   type RequestEnvelope,
+  canonicalJson,
 } from "../src/index.js";
 import {
   GAME_BRIDGE_TOOL_NAME,
@@ -473,6 +477,23 @@ describe("local MCP contract", () => {
     expect(JSON.stringify(result)).not.toContain(injectedSecret);
   });
 
+  it("replaces an oversized MCP tool result with one fixed capacity response", async () => {
+    const oversized = "x".repeat(STDIO_MAX_BUFFER_BYTES * 2);
+    const bridge: BridgeRequestHandler = {
+      async handle(envelope) {
+        return successResponse(envelope as RequestEnvelope, { payload: oversized });
+      },
+    };
+    const { client } = await connectInMemory(createGameBridgeMcpServer({ bridge }));
+    const result = await callBridge(
+      client,
+      request("oversized-tool-result", "bridge.describe", {}),
+    );
+    expectBridgeError(parseBridgeResponse(result), "RESOURCE_CAPACITY");
+    expect(result.isError).toBe(true);
+    expect(JSON.stringify(result)).not.toContain(oversized.slice(0, 1_024));
+  });
+
   it("bounds concurrent handlers and releases permits after all outcomes", async () => {
     const firstEntered = deferred<void>();
     const releaseFirst = deferred<void>();
@@ -560,6 +581,123 @@ describe("local MCP contract", () => {
     await Promise.allSettled([pending, closing]);
     expect(gate.inFlight).toBe(0);
   });
+
+  it.runIf(process.platform === "win32")(
+    "carries the maximum core result and near-limit capacity catalog through built stdio",
+    async () => {
+      const entrypoint = resolve(
+        process.cwd(),
+        "dist",
+        "tests",
+        "fixtures",
+        "mcp-wire-boundary-child.js",
+      );
+      const env = await isolatedChildEnvironment();
+      const transport = new StdioClientTransport({
+        command: process.execPath,
+        args: [entrypoint],
+        cwd: process.cwd(),
+        env,
+        stderr: "pipe",
+        maxBufferSize: STDIO_MAX_BUFFER_BYTES,
+      });
+      let stderr = "";
+      transport.stderr?.on("data", (chunk: Buffer) => (stderr += chunk.toString("utf8")));
+      const client = new Client({ name: "wire-boundary-test", version: "1.0.0" });
+
+      try {
+        await client.connect(transport);
+        const described = parseBridgeResponse(
+          await callBridge(client, request("wire-describe", "bridge.describe", {})),
+        );
+        expect(described.ok).toBe(true);
+        const adapters = (described as { result: { adapters: unknown[] } }).result.adapters;
+        expect(adapters).toHaveLength(ADAPTER_REGISTRY_MAX_ADAPTERS);
+        const catalogBytes = Buffer.byteLength(canonicalJson(adapters), "utf8");
+        expect(catalogBytes).toBeLessThanOrEqual(ADAPTER_REGISTRY_MAX_CATALOG_BYTES);
+        expect(catalogBytes).toBeGreaterThan(
+          ADAPTER_REGISTRY_MAX_CATALOG_BYTES - ADAPTER_REGISTRY_MAX_ADAPTERS - 512,
+        );
+
+        const opened = parseBridgeResponse(
+          await callBridge(
+            client,
+            request("wire-open", "session.open", {
+              adapterId: "wire-00",
+              capabilities: ["game.observe"],
+            }),
+          ),
+        );
+        expect(opened.ok).toBe(true);
+        const sessionId = (opened as { result: { sessionId: string } }).result.sessionId;
+        const observed = parseBridgeResponse(
+          await callBridge(
+            client,
+            request(
+              "wire-observe",
+              "game.observe",
+              { adapterId: "wire-00" },
+              { sessionId },
+            ),
+          ),
+        );
+        expect(observed.ok).toBe(true);
+        expect(
+          Buffer.byteLength(
+            canonicalJson((observed as { result: unknown }).result),
+            "utf8",
+          ),
+        ).toBe(ADAPTER_MAX_RESULT_BYTES);
+      } finally {
+        await client.close().catch(() => undefined);
+        await transport.close().catch(() => undefined);
+      }
+      expect(stderr).toBe("");
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
+    "returns a fixed protocol error for oversized built stdio output and keeps the connection",
+    async () => {
+      const entrypoint = resolve(
+        process.cwd(),
+        "dist",
+        "tests",
+        "fixtures",
+        "mcp-wire-boundary-child.js",
+      );
+      const env = {
+        ...(await isolatedChildEnvironment()),
+        XIAOQIE_TEST_MCP_WIRE_SCENARIO: "oversize",
+      };
+      const transport = new StdioClientTransport({
+        command: process.execPath,
+        args: [entrypoint],
+        cwd: process.cwd(),
+        env,
+        stderr: "pipe",
+        maxBufferSize: STDIO_MAX_BUFFER_BYTES,
+      });
+      let stderr = "";
+      transport.stderr?.on("data", (chunk: Buffer) => (stderr += chunk.toString("utf8")));
+      const client = new Client({ name: "wire-oversize-test", version: "1.0.0" });
+
+      try {
+        await client.connect(transport);
+        const result = await callBridge(
+          client,
+          request("wire-oversize", "bridge.describe", {}),
+        );
+        expectBridgeError(parseBridgeResponse(result), "RESOURCE_CAPACITY");
+        expect(result.isError).toBe(true);
+        expect((await client.listTools()).tools).toHaveLength(1);
+      } finally {
+        await client.close().catch(() => undefined);
+        await transport.close().catch(() => undefined);
+      }
+      expect(stderr).toBe("");
+    },
+  );
 
   it.runIf(process.platform === "win32")(
     "round-trips through the built stdio child with the official client",
@@ -675,7 +813,9 @@ describe("local MCP contract", () => {
             name: GAME_BRIDGE_TOOL_NAME,
             arguments: toolArguments(
               request("stdio-oversize", "bridge.describe", {
-                payload: injectedSecret.repeat(3_000),
+                payload: injectedSecret.repeat(
+                  Math.ceil((STDIO_MAX_BUFFER_BYTES + 1) / injectedSecret.length),
+                ),
               }),
             ),
           },

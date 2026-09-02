@@ -128,9 +128,12 @@ preview action 不取得 write permit；read/preview 都不能修改 world。纯
 内取得 adapter/scope/resource 单写 permit。未来真实 adapter 必须用实际证据声明
 自己的读取与写入语义，不能隐式继承 mock 的并发结论。
 
-The stdio transport has an explicit 64 KiB read-buffer ceiling. The tool handler
+The stdio transport has an explicit 128 KiB read-buffer ceiling. The tool handler
 independently measures deterministic UTF-8 envelope bytes and refuses more than
-32 KiB. A synchronous gate admits at most eight concurrent handlers by default;
+32 KiB. Complete duplicated tool results are limited to 112 KiB, leaving a fixed
+16 KiB JSON-RPC framing reserve; oversize becomes a fixed `RESOURCE_CAPACITY`
+result before transport and the connection remains usable. A synchronous gate
+admits at most eight concurrent handlers by default;
 full capacity rejects immediately before bridge/adapter execution and creates no
 unbounded queue. Permits release in `finally`. Future remote work still needs
 per-principal and per-action rate limits.
@@ -148,6 +151,9 @@ serialized deterministically. Invalid output, thrown errors, and mismatched
 request identity become a fixed `INTERNAL_ERROR`; raw results, stack traces, and
 exceptions are not written to MCP. Stdout carries MCP only. Transport failures
 write a fixed message to stderr without embedding the received frame or error.
+The wrapper measures the complete text-plus-structured tool result before the
+SDK can frame it, so an oversized bridge response is replaced by a fixed
+`RESOURCE_CAPACITY` envelope rather than a transport disconnect.
 Audit key-name redaction is deliberately not applied to protocol responses:
 otherwise ordinary domain fields such as `path`, `token`, or `password` would
 silently change a validated JSON Schema or result type. Adapter results are
@@ -228,7 +234,8 @@ getter 按锁定实现身份读取恰好一次。可信 schema 从 AST 重建后
 metadata registry 发射；活动 validator 再从深冻结 JSON 快照的隔离副本重建并
 隐藏，因此源 definition graph、metadata、emitter 或后续修改不能改变验证逻辑。
 property name、string literal/enum 与 regex source 受 1 KiB UTF-8 标量上限约束，
-每份 schema snapshot 与单 adapter catalog 另有 16 KiB / 128 KiB 固定上限。
+每份 schema snapshot、单 adapter catalog 与 registry 聚合 catalog 另有
+16 KiB / 24 KiB / 32 KiB 固定上限，registry 最多 64 个 adapter。
 
 Capability grant 虽来自受信 provider，仍作为运行时边界严格捕获、校验、复制：
 对象和 scope 无额外字段或 accessor，TTL 是受请求/全局上限约束的正 safe
@@ -240,9 +247,11 @@ audit reservation 之前固定拒绝，因此 `NaN` expiry 不能形成不可回
 capability array 的 own `length` data descriptor 只读取一次；live Proxy `length`
 不会被重复读取来改变 64 项上限、own-key 校验或捕获循环边界。
 
-health callback 的结果同样按 descriptor 捕获并收敛到闭集。unknown status、throw、
-Promise/thenable、accessor、`NaN` 或负 count 分别保守映射为 adapter `faulted` 或
-audit `corrupt`；operator 仍得到合法固定快照，commit 则在 session/world 副作用前拒绝。
+adapter manifest 的可选 health member 在注册 snapshot 时只读取一次；真正缺省才允许
+ready 默认值，已定义的非函数、Promise/thenable 或 getter 异常直接拒绝注册。已注册
+health callback 的返回结果与 audit health 同样收敛到闭集；unknown status、throw、
+Promise/thenable、accessor、`NaN` 或负 count 分别保守映射为 adapter `faulted` 或 audit
+`corrupt`；operator 仍得到合法固定快照，commit 则在 session/world 副作用前拒绝。
 
 `game.act` 的 effect × mode 是闭合集合：read/preview action 只允许 dry-run，commit
 仅属于 write action；non-write 同时必须声明 `writeConcurrency: none`，不能在 catalog

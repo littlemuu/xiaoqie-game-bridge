@@ -50,7 +50,7 @@
                      | stdin/stdout 上的本地 MCP
                      v
            stdio 边界：一个 tool
-          64 KiB frame / 32 KiB envelope
+         128 KiB frame / 32 KiB envelope
                      |
                      | 固定 local context
                      v
@@ -151,6 +151,7 @@ capability 请求不等于授权。当前产品只使用可信代码中的 fixed
 - 全局默认最多同时有 4 个 commit write；
 - MCP 默认最多同时有 8 个 handler；
 - adapter IPC 默认最多有 8 个 pending call；
+- registry 最多注册 64 个 adapter，聚合 catalog 最多 32 KiB；
 - 达到容量时在 adapter 副作用前拒绝，不建立无界等待队列。
 
 这些限制只能证明资源有界，不能单独证明状态安全。Adapter Contract v2 另外要求同一 adapter/scope/resource 的写入默认单写；observation 必须显式声明 `parallel`、`serial` 或 `resource-serial`，纯只读 adapter 可以声明零个 action，也不需要 revision provider。`game.act` 的 effect × mode 矩阵是封闭的：write action 可按声明接受 commit 或 dry-run，read/preview action 只能使用 dry-run且必须声明 `writeConcurrency: none`，不能声称未执行的资源串行保证；任何 non-write commit 都在 adapter dispatch、写调度和预算预留前固定拒绝。mock observation 和 preview 返回 `stateRevision`，声明需要 revision 的 commit 必须携带 `expectedRevision`。core 在派发前发现的 stale/future revision、预算耗尽、stop 和并发占用均不扣预算；已派发到 worker 的明确拒绝（包括 worker 侧 revision conflict）扣一次，幂等重放不重复扣减。成功 commit 只递增一次。
@@ -203,9 +204,10 @@ MCP surface：
 - wrapper 不替换 request ID、不自动重试；
 - stdout 只承载 MCP 协议，固定脱敏诊断写入 stderr；
 - bridge 输出会再次经过 envelope schema 与请求身份验证；审计用字段名脱敏不会改写协议响应；
+- 完整 tool result 最多 112 KiB，并为 128 KiB stdio frame 保留 16 KiB JSON-RPC 包装预算；超限改为固定 `RESOURCE_CAPACITY`，不会把连接关闭冒充协议响应；
 - client disconnect 不被描述成已经取消或回滚进入 core/worker 的动作。
 
-MCP 仍只使用一个通用 tool；`bridge.describe` 现在返回纯 JSON action catalog，包含输入/输出 JSON Schema、read/preview/write、dry-run 精确度、required capabilities、revision、结果上限、资源调度与 adapter error namespace，不返回 Zod 实例或函数。注册先把 Zod node/check/options 捕获为有界、own-data-only、不可变的声明式 AST；hole、accessor、symbol/extra key、Proxy 异常、自定义 `_zod.toJSONSchema` / `_zod.processJSONSchema`、非有限或有损 JSON number 与任何未知定义均拒绝。只有 Zod 内建 object lazy-shape getter 按固定实现身份读取恰好一次；snapshot 从该 AST 重建的可信 schema 发射，并使用独有空 metadata registry，源 definition graph、hook 或 global metadata 都不能形成 check/use gap。schema 标量、单份 snapshot 与单 adapter catalog 分别有固定 UTF-8 字节上限。活动 validator 由不可变 JSON 快照重建并隐藏在闭包中。required capabilities、adapter error codes 与 grant capabilities 都只接受 dense own-data string array，长度只从 own data descriptor 捕获一次。MCP 保持已验证 catalog/result 的结构与类型，不按 `path`、`token`、`password` 等普通领域字段名做静默替换。MCP server version 从 `package.json` 单一来源读取，协议版本只使用 `PROTOCOL_VERSION`。
+MCP 仍只使用一个通用 tool；`bridge.describe` 现在返回纯 JSON action catalog，包含输入/输出 JSON Schema、read/preview/write、dry-run 精确度、required capabilities、revision、结果上限、资源调度与 adapter error namespace，不返回 Zod 实例或函数。注册先把 Zod node/check/options 捕获为有界、own-data-only、不可变的声明式 AST；hole、accessor、symbol/extra key、Proxy 异常、自定义 `_zod.toJSONSchema` / `_zod.processJSONSchema`、非有限或有损 JSON number 与任何未知定义均拒绝。只有 Zod 内建 object lazy-shape getter 按固定实现身份读取恰好一次；snapshot 从该 AST 重建的可信 schema 发射，并使用独有空 metadata registry，源 definition graph、hook 或 global metadata 都不能形成 check/use gap。schema 标量、单份 snapshot、单 adapter catalog 与 registry 聚合 catalog 分别限制为 1 KiB、16 KiB、24 KiB 与 32 KiB；registry 同时限制为 64 个 adapter。活动 validator 由不可变 JSON 快照重建并隐藏在闭包中。可选 `health` member 在注册时只读取一次；真正缺省才使用 ready 默认值，已定义的非函数、Promise/thenable 或 getter 异常均拒绝注册。required capabilities、adapter error codes 与 grant capabilities 都只接受 dense own-data string array，长度只从 own data descriptor 捕获一次。MCP 保持已验证 catalog/result 的结构与类型，不按 `path`、`token`、`password` 等普通领域字段名做静默替换。MCP server version 从 `package.json` 单一来源读取，协议版本只使用 `PROTOCOL_VERSION`。
 
 ## 持久审计账本
 

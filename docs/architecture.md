@@ -148,9 +148,12 @@ is rebuilt from the captured AST and emitted with a fresh empty metadata registr
 so neither a live definition graph nor global metadata can rewrite the contract.
 Registration deep-freezes the JSON snapshot, rebuilds the active validator from
 an isolated clone, and exposes only a frozen `safeParse` wrapper. Schema scalar
-values are limited to 1 KiB UTF-8, each JSON Schema snapshot to 16 KiB, and each
-adapter catalog to 128 KiB; oversized literals, property names, enum values, or
-regular expressions fail during registration.
+values are limited to 1 KiB UTF-8, each JSON Schema snapshot to 16 KiB, each
+adapter catalog to 24 KiB, and the 64-adapter registry catalog to 32 KiB;
+oversized literals, property names, enum values, or regular expressions fail
+during registration. The optional health member is read once during snapshot;
+only an actually absent member defaults to ready, while defined non-functions,
+promises/thenables, or throwing accessors reject registration.
 
 The mock adapter is a proof of this boundary, not a placeholder shell: it has a
 deterministic state, validates movement and block placement, previews changes
@@ -360,7 +363,11 @@ durable audit reservation。普通 audit 与未来安全关键 operation journal
    Audit-oriented key-name redaction is not applied to protocol output: trusted
    JSON Schema and already output-schema-validated adapter results keep their
    field names, structure, and scalar types.
-7. Handler capacity is released in `finally`, including errors, invalid output,
+7. The complete duplicated tool result is limited to 112 KiB. The 128 KiB stdio
+   buffer therefore retains a fixed 16 KiB reserve for JSON-RPC framing and
+   escaping; an oversized result is replaced by one fixed `RESOURCE_CAPACITY`
+   result before transport, without closing the connection.
+8. Handler capacity is released in `finally`, including errors, invalid output,
    and client-disconnect completion paths.
 
 The MCP JSON-RPC ID belongs to the SDK transport. The bridge `requestId` lives
