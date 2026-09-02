@@ -1,8 +1,12 @@
+import { Buffer } from "node:buffer";
 import { z } from "zod";
 import type { BridgeMode } from "./protocol.js";
 import type { AdapterHealthStatus } from "./health.js";
 
 export const ADAPTER_MAX_RESULT_BYTES = 32 * 1_024;
+export const ADAPTER_MAX_SCHEMA_SCALAR_BYTES = 1_024;
+export const ADAPTER_MAX_SCHEMA_SNAPSHOT_BYTES = 16 * 1_024;
+export const ADAPTER_MAX_CATALOG_BYTES = 128 * 1_024;
 const ADAPTER_ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/u;
 const MANIFEST_NAME_PATTERN = /^[a-z][a-z0-9_.-]{0,127}$/u;
 
@@ -262,6 +266,13 @@ function declarativeError(label: string): never {
   throw new TypeError(`${label} must use the declarative schema subset.`);
 }
 
+function boundedSchemaString(value: string, label: string): string {
+  if (Buffer.byteLength(value, "utf8") > ADAPTER_MAX_SCHEMA_SCALAR_BYTES) {
+    throw new TypeError(`${label} exceeds bounded schema limits.`);
+  }
+  return value;
+}
+
 function hasExactKeys(record: ReadonlyMap<string, unknown>, expected: readonly string[]): boolean {
   return record.size === expected.length && expected.every((key) => record.has(key));
 }
@@ -414,7 +425,7 @@ function captureRegexSource(value: unknown, label: string): string {
       [],
     ) as string;
     if (flags !== "") declarativeError(label);
-    return source;
+    return boundedSchemaString(source, label);
   } catch {
     return declarativeError(label);
   }
@@ -569,7 +580,11 @@ function captureDeclarativeSchema(value: unknown, label: string): DeclarativeSch
           }
           return Object.freeze({
             type,
-            values: Object.freeze([...values] as DeclarativeLiteral[]),
+            values: Object.freeze(
+              values.map((entry) =>
+                typeof entry === "string" ? boundedSchemaString(entry, label) : entry,
+              ) as DeclarativeLiteral[],
+            ),
           });
         }
         case "enum": {
@@ -584,7 +599,12 @@ function captureDeclarativeSchema(value: unknown, label: string): DeclarativeSch
             ) {
               return declarativeError(label);
             }
-            capturedEntries.push(Object.freeze([key, entry] as const));
+            capturedEntries.push(
+              Object.freeze([
+                boundedSchemaString(key, label),
+                typeof entry === "string" ? boundedSchemaString(entry, label) : entry,
+              ] as const),
+            );
           }
           return Object.freeze({ type, entries: Object.freeze(capturedEntries) });
         }
@@ -617,8 +637,8 @@ function captureDeclarativeSchema(value: unknown, label: string): DeclarativeSch
           if (catchall.type !== "never") return declarativeError(label);
           const shape = captureOwnDataRecord(definition.get("shape"), 256);
           if (shape === undefined) return declarativeError(label);
-          const capturedShape = [...shape].map(
-            ([key, child]) => Object.freeze([key, visit(child)] as const),
+          const capturedShape = [...shape].map(([key, child]) =>
+            Object.freeze([boundedSchemaString(key, label), visit(child)] as const),
           );
           return Object.freeze({ type, shape: Object.freeze(capturedShape) });
         }
@@ -705,11 +725,13 @@ function schemaSnapshot(value: unknown, label: string): AdapterSchema {
   try {
     const captured = captureDeclarativeSchema(value, label);
     const trustedSchema = buildDeclarativeSchema(captured);
-    const jsonSchema = deepFreezeJson(
-      JSON.parse(
-        JSON.stringify(z.toJSONSchema(trustedSchema, { metadata: z.registry() })),
-      ) as unknown,
+    const encoded = JSON.stringify(
+      z.toJSONSchema(trustedSchema, { metadata: z.registry() }),
     );
+    if (Buffer.byteLength(encoded, "utf8") > ADAPTER_MAX_SCHEMA_SNAPSHOT_BYTES) {
+      throw new TypeError(`${label} exceeds bounded schema limits.`);
+    }
+    const jsonSchema = deepFreezeJson(JSON.parse(encoded) as unknown);
     const validator = z.fromJSONSchema(
       structuredClone(jsonSchema) as Parameters<typeof z.fromJSONSchema>[0],
     );
@@ -723,7 +745,10 @@ function schemaSnapshot(value: unknown, label: string): AdapterSchema {
       },
     });
   } catch (error) {
-    if (error instanceof TypeError && /declarative schema subset/u.test(error.message)) {
+    if (
+      error instanceof TypeError &&
+      /declarative schema subset|bounded schema limits/u.test(error.message)
+    ) {
       throw error;
     }
     throw new TypeError(`${label} cannot be represented as declarative JSON Schema.`);
@@ -914,7 +939,7 @@ export function snapshotAdapter(adapter: GameAdapter): GameAdapter {
   if (requiresRevision && typeof adapter.getStateRevision !== "function") {
     throw new TypeError("Adapter revision provider is required by a write action.");
   }
-  return Object.freeze({
+  const snapshot = Object.freeze({
     id,
     displayName,
     observation: snapshotObservation(ownData(adapter, "observation")),
@@ -926,6 +951,13 @@ export function snapshotAdapter(adapter: GameAdapter): GameAdapter {
     ...(typeof adapter.execute === "function" ? { execute: adapter.execute.bind(adapter) } : {}),
     ...(typeof adapter.health === "function" ? { health: adapter.health.bind(adapter) } : {}),
   });
+  if (
+    Buffer.byteLength(JSON.stringify(describeAdapter(snapshot)), "utf8") >
+    ADAPTER_MAX_CATALOG_BYTES
+  ) {
+    throw new TypeError("Adapter catalog exceeds its bounded byte limit.");
+  }
+  return snapshot;
 }
 
 export function describeAdapter(adapter: GameAdapter): AdapterDescription {

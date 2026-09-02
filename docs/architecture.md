@@ -147,7 +147,10 @@ identified by its locked implementation and read exactly once. A trusted schema
 is rebuilt from the captured AST and emitted with a fresh empty metadata registry,
 so neither a live definition graph nor global metadata can rewrite the contract.
 Registration deep-freezes the JSON snapshot, rebuilds the active validator from
-an isolated clone, and exposes only a frozen `safeParse` wrapper.
+an isolated clone, and exposes only a frozen `safeParse` wrapper. Schema scalar
+values are limited to 1 KiB UTF-8, each JSON Schema snapshot to 16 KiB, and each
+adapter catalog to 128 KiB; oversized literals, property names, enum values, or
+regular expressions fail during registration.
 
 The mock adapter is a proof of this boundary, not a placeholder shell: it has a
 deterministic state, validates movement and block placement, previews changes
@@ -166,6 +169,13 @@ manifest 的去重子集，scope kind 必须位于 adapter 自身 namespace，re
 有界且无额外字段，per-action budget 只能引用 manifest 中的 write action。异步
 provider 返回并完成快照后，commit admission 会在无后续 `await` 的临界段再次检查
 runtime、adapter 与 audit health，才允许 audit reservation 和 session insertion。
+capability 数组只从 own `length` data descriptor 读取一次，再按该快照捕获 dense
+own-data index；live `length` getter/Proxy 读取不能改变 64 项上限或循环边界。
+
+adapter 与 audit health 也在一个运行时 capture 中收敛到闭集。callback throw、
+Promise/thenable、未知 status、accessor、`NaN` 或负 outstanding count 都不会穿透
+operator 或 admission；异常 adapter 固定映射为 `faulted`，异常 audit 固定映射为
+`corrupt`，并且不回显异常文本。commit 因而在 session/world 副作用前 fail closed。
 
 mock observation 与 dry-run preview 返回当前 `stateRevision`。声明
 `requiresExpectedRevision` 的 commit 必须提供 `expectedRevision`；core 在持有
@@ -344,9 +354,12 @@ durable audit reservation。普通 audit 与未来安全关键 operation journal
    original request ID/action/mode/session. Invalid output or any exception is
    replaced by one fixed `INTERNAL_ERROR`; raw values and stacks never reach the
    protocol stream.
-6. The sanitized response becomes complete `structuredContent`; deterministic
+6. The validated response becomes complete `structuredContent`; deterministic
    JSON of that same response is the only text content. Bridge failures set MCP
    `isError: true` while preserving the stable bridge envelope and error code.
+   Audit-oriented key-name redaction is not applied to protocol output: trusted
+   JSON Schema and already output-schema-validated adapter results keep their
+   field names, structure, and scalar types.
 7. Handler capacity is released in `finally`, including errors, invalid output,
    and client-disconnect completion paths.
 
@@ -397,7 +410,9 @@ new fixed-name segment is exclusively created after identity checks. Once
 conservative physical capacity is unavailable, the ledger reports `full`,
 performs no eviction, and refuses ordinary commit/resume admission. The internal health snapshot is closed-world:
 `ready`, `degraded`, `full`, `corrupt`, or `closed`, plus outstanding/segment/
-sequence counters. It is not exposed as an MCP log or file resource.
+sequence counters. The bridge captures only validated status/outstanding values;
+malformed or throwing sink health becomes `corrupt`. It is not exposed as an MCP
+log or file resource.
 
 `write()` first appends and syncs the full data frame. It then exclusively
 creates and syncs a strict `confirmation-NNNNNNNNNNNNNNNN.audit`, followed by a

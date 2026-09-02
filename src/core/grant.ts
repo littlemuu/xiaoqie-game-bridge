@@ -63,10 +63,21 @@ function boundedName(value: unknown, pattern = GRANT_NAME_PATTERN): value is str
 }
 
 function captureCapabilityArray(value: unknown): readonly string[] | undefined {
-  if (!Array.isArray(value) || value.length > 64) return undefined;
+  if (!Array.isArray(value)) return undefined;
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+  if (
+    lengthDescriptor === undefined ||
+    !("value" in lengthDescriptor) ||
+    !Number.isSafeInteger(lengthDescriptor.value) ||
+    lengthDescriptor.value < 0 ||
+    lengthDescriptor.value > 64
+  ) {
+    return undefined;
+  }
+  const length = lengthDescriptor.value as number;
   const keys = Reflect.ownKeys(value);
   if (
-    keys.length !== value.length + 1 ||
+    keys.length !== length + 1 ||
     keys.some(
       (key) =>
         typeof key !== "string" ||
@@ -76,7 +87,7 @@ function captureCapabilityArray(value: unknown): readonly string[] | undefined {
     return undefined;
   }
   const captured: string[] = [];
-  for (let index = 0; index < value.length; index += 1) {
+  for (let index = 0; index < length; index += 1) {
     const descriptor = Object.getOwnPropertyDescriptor(value, index.toString());
     if (
       descriptor === undefined ||

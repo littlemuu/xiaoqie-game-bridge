@@ -21,6 +21,7 @@ import {
   type GameAdapter,
   type RequestContext,
   type RequestEnvelope,
+  operatorHealthStatusSchema,
 } from "../src/index.js";
 
 const local = Object.freeze({ transport: "local" } satisfies RequestContext);
@@ -344,6 +345,32 @@ class ToggleAuditSink implements AuditSink {
   }
 }
 
+class RawHealthAuditSink extends MemoryAuditSink {
+  rawHealth: unknown = Object.freeze({ status: "ready", outstandingWrites: 0 });
+  throwHealth = false;
+  throwWrite = false;
+
+  override write(event: AuditEvent): void {
+    if (this.throwWrite) throw new Error("Bearer-audit-write-secret");
+    super.write(event);
+  }
+
+  override health(): Readonly<{ status: "ready"; outstandingWrites: number }> {
+    if (this.throwHealth) throw new Error("Bearer-audit-health-secret");
+    return this.rawHealth as Readonly<{ status: "ready"; outstandingWrites: number }>;
+  }
+}
+
+class RawHealthAdapter extends ContractTestAdapter {
+  rawHealth: unknown = "ready";
+  throwHealth = false;
+
+  override health(): AdapterHealthStatus {
+    if (this.throwHealth) throw new Error("Bearer-adapter-health-secret");
+    return this.rawHealth as AdapterHealthStatus;
+  }
+}
+
 class GatedStateChangeAuditSink implements AuditSink {
   readonly events: AuditEvent[] = [];
   readonly writeAuditEntered = deferred();
@@ -643,6 +670,22 @@ describe("Adapter Contract v2", () => {
     }
   });
 
+  it("bounds schema scalar payloads during registration", () => {
+    const oversized = "x".repeat(1_025);
+    for (const schema of [
+      z.literal(oversized),
+      z.object({ [oversized]: z.string() }).strict(),
+      z.string().regex(new RegExp(oversized)),
+    ]) {
+      const adapter = new ContractTestAdapter();
+      (adapter.actions as Record<string, AdapterActionDefinition>).write = {
+        ...adapter.actions.write!,
+        inputSchema: schema,
+      };
+      expect(() => new AdapterRegistry().register(adapter)).toThrow(/declarative|bounded/u);
+    }
+  });
+
   it("fails closed when a declarative schema graph proxy cannot be captured", () => {
     const proxiedShapeSchema = z.object({ value: z.string() }).strict();
     Object.defineProperty(
@@ -824,6 +867,47 @@ describe("Adapter Contract v2", () => {
       expect(sessions.size).toBe(0);
       expect(audit.reservations).toBe(0);
     }
+  });
+
+  it("captures grant capability array length from one own data descriptor", async () => {
+    let liveLengthReads = 0;
+    let lengthDescriptorReads = 0;
+    const capabilities = new Proxy(["game.observe"], {
+      get(target, property, receiver) {
+        if (property === "length") {
+          liveLengthReads += 1;
+          return 65;
+        }
+        return Reflect.get(target, property, receiver);
+      },
+      getOwnPropertyDescriptor(target, property) {
+        if (property === "length") lengthDescriptorReads += 1;
+        return Reflect.getOwnPropertyDescriptor(target, property);
+      },
+    });
+    const adapter = new ContractTestAdapter();
+    const grantProvider: CapabilityGrantProvider = {
+      grant: () => ({
+        allowed: true,
+        capabilities,
+        scope: { kind: "contract-test", resourceId: "contract-world" },
+        ttlMs: 1_000,
+        totalActionBudget: 1,
+        perActionBudgets: { write: 1 },
+      }),
+    };
+    const { bridge, sessions } = contractHarness(adapter, { grantProvider });
+    const response = await bridge.handle(
+      request("grant-length-snapshot", "session.open", {
+        adapterId: adapter.id,
+        capabilities: ["game.observe"],
+      }),
+      local,
+    );
+    expect(response.ok).toBe(true);
+    expect(sessions.size).toBe(1);
+    expect(liveLengthReads).toBe(0);
+    expect(lengthDescriptorReads).toBe(1);
   });
 
   it("rechecks committed session admission after an asynchronous grant settles", async () => {
@@ -1206,6 +1290,137 @@ describe("Adapter Contract v2", () => {
       "RUNTIME_UNAVAILABLE",
     );
     expect(quiescingAdapter.entries).toBe(0);
+  });
+
+  it("maps malformed adapter health to one fixed faulted snapshot before side effects", async () => {
+    for (const [index, rawHealth] of ["broken", Promise.resolve("ready")].entries()) {
+      const adapter = new RawHealthAdapter();
+      const { bridge, sessions } = contractHarness(adapter);
+      const sessionId = await open(bridge, adapter.id, ["game.act.write"]);
+      adapter.rawHealth = rawHealth;
+
+      const health = bridge.getHealthStatus();
+      expect(health).toMatchObject({
+        runtime: { status: "faulted" },
+        adapter: { status: "faulted", registeredAdapters: 1 },
+        audit: { status: "ready" },
+      });
+      expect(operatorHealthStatusSchema.safeParse(health).success).toBe(true);
+      expect(JSON.stringify(health)).not.toContain("Bearer-");
+
+      expectError(
+        await bridge.handle(
+          request(`health-open-${index}`, "session.open", {
+            adapterId: adapter.id,
+            capabilities: ["game.observe"],
+          }),
+          local,
+        ),
+        "RUNTIME_UNAVAILABLE",
+      );
+      expectError(
+        await bridge.handle(writeRequest(`health-write-${index}`, sessionId), local),
+        "RUNTIME_UNAVAILABLE",
+      );
+      expect(sessions.size).toBe(1);
+      expect(adapter.entries).toBe(0);
+    }
+
+    const throwing = new RawHealthAdapter();
+    const throwingHarness = contractHarness(throwing);
+    const sessionId = await open(throwingHarness.bridge, throwing.id, ["game.act.write"]);
+    throwing.throwHealth = true;
+    expect(throwingHarness.bridge.getHealthStatus()).toMatchObject({
+      runtime: { status: "faulted" },
+      adapter: { status: "faulted" },
+    });
+    expectError(
+      await throwingHarness.bridge.handle(writeRequest("throwing-health-write", sessionId), local),
+      "RUNTIME_UNAVAILABLE",
+    );
+    expect(throwing.entries).toBe(0);
+  });
+
+  it("maps malformed audit health to a legal corrupt snapshot without secondary throws", async () => {
+    let accessorReads = 0;
+    const accessorHealth = { outstandingWrites: 0 } as Record<string, unknown>;
+    Object.defineProperty(accessorHealth, "status", {
+      enumerable: true,
+      get: () => {
+        accessorReads += 1;
+        return "ready";
+      },
+    });
+    const malformedHealthValues: readonly unknown[] = [
+      { status: "broken", outstandingWrites: 0 },
+      { status: "ready", outstandingWrites: Number.NaN },
+      { status: "ready", outstandingWrites: -1 },
+      Promise.resolve({ status: "ready", outstandingWrites: 0 }),
+      { status: "ready", outstandingWrites: 0, then: () => undefined },
+      accessorHealth,
+    ];
+
+    for (const [index, rawHealth] of malformedHealthValues.entries()) {
+      const audit = new RawHealthAuditSink();
+      const adapter = new ContractTestAdapter();
+      const { bridge, sessions } = contractHarness(adapter, { auditSink: audit });
+      const sessionId = await open(bridge, adapter.id, ["game.act.write"]);
+      audit.rawHealth = rawHealth;
+
+      const health = bridge.getHealthStatus();
+      expect(health).toMatchObject({
+        runtime: { status: "ready" },
+        adapter: { status: "ready" },
+        audit: { status: "corrupt" },
+      });
+      expect(operatorHealthStatusSchema.safeParse(health).success).toBe(true);
+      expectError(
+        await bridge.handle(writeRequest(`malformed-audit-${index}`, sessionId), local),
+        "RUNTIME_UNAVAILABLE",
+      );
+      expect(sessions.size).toBe(1);
+      expect(adapter.entries).toBe(0);
+    }
+    expect(accessorReads).toBe(0);
+
+    const throwingAudit = new RawHealthAuditSink();
+    const throwingAdapter = new ContractTestAdapter();
+    const throwingHarness = contractHarness(throwingAdapter, { auditSink: throwingAudit });
+    const sessionId = await open(
+      throwingHarness.bridge,
+      throwingAdapter.id,
+      ["game.observe", "game.act.write"],
+    );
+    throwingAudit.throwHealth = true;
+    expect(throwingHarness.bridge.getHealthStatus()).toMatchObject({
+      audit: { status: "corrupt" },
+    });
+    expectError(
+      await throwingHarness.bridge.handle(
+        writeRequest("throwing-audit-health", sessionId),
+        local,
+      ),
+      "RUNTIME_UNAVAILABLE",
+    );
+    expect(JSON.stringify(throwingHarness.bridge.getHealthStatus())).not.toContain(
+      "Bearer-audit-health-secret",
+    );
+
+    throwingAudit.throwWrite = true;
+    expect(
+      await throwingHarness.bridge.handle(
+        request(
+          "audit-rejection-health-throw",
+          "game.observe",
+          { adapterId: throwingAdapter.id },
+          { sessionId },
+        ),
+        local,
+      ),
+    ).toMatchObject({ ok: true, result: { stateRevision: 0 } });
+    expect(throwingHarness.bridge.getHealthStatus()).toMatchObject({
+      audit: { status: "corrupt" },
+    });
   });
 
   it("blocks new state-change admission while quiescing and drains write audit completion", async () => {

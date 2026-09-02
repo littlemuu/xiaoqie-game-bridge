@@ -143,11 +143,16 @@ session 还具有总 commit-attempt 与 per-action 预算。同资源写入使�
 
 ### Protocol output or diagnostics leak attacker data
 
-Every core result is validated by `responseEnvelopeSchema`, sanitized, and
+Every core result is validated by `responseEnvelopeSchema` and
 serialized deterministically. Invalid output, thrown errors, and mismatched
 request identity become a fixed `INTERNAL_ERROR`; raw results, stack traces, and
 exceptions are not written to MCP. Stdout carries MCP only. Transport failures
 write a fixed message to stderr without embedding the received frame or error.
+Audit key-name redaction is deliberately not applied to protocol responses:
+otherwise ordinary domain fields such as `path`, `token`, or `password` would
+silently change a validated JSON Schema or result type. Adapter results are
+validated against their registered output schema before the envelope is built;
+the MCP wrapper performs no later value transformation.
 
 observation 和 action 返回值在进入 `BridgeResponse` 前还必须通过注册快照中的
 output schema 与固定 UTF-8 字节上限。schema 不匹配、不可 JSON 序列化或过大
@@ -222,6 +227,8 @@ symbol/extra key、Proxy 异常、自定义 `_zod.toJSONSchema` / `_zod.processJ
 getter 按锁定实现身份读取恰好一次。可信 schema 从 AST 重建后才使用独有空
 metadata registry 发射；活动 validator 再从深冻结 JSON 快照的隔离副本重建并
 隐藏，因此源 definition graph、metadata、emitter 或后续修改不能改变验证逻辑。
+property name、string literal/enum 与 regex source 受 1 KiB UTF-8 标量上限约束，
+每份 schema snapshot 与单 adapter catalog 另有 16 KiB / 128 KiB 固定上限。
 
 Capability grant 虽来自受信 provider，仍作为运行时边界严格捕获、校验、复制：
 对象和 scope 无额外字段或 accessor，TTL 是受请求/全局上限约束的正 safe
@@ -230,6 +237,12 @@ namespace，budget key 只引用 manifest write action。非法 grant 在 sessio
 audit reservation 之前固定拒绝，因此 `NaN` expiry 不能形成不可回收 session。
 异步 grant 返回后还会立即重检 runtime/adapter/audit health；quiescing 或 faulted
 转换不能在 provider 等待窗口后提交 session。
+capability array 的 own `length` data descriptor 只读取一次；live Proxy `length`
+不会被重复读取来改变 64 项上限、own-key 校验或捕获循环边界。
+
+health callback 的结果同样按 descriptor 捕获并收敛到闭集。unknown status、throw、
+Promise/thenable、accessor、`NaN` 或负 count 分别保守映射为 adapter `faulted` 或
+audit `corrupt`；operator 仍得到合法固定快照，commit 则在 session/world 副作用前拒绝。
 
 `game.act` 的 effect × mode 是闭合集合：read/preview action 只允许 dry-run，commit
 仅属于 write action；non-write 同时必须声明 `writeConcurrency: none`，不能在 catalog

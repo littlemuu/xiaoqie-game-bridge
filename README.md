@@ -202,10 +202,10 @@ MCP surface：
 - MCP JSON-RPC ID 与 bridge `requestId` 是两层不同标识；
 - wrapper 不替换 request ID、不自动重试；
 - stdout 只承载 MCP 协议，固定脱敏诊断写入 stderr；
-- bridge 输出会再次经过 schema、请求身份和脱敏验证；
+- bridge 输出会再次经过 envelope schema 与请求身份验证；审计用字段名脱敏不会改写协议响应；
 - client disconnect 不被描述成已经取消或回滚进入 core/worker 的动作。
 
-MCP 仍只使用一个通用 tool；`bridge.describe` 现在返回纯 JSON action catalog，包含输入/输出 JSON Schema、read/preview/write、dry-run 精确度、required capabilities、revision、结果上限、资源调度与 adapter error namespace，不返回 Zod 实例或函数。注册先把 Zod node/check/options 捕获为有界、own-data-only、不可变的声明式 AST；hole、accessor、symbol/extra key、Proxy 异常、自定义 `_zod.toJSONSchema` / `_zod.processJSONSchema`、非有限或有损 JSON number 与任何未知定义均拒绝。只有 Zod 内建 object lazy-shape getter 按固定实现身份读取恰好一次；snapshot 从该 AST 重建的可信 schema 发射，并使用独有空 metadata registry，源 definition graph、hook 或 global metadata 都不能形成 check/use gap。活动 validator 由不可变 JSON 快照重建并隐藏在闭包中。required capabilities 与 adapter error codes 同样只接受 dense own-data string array。MCP server version 从 `package.json` 单一来源读取，协议版本只使用 `PROTOCOL_VERSION`。
+MCP 仍只使用一个通用 tool；`bridge.describe` 现在返回纯 JSON action catalog，包含输入/输出 JSON Schema、read/preview/write、dry-run 精确度、required capabilities、revision、结果上限、资源调度与 adapter error namespace，不返回 Zod 实例或函数。注册先把 Zod node/check/options 捕获为有界、own-data-only、不可变的声明式 AST；hole、accessor、symbol/extra key、Proxy 异常、自定义 `_zod.toJSONSchema` / `_zod.processJSONSchema`、非有限或有损 JSON number 与任何未知定义均拒绝。只有 Zod 内建 object lazy-shape getter 按固定实现身份读取恰好一次；snapshot 从该 AST 重建的可信 schema 发射，并使用独有空 metadata registry，源 definition graph、hook 或 global metadata 都不能形成 check/use gap。schema 标量、单份 snapshot 与单 adapter catalog 分别有固定 UTF-8 字节上限。活动 validator 由不可变 JSON 快照重建并隐藏在闭包中。required capabilities、adapter error codes 与 grant capabilities 都只接受 dense own-data string array，长度只从 own data descriptor 捕获一次。MCP 保持已验证 catalog/result 的结构与类型，不按 `path`、`token`、`password` 等普通领域字段名做静默替换。MCP server version 从 `package.json` 单一来源读取，协议版本只使用 `PROTOCOL_VERSION`。
 
 ## 持久审计账本
 

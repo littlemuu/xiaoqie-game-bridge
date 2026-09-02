@@ -1,6 +1,5 @@
 import { Buffer } from "node:buffer";
 import { McpServer, type CallToolResult } from "@modelcontextprotocol/server";
-import { redactSensitive } from "../core/audit.js";
 import { canonicalJson } from "../core/canonical-json.js";
 import type { RequestContext } from "../core/request-context.js";
 import {
@@ -100,12 +99,11 @@ function responseMatchesRequest(
 }
 
 function toolResult(response: BridgeResponse): CallToolResult {
-  const sanitized = redactSensitive(response);
-  const parsed = responseEnvelopeSchema.safeParse(sanitized);
+  const parsed = responseEnvelopeSchema.safeParse(response);
   if (!parsed.success) {
-    throw new TypeError("The sanitized bridge response is invalid.");
+    throw new TypeError("The bridge response is invalid.");
   }
-  const validated = sanitized as BridgeResponse;
+  const validated = parsed.data as BridgeResponse;
   const text = canonicalJson(validated);
   return {
     content: [{ type: "text", text }],

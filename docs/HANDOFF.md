@@ -16,6 +16,8 @@
   by an action, and parallel/serial/resource-serial observation scheduling
 - Pure-JSON `bridge.describe` catalog with input/output JSON Schema and no Zod
   instances, functions, or arbitrary adapter objects
+- Fixed 1 KiB schema-scalar, 16 KiB schema-snapshot, and 128 KiB adapter-catalog
+  UTF-8 limits enforced during registration
 - Explicit trusted mock grant provider with fixed tiny-world scope, actual
   requested/profile/manifest intersection, TTL cap, session action budget, and
   per-action budgets; owner binding remains independent from authorization
@@ -30,9 +32,13 @@
 - Closed runtime/adapter/audit/safety health model returned by operator status
   from one coherent snapshot and printed by the CLI without paths, endpoints,
   tokens, PIDs, exception text, audit contents, or adapter payloads
+- Runtime health capture maps malformed/throwing/thenable adapter health to
+  `faulted` and malformed audit health/counts to `corrupt` before commit admission
 - Pre-response adapter output schema/serialization/byte-limit validation,
   allowlisted adapter rejection codes, explicit dispatch-phase classification,
   and conservative cached `OUTCOME_UNKNOWN` without retry
+- MCP preserves validated catalog/result fields and types; audit-oriented
+  key-name redaction is confined to audit events
 - `package.json` as the MCP metadata version source, `PROTOCOL_VERSION` as the
   bridge protocol source, shared transient canonical JSON, and explicitly
   separate versioned audit-frame canonical encoding
@@ -136,7 +142,9 @@
   actions can claim resource scheduling or enter commit safety and budgets.
 - Schema registration captures an immutable own-data declarative AST before
   rebuilding a trusted emitter input. Custom Zod emitters, live graph accessors,
-  proxy failures, and malformed manifest string arrays fail closed.
+  proxy failures, oversized scalar/snapshot/catalog data, and malformed manifest
+  string arrays fail closed. Grant capability length is captured once from its
+  own data descriptor rather than repeatedly reading live array state.
   Product shutdown separately bounds mutation settlement, closes the adapter,
   then always invokes the ledger's own bounded drain/abort even on adapter error.
 - Invalid output after a write is classified with a fixed output error and
@@ -210,16 +218,21 @@ Actual local results on 2026-09-01 with Node.js `v22.23.1` and npm `10.9.8`:
 - `npm ci` — passed; 73 packages installed, 74 audited, 0 vulnerabilities
 - `npm audit` — passed; 0 vulnerabilities
 - `npm run check` — passed
-- `npm test` — passed; 10 files, 153 tests passed and 2 explicitly inapplicable
-  Windows gates skipped (155 registered assertions) in 46.23 s. All prior
+- `npm test` — passed; 10 files, 158 tests passed and 2 explicitly inapplicable
+  Windows gates skipped (160 registered assertions) in 40.05 s. The first full
+  run hit only the existing 5 s release-clone and 10 s ledger-prefix timeouts;
+  both passed unchanged in isolation (2.83 s / 7.72 s), then the final default
+  full run passed. All prior
   protocol, MCP, operator, audit, safety, idempotency, capacity and containment
   regressions remain green. Adapter Contract v2 coverage now includes the Zod
   positive allowlist with own-data AST capture, trusted emitter reconstruction,
   isolated metadata and finite numeric literals, dense manifest string arrays,
   async grant final admission, the closed effect/mode/scheduling matrix,
-  malformed runtime grants before side effects, separate mutation/audit shutdown
-  phases, adapter-close failure cleanup, immutable catalogs, revisions, budgets,
-  output validation, and outcome-unknown handling.
+  malformed runtime grants before side effects, closed-world runtime health,
+  schema/catalog byte limits, descriptor-captured grant arrays, MCP catalog/result
+  type preservation, separate mutation/audit shutdown phases, adapter-close
+  failure cleanup, immutable catalogs, revisions, budgets, output validation,
+  and outcome-unknown handling.
 - Real stdio contract — passed inside `npm test`; official
   `Client@2.0.0`/`StdioClientTransport` started the built Node entrypoint,
   completed initialize/list/calls, and closed client first then transport

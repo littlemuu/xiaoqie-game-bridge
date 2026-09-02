@@ -6,6 +6,7 @@ import {
   describeAdapter,
   type AdapterSchema,
   type AdapterActionDefinition,
+  type GameAdapter,
 } from "./adapter.js";
 import { AdapterRegistry } from "./adapter-registry.js";
 import { canonicalJson } from "./canonical-json.js";
@@ -66,6 +67,104 @@ import { ResourceWriteScheduler } from "./write-scheduler.js";
 export type { RequestContext } from "./request-context.js";
 
 const emptyParamsSchema = z.object({}).strict();
+
+const ADAPTER_HEALTH_STATUSES = new Set<AdapterHealthStatus>([
+  "ready",
+  "unavailable",
+  "faulted",
+]);
+const AUDIT_HEALTH_STATUSES = new Set<AuditHealthStatus>([
+  "ready",
+  "degraded",
+  "full",
+  "corrupt",
+  "closed",
+]);
+const AUDIT_HEALTH_FIELDS = new Set([
+  "status",
+  "outstandingWrites",
+  "segmentCount",
+  "currentSegment",
+  "nextSequence",
+]);
+
+function captureAdapterHealth(adapter: GameAdapter): AdapterHealthStatus {
+  try {
+    const health = adapter.health;
+    if (health === undefined) return "ready";
+    if (typeof health !== "function") return "faulted";
+    const status = Reflect.apply(health, adapter, []) as unknown;
+    return typeof status === "string" && ADAPTER_HEALTH_STATUSES.has(status as AdapterHealthStatus)
+      ? (status as AdapterHealthStatus)
+      : "faulted";
+  } catch {
+    return "faulted";
+  }
+}
+
+function captureAuditHealth(
+  sink: AuditSink,
+  fallbackOutstandingWrites: number,
+): Readonly<{ status: AuditHealthStatus; outstandingWrites: number }> {
+  const invalid = (): Readonly<{
+    status: "corrupt";
+    outstandingWrites: number;
+  }> => Object.freeze({ status: "corrupt", outstandingWrites: fallbackOutstandingWrites });
+  try {
+    const health = sink.health;
+    if (health === undefined) {
+      return Object.freeze({
+        status: "ready" as const,
+        outstandingWrites: fallbackOutstandingWrites,
+      });
+    }
+    if (typeof health !== "function") return invalid();
+    const value = Reflect.apply(health, sink, []) as unknown;
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+      return invalid();
+    }
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) return invalid();
+    const keys = Reflect.ownKeys(value);
+    if (
+      keys.some(
+        (key) => typeof key !== "string" || !AUDIT_HEALTH_FIELDS.has(key),
+      )
+    ) {
+      return invalid();
+    }
+    const captured = new Map<string, unknown>();
+    for (const key of keys as string[]) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor === undefined || !("value" in descriptor)) return invalid();
+      captured.set(key, descriptor.value);
+    }
+    const status = captured.get("status");
+    const outstandingWrites = captured.get("outstandingWrites");
+    if (
+      typeof status !== "string" ||
+      !AUDIT_HEALTH_STATUSES.has(status as AuditHealthStatus) ||
+      typeof outstandingWrites !== "number" ||
+      !Number.isSafeInteger(outstandingWrites) ||
+      outstandingWrites < 0 ||
+      [...captured]
+        .filter(([key]) => key !== "status")
+        .some(
+          ([, count]) =>
+            typeof count !== "number" || !Number.isSafeInteger(count) || count < 0,
+        )
+    ) {
+      return invalid();
+    }
+    return Object.freeze({
+      status: status as AuditHealthStatus,
+      outstandingWrites,
+    });
+  } catch {
+    return invalid();
+  }
+}
+
 const sessionOpenParamsSchema = z
   .object({
     adapterId: z.string().min(1).max(128),
@@ -262,16 +361,14 @@ export class GameBridge {
 
   getHealthStatus(): BridgeHealthStatus {
     const adapters = this.#registry.list();
-    const adapterStatuses = adapters.map(
-      (adapter): AdapterHealthStatus => adapter.health?.() ?? "ready",
-    );
+    const adapterStatuses = adapters.map(captureAdapterHealth);
     const adapterStatus: AdapterHealthStatus = adapterStatuses.includes("faulted")
       ? "faulted"
       : adapterStatuses.length === 0 || adapterStatuses.includes("unavailable")
         ? "unavailable"
         : "ready";
-    const sinkHealth = this.#audit.health?.();
-    const sinkAuditStatus = sinkHealth?.status ?? "ready";
+    const sinkHealth = captureAuditHealth(this.#audit, this.#auditWrites.size);
+    const sinkAuditStatus = sinkHealth.status;
     const auditStatus =
       sinkAuditStatus === "ready" ? this.#observedAuditHealth : sinkAuditStatus;
     const runtimeStatus: RuntimeHealthStatus =
@@ -285,7 +382,7 @@ export class GameBridge {
       adapter: Object.freeze({ status: adapterStatus, registeredAdapters: adapters.length }),
       audit: Object.freeze({
         status: auditStatus,
-        outstandingWrites: sinkHealth?.outstandingWrites ?? this.#auditWrites.size,
+        outstandingWrites: sinkHealth.outstandingWrites,
       }),
       safety: Object.freeze({ ...this.#safety.status() }),
     });
@@ -449,7 +546,10 @@ export class GameBridge {
       () => this.#auditWrites.delete(pending),
       () => {
         this.#auditWrites.delete(pending);
-        this.#observedAuditHealth = this.#audit.health?.().status ?? "degraded";
+        this.#observedAuditHealth = captureAuditHealth(
+          this.#audit,
+          this.#auditWrites.size,
+        ).status;
         if (this.#observedAuditHealth === "ready") {
           this.#observedAuditHealth = "degraded";
         }

@@ -5,10 +5,16 @@ import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { InMemoryTransport, type McpServer } from "@modelcontextprotocol/server";
 import { afterEach, describe, expect, it } from "vitest";
+import { z } from "zod";
 import {
+  type AdapterActionDefinition,
+  type AdapterObservationDefinition,
   AdapterRegistry,
+  type BridgeMode,
   type BridgeResponse,
+  type CapabilityGrantProvider,
   GameBridge,
+  type GameAdapter,
   MockGameAdapter,
   PACKAGE_VERSION,
   SessionManager,
@@ -143,6 +149,71 @@ function createMockBridge(options: { sessions?: SessionManager } = {}): GameBrid
   });
 }
 
+class DomainFieldAdapter implements GameAdapter {
+  readonly id = "domain-fields";
+  readonly displayName = "Domain field contract adapter";
+  readonly observation: AdapterObservationDefinition = {
+    description: "Return one harmless domain token value.",
+    outputSchema: z.object({ token: z.number() }).strict(),
+    effectKind: "read",
+    concurrency: { kind: "parallel" },
+    requiredCapabilities: ["game.observe"],
+    maxResultBytes: 128,
+  };
+  readonly actions: Readonly<Record<string, AdapterActionDefinition>> = {
+    inspect: {
+      description: "Validate ordinary domain field names.",
+      inputSchema: z
+        .object({ path: z.string(), token: z.number(), password: z.string() })
+        .strict(),
+      outputSchema: z.object({ token: z.number() }).strict(),
+      effectKind: "preview",
+      dryRunSemantics: "exact",
+      requiredCapabilities: ["game.act.inspect"],
+      maxResultBytes: 128,
+      writeConcurrency: { kind: "none" },
+      adapterErrorCodes: [],
+      requiresExpectedRevision: false,
+      reconciliation: "unsupported",
+    },
+  };
+
+  async observe(): Promise<unknown> {
+    return { token: 7 };
+  }
+
+  async execute(
+    _action: string,
+    _input: unknown,
+    _mode: BridgeMode,
+  ): Promise<unknown> {
+    return { token: 7 };
+  }
+}
+
+function createDomainFieldBridge(): GameBridge {
+  const adapter = new DomainFieldAdapter();
+  const registry = new AdapterRegistry();
+  registry.register(adapter);
+  const grantProvider: CapabilityGrantProvider = {
+    grant(grantRequest) {
+      return {
+        allowed: true,
+        capabilities: [...grantRequest.requestedCapabilities],
+        scope: { kind: adapter.id, resourceId: "domain-world" },
+        ttlMs: grantRequest.requestedTtlMs ?? 60_000,
+        totalActionBudget: 0,
+        perActionBudgets: {},
+      };
+    },
+  };
+  return new GameBridge({
+    registry,
+    sessions: new SessionManager({ idGenerator: () => "domain-session" }),
+    grantProvider,
+  });
+}
+
 async function callBridge(client: Client, envelope: RequestEnvelope) {
   return client.callTool({
     name: GAME_BRIDGE_TOOL_NAME,
@@ -172,6 +243,65 @@ describe("local MCP contract", () => {
     expect(client.getServerCapabilities()).not.toHaveProperty("prompts");
     expect(listed.tools.map((tool) => tool.name)).not.toContain("safety.resume");
     expect(listed.tools.map((tool) => tool.name)).not.toContain("safety.status");
+  });
+
+  it("preserves validated domain field names and number outputs across the real MCP boundary", async () => {
+    const { client } = await connectInMemory(
+      createGameBridgeMcpServer({ bridge: createDomainFieldBridge() }),
+    );
+
+    const describeResult = await callBridge(
+      client,
+      request("domain-describe", "bridge.describe", {}),
+    );
+    const described = parseBridgeResponse(describeResult);
+    expect(described.ok).toBe(true);
+    expect(JSON.parse(textContent(describeResult))).toEqual(described);
+    const inputSchema = (
+      described as {
+        result: {
+          adapters: Array<{
+            actions: { inspect: { inputSchema: { properties: Record<string, unknown> } } };
+          }>;
+        };
+      }
+    ).result.adapters[0]!.actions.inspect.inputSchema;
+    expect(inputSchema.properties).toMatchObject({
+      path: { type: "string" },
+      token: { type: "number" },
+      password: { type: "string" },
+    });
+
+    const opened = parseBridgeResponse(
+      await callBridge(
+        client,
+        request("domain-open", "session.open", {
+          adapterId: "domain-fields",
+          capabilities: ["game.act.inspect"],
+        }),
+      ),
+    );
+    expect(opened.ok).toBe(true);
+    const sessionId = (opened as { result: { sessionId: string } }).result.sessionId;
+    const actionResult = await callBridge(
+      client,
+      request(
+        "domain-result",
+        "game.act",
+        {
+          adapterId: "domain-fields",
+          gameAction: "inspect",
+          input: { path: "inventory.slot", token: 42, password: "puzzle-answer" },
+        },
+        { sessionId, mode: "dry-run" },
+      ),
+    );
+    const actionResponse = parseBridgeResponse(actionResult);
+    expect(actionResponse).toMatchObject({ ok: true, result: { token: 7 } });
+    expect(typeof (actionResponse as { result: { token: unknown } }).result.token).toBe(
+      "number",
+    );
+    expect(JSON.parse(textContent(actionResult))).toEqual(actionResponse);
   });
 
   it("injects frozen local context and rejects caller-supplied identity fields", async () => {
