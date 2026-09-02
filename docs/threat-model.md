@@ -130,9 +130,14 @@ preview action 不取得 write permit；read/preview 都不能修改 world。纯
 
 The stdio transport has an explicit 128 KiB read-buffer ceiling. The tool handler
 independently measures deterministic UTF-8 envelope bytes and refuses more than
-32 KiB. Complete duplicated tool results are limited to 112 KiB, leaving a fixed
-16 KiB JSON-RPC framing reserve; oversize becomes a fixed `RESOURCE_CAPACITY`
-result before transport and the connection remains usable. A synchronous gate
+32 KiB. Complete duplicated tool results are limited to 112 KiB. The remaining
+16 KiB is split into at most 8 KiB for a JSON-encoded request ID and at least
+8 KiB for outer JSON-RPC fields and escaping. IDs must be safe integers or
+bounded strings; an oversized ID receives fixed `-32600` with `id: null` and is
+not reflected. Every outbound frame is measured before the SDK writes it.
+Oversized tool output becomes fixed `RESOURCE_CAPACITY`, and an unexpected
+oversized outer response becomes a fixed bounded JSON-RPC error; the connection
+remains usable. A synchronous gate
 admits at most eight concurrent handlers by default;
 full capacity rejects immediately before bridge/adapter execution and creates no
 unbounded queue. Permits release in `finally`. Future remote work still needs
@@ -154,6 +159,8 @@ write a fixed message to stderr without embedding the received frame or error.
 The wrapper measures the complete text-plus-structured tool result before the
 SDK can frame it, so an oversized bridge response is replaced by a fixed
 `RESOURCE_CAPACITY` envelope rather than a transport disconnect.
+The transport wrapper also measures the final JSON-RPC frame and bounds the
+otherwise-unlimited SDK string request ID before handler dispatch.
 Audit key-name redaction is deliberately not applied to protocol responses:
 otherwise ordinary domain fields such as `path`, `token`, or `password` would
 silently change a validated JSON Schema or result type. Adapter results are

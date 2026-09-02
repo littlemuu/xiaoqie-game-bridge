@@ -124,10 +124,12 @@
   `game_bridge_request` tool and no resource, prompt, or control-plane surface
 - Client-spawned stdio entrypoint with a 128 KiB frame limit, 32 KiB logical
   envelope limit, 112 KiB complete-result limit, fixed 16 KiB JSON-RPC reserve,
+  bounded 8 KiB JSON-encoded request IDs, final outbound-frame measurement,
   and default maximum of eight concurrent handlers
 - Official MCP client contract tests against the built Node child process,
   including exact 32 KiB core results, near-limit 64-adapter catalogs, and a
-  fixed oversize protocol error that preserves the connection
+  fixed oversize protocol error that preserves the connection; raw stdio tests
+  cover maximum string IDs and non-reflecting `id: null` rejection above limit
 - Acceptance tests, deterministic demo, and Node 22 GitHub Actions workflow
 - Architecture, threat model, handoff, and open-question documentation
 
@@ -224,11 +226,11 @@ Actual local results on 2026-09-02 with Node.js `v22.23.1` and npm `10.9.8`:
 - `npm ci` — passed; 73 packages installed, 74 audited, 0 vulnerabilities
 - `npm audit` — passed; 0 vulnerabilities
 - `npm run check` — passed
-- `npm test` — passed; 10 files, 163 tests passed and 2 explicitly inapplicable
-  Windows gates skipped (165 registered assertions) in 39.00 s. The first full
-  run hit only the existing 5 s release-clone timeout; the unchanged release
-  file passed in isolation (19/19, clone case 2.66 s), then the final default
-  full run passed. All prior
+- `npm test` — passed; 10 files, 164 tests passed and 2 explicitly inapplicable
+  Windows gates skipped (166 registered assertions) in 44.36 s. Earlier full
+  runs hit only existing release-clone, ledger-prefix, and process late-ID
+  timing cases; their unchanged files passed in isolation, then the final
+  default full run passed. All prior
   protocol, MCP, operator, audit, safety, idempotency, capacity and containment
   regressions remain green. Adapter Contract v2 coverage now includes the Zod
   positive allowlist with own-data AST capture, trusted emitter reconstruction,
@@ -237,13 +239,16 @@ Actual local results on 2026-09-02 with Node.js `v22.23.1` and npm `10.9.8`:
   malformed runtime grants before side effects, closed-world runtime health,
   schema/catalog/registry byte and count limits, one-read health-member capture,
   descriptor-captured grant arrays, MCP catalog/result type preservation,
-  built-stdio maximum result/catalog and fixed oversize response behavior,
+  built-stdio maximum result/catalog, bounded raw JSON-RPC IDs, final frame
+  measurement, and fixed oversize response behavior,
   separate mutation/audit shutdown phases, adapter-close
   failure cleanup, immutable catalogs, revisions, budgets, output validation,
   and outcome-unknown handling.
 - Real stdio contract — passed inside `npm test`; official
   `Client@2.0.0`/`StdioClientTransport` started the built Node entrypoint,
-  completed initialize/list/calls, and closed client first then transport
+  completed initialize/list/calls, and closed client first then transport. A
+  raw stdio client proved maximum 8 KiB encoded IDs with maximum result/catalog
+  remain in frame and oversized IDs receive non-reflecting `id: null` rejection
 - Real operator contract — passed inside `npm test`; the built CLI observed and
   stopped the same runtime used by the official MCP client, blocked a new MCP
   commit while leaving observe/dry-run/session-close usable, resumed generation

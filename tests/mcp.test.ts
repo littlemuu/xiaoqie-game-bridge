@@ -1,3 +1,5 @@
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -10,6 +12,8 @@ import {
   ADAPTER_MAX_RESULT_BYTES,
   ADAPTER_REGISTRY_MAX_ADAPTERS,
   ADAPTER_REGISTRY_MAX_CATALOG_BYTES,
+  MCP_MAX_JSON_RPC_ID_BYTES,
+  MCP_JSON_RPC_WRAPPER_BYTES,
   type AdapterActionDefinition,
   type AdapterObservationDefinition,
   AdapterRegistry,
@@ -31,6 +35,8 @@ import {
 import {
   GAME_BRIDGE_TOOL_NAME,
   HandlerConcurrencyGate,
+  MCP_JSON_RPC_RESERVE_BYTES,
+  MCP_MAX_TOOL_RESULT_BYTES,
   STDIO_LOCAL_CONTEXT,
   STDIO_MAX_BUFFER_BYTES,
   createGameBridgeMcpServer,
@@ -151,6 +157,75 @@ function createMockBridge(options: { sessions?: SessionManager } = {}): GameBrid
     registry,
     ...(options.sessions === undefined ? {} : { sessions: options.sessions }),
   });
+}
+
+interface RawStdioLine {
+  bytes: number;
+  message: Record<string, unknown>;
+}
+
+async function rawStdioConnection(
+  entrypoint: string,
+  env: Record<string, string>,
+): Promise<{
+  send(message: Record<string, unknown>): void;
+  read(): Promise<RawStdioLine>;
+  stderr(): string;
+  close(): Promise<void>;
+}> {
+  const child = spawn(process.execPath, [entrypoint], {
+    cwd: process.cwd(),
+    env,
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  let stdout = Buffer.alloc(0);
+  let stderr = "";
+  const lines: Buffer[] = [];
+  const readers: Array<(line: Buffer) => void> = [];
+  child.stdout.on("data", (chunk: Buffer) => {
+    stdout = Buffer.concat([stdout, chunk]);
+    while (true) {
+      const newline = stdout.indexOf(0x0a);
+      if (newline < 0) break;
+      const line = stdout.subarray(0, newline);
+      stdout = stdout.subarray(newline + 1);
+      const reader = readers.shift();
+      if (reader === undefined) lines.push(line);
+      else reader(line);
+    }
+  });
+  child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString("utf8")));
+
+  return {
+    send(message) {
+      child.stdin.write(`${JSON.stringify(message)}\n`);
+    },
+    async read() {
+      const line =
+        lines.shift() ??
+        (await new Promise<Buffer>((resolveLine, reject) => {
+          const timer = setTimeout(() => reject(new Error("raw-stdio-timeout")), 3_000);
+          readers.push((value) => {
+            clearTimeout(timer);
+            resolveLine(value);
+          });
+        }));
+      return {
+        bytes: line.byteLength + 1,
+        message: JSON.parse(line.toString("utf8")) as Record<string, unknown>,
+      };
+    },
+    stderr: () => stderr,
+    async close() {
+      child.stdin.end();
+      await Promise.race([
+        once(child, "exit"),
+        new Promise<void>((resolveClose) => setTimeout(resolveClose, 1_000)),
+      ]);
+      if (child.exitCode === null) child.kill();
+    },
+  };
 }
 
 class DomainFieldAdapter implements GameAdapter {
@@ -581,6 +656,151 @@ describe("local MCP contract", () => {
     await Promise.allSettled([pending, closing]);
     expect(gate.inFlight).toBe(0);
   });
+
+  it.runIf(process.platform === "win32")(
+    "bounds raw JSON-RPC IDs while maximum stdio results and catalogs stay in frame",
+    async () => {
+      const entrypoint = resolve(
+        process.cwd(),
+        "dist",
+        "tests",
+        "fixtures",
+        "mcp-wire-boundary-child.js",
+      );
+      const connection = await rawStdioConnection(
+        entrypoint,
+        await isolatedChildEnvironment(),
+      );
+      const maximumId = (prefix: string) =>
+        prefix.repeat(MCP_MAX_JSON_RPC_ID_BYTES - 2);
+      expect(MCP_MAX_JSON_RPC_ID_BYTES + MCP_JSON_RPC_WRAPPER_BYTES).toBe(
+        MCP_JSON_RPC_RESERVE_BYTES,
+      );
+      expect(MCP_MAX_TOOL_RESULT_BYTES + MCP_JSON_RPC_RESERVE_BYTES).toBe(
+        STDIO_MAX_BUFFER_BYTES,
+      );
+      const requestMessage = (
+        id: string,
+        action: string,
+        params: Record<string, unknown>,
+        options: { sessionId?: string } = {},
+      ) => ({
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call",
+        params: {
+          name: GAME_BRIDGE_TOOL_NAME,
+          arguments: toolArguments(
+            request(`raw-${action}`, action, params, {
+              ...(options.sessionId === undefined
+                ? {}
+                : { sessionId: options.sessionId }),
+            }),
+          ),
+        },
+      });
+
+      try {
+        connection.send({
+          jsonrpc: "2.0",
+          id: "initialize",
+          method: "initialize",
+          params: {
+            protocolVersion: "2025-11-25",
+            capabilities: {},
+            clientInfo: { name: "raw-wire-test", version: "1.0.0" },
+          },
+        });
+        expect((await connection.read()).message).toMatchObject({
+          jsonrpc: "2.0",
+          id: "initialize",
+          result: { protocolVersion: "2025-11-25" },
+        });
+        connection.send({
+          jsonrpc: "2.0",
+          method: "notifications/initialized",
+        });
+
+        const catalogId = maximumId("c");
+        expect(Buffer.byteLength(JSON.stringify(catalogId), "utf8")).toBe(
+          MCP_MAX_JSON_RPC_ID_BYTES,
+        );
+        connection.send(requestMessage(catalogId, "bridge.describe", {}));
+        const catalog = await connection.read();
+        expect(catalog.bytes).toBeLessThanOrEqual(STDIO_MAX_BUFFER_BYTES);
+        expect(catalog.message.id).toBe(catalogId);
+        expect(
+          (
+            catalog.message.result as {
+              structuredContent: { result: { adapters: unknown[] } };
+            }
+          ).structuredContent.result.adapters,
+        ).toHaveLength(ADAPTER_REGISTRY_MAX_ADAPTERS);
+
+        connection.send(
+          requestMessage("open", "session.open", {
+            adapterId: "wire-00",
+            capabilities: ["game.observe"],
+          }),
+        );
+        const opened = await connection.read();
+        const sessionId = (
+          opened.message.result as {
+            structuredContent: { result: { sessionId: string } };
+          }
+        ).structuredContent.result.sessionId;
+
+        const resultId = maximumId("r");
+        connection.send(
+          requestMessage(
+            resultId,
+            "game.observe",
+            { adapterId: "wire-00" },
+            { sessionId },
+          ),
+        );
+        const result = await connection.read();
+        expect(result.bytes).toBeLessThanOrEqual(STDIO_MAX_BUFFER_BYTES);
+        expect(result.message.id).toBe(resultId);
+        const observed = (
+          result.message.result as { structuredContent: { result: unknown } }
+        ).structuredContent.result;
+        expect(Buffer.byteLength(canonicalJson(observed), "utf8")).toBe(
+          ADAPTER_MAX_RESULT_BYTES,
+        );
+
+        const oversizedId = "x".repeat(MCP_MAX_JSON_RPC_ID_BYTES - 1);
+        expect(Buffer.byteLength(JSON.stringify(oversizedId), "utf8")).toBe(
+          MCP_MAX_JSON_RPC_ID_BYTES + 1,
+        );
+        connection.send(requestMessage(oversizedId, "bridge.describe", {}));
+        const rejected = await connection.read();
+        expect(rejected.message).toMatchObject({
+          jsonrpc: "2.0",
+          id: null,
+          error: {
+            code: -32600,
+            message: "The JSON-RPC request ID exceeds the local wire budget.",
+          },
+        });
+        expect(JSON.stringify(rejected.message)).not.toContain(oversizedId.slice(0, 128));
+
+        connection.send({
+          jsonrpc: "2.0",
+          id: "after-rejection",
+          method: "tools/list",
+          params: {},
+        });
+        expect((await connection.read()).message).toMatchObject({
+          id: "after-rejection",
+          result: { tools: [{ name: GAME_BRIDGE_TOOL_NAME }] },
+        });
+      } finally {
+        await connection.close();
+      }
+      expect(connection.stderr()).toBe("");
+    },
+  );
 
   it.runIf(process.platform === "win32")(
     "carries the maximum core result and near-limit capacity catalog through built stdio",

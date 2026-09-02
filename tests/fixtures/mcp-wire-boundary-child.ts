@@ -16,6 +16,7 @@ import {
   createGameBridgeMcpServer,
   type BridgeRequestHandler,
 } from "../../src/mcp/server.js";
+import { BoundedStdioServerTransport } from "../../src/mcp/bounded-stdio-transport.js";
 
 const maximumResultOverhead = Buffer.byteLength(
   JSON.stringify({ payload: "" }),
@@ -94,9 +95,11 @@ const bridge =
   process.env.XIAOQIE_TEST_MCP_WIRE_SCENARIO === "oversize"
     ? oversizedBridge
     : productBoundaryBridge();
-const transport = new StdioServerTransport(process.stdin, process.stdout, {
-  maxBufferSize: STDIO_MAX_BUFFER_BYTES,
-});
+const transport = new BoundedStdioServerTransport(
+  new StdioServerTransport(process.stdin, process.stdout, {
+    maxBufferSize: STDIO_MAX_BUFFER_BYTES,
+  }),
+);
 const handle = serveStdio(() => createGameBridgeMcpServer({ bridge }), {
   transport,
   onerror: () => process.stderr.write("Wire boundary fixture transport error.\n"),

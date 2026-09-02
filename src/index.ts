@@ -17,6 +17,7 @@ export * from "./core/session.js";
 export * from "./core/write-scheduler.js";
 export * from "./package-version.js";
 export * from "./mcp/server.js";
+export * from "./mcp/bounded-stdio-transport.js";
 export * from "./operator/client.js";
 export * from "./operator/protocol.js";
 export * from "./operator/server.js";

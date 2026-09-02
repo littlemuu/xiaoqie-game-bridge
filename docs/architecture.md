@@ -363,14 +363,19 @@ durable audit reservation。普通 audit 与未来安全关键 operation journal
    Audit-oriented key-name redaction is not applied to protocol output: trusted
    JSON Schema and already output-schema-validated adapter results keep their
    field names, structure, and scalar types.
-7. The complete duplicated tool result is limited to 112 KiB. The 128 KiB stdio
-   buffer therefore retains a fixed 16 KiB reserve for JSON-RPC framing and
-   escaping; an oversized result is replaced by one fixed `RESOURCE_CAPACITY`
-   result before transport, without closing the connection.
-8. Handler capacity is released in `finally`, including errors, invalid output,
+7. The stdio transport accepts only safe-integer IDs or strings whose JSON
+   encoding is at most 8 KiB. A larger ID receives a fixed `-32600` response
+   with `id: null`, so attacker bytes are not reflected and the connection stays
+   open. The complete duplicated tool result is limited to 112 KiB; another
+   8 KiB remains for outer JSON-RPC fields and escaping inside the 128 KiB frame.
+   Every outbound frame is measured again before the underlying SDK transport.
+8. An oversized tool result becomes fixed `RESOURCE_CAPACITY`; any unexpected
+   oversized outer response becomes a fixed bounded JSON-RPC error rather than
+   a passive client-buffer disconnect.
+9. Handler capacity is released in `finally`, including errors, invalid output,
    and client-disconnect completion paths.
 
-The MCP JSON-RPC ID belongs to the SDK transport. The bridge `requestId` lives
+The bounded MCP JSON-RPC ID belongs to the SDK transport. The bridge `requestId` lives
 inside tool arguments and is the core idempotency key; the two are deliberately
 not mapped to each other. A transport-level size/concurrency refusal never
 enters the session request cache, so a later retry with the same bridge ID may
