@@ -1,5 +1,14 @@
 # 开放问题
 
+## 2026-09-16 当前决定与待验收项
+
+用户已授权直接推进第一个可用版本。首个目标已选定 Minecraft Java 1.20.4 专用测试世界，采用固定 RCON/data pack 连接和一个方块颜色动作；不再等待泛化的 B/C/D 分阶段审批。已实现代码，但真实游戏及 Windows 新入口仍需实测。
+
+现在真正待完成的是：用户自行接受 Minecraft EULA 并启动专用服务，运行 `npm run minecraft -- verify`，在实际 MCP 客户端复核工具发现与动作。游戏服务器崩溃/磁盘故障、更多动作、操作历史归档、其他游戏版本和云端连接继续后置。
+
+下面保留先前问题的历史记录；与上述已决定事项冲突时，以本节及 [当前路线](ROADMAP.md) 为准。
+
+
 > 更新日期：2026-09-01  
 > 路线依据：[`docs/ROADMAP.md`](ROADMAP.md)  
 > 当前实施工单：[Issue #19](https://github.com/littlemuu/xiaoqie-game-bridge/issues/19)；合并复审后才为阶段 B 建立独立工单

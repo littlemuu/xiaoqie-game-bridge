@@ -55,6 +55,7 @@ export interface BridgeError {
     | "adapter-succeeded"
     | "outcome-unknown";
   adapterError?: { code: string };
+  operationId?: string;
 }
 
 interface ResponseBase {
@@ -106,6 +107,7 @@ export const responseEnvelopeSchema = z.discriminatedUnion("ok", [
             .object({ code: z.string().regex(/^[A-Z][A-Z0-9_]{0,63}$/u) })
             .strict()
             .optional(),
+          operationId: z.string().uuid().optional(),
         })
         .strict(),
     })
@@ -183,7 +185,7 @@ export function errorResponse(
   request: Pick<RequestEnvelope, "requestId" | "sessionId" | "action" | "mode">,
   code: ErrorCode,
   message: string,
-  details: Pick<BridgeError, "operationPhase" | "adapterError"> = {},
+  details: Pick<BridgeError, "operationPhase" | "adapterError" | "operationId"> = {},
 ): ErrorResponse {
   return {
     protocolVersion: PROTOCOL_VERSION,

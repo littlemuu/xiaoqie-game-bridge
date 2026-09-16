@@ -47,7 +47,7 @@ export interface AdapterActionDefinition {
   writeConcurrency: AdapterWriteConcurrency;
   adapterErrorCodes: readonly string[];
   requiresExpectedRevision: boolean;
-  reconciliation: "unsupported" | "future";
+  reconciliation: "unsupported" | "future" | "supported";
 }
 
 export interface AdapterActionDescription {
@@ -61,7 +61,7 @@ export interface AdapterActionDescription {
   writeConcurrency: AdapterWriteConcurrency;
   adapterErrorCodes: readonly string[];
   requiresExpectedRevision: boolean;
-  reconciliation: "unsupported" | "future";
+  reconciliation: "unsupported" | "future" | "supported";
 }
 
 export interface AdapterDescription {
@@ -80,6 +80,10 @@ export interface AdapterDescription {
 
 export interface AdapterExecutionOptions {
   expectedRevision?: number;
+  /** Trusted core-derived digest; never accepted from adapter input. */
+  requestKey?: string;
+  /** Recheck after adapter preparation, immediately before external dispatch. */
+  canDispatch?: () => boolean;
 }
 
 export interface GameAdapter {
@@ -113,6 +117,7 @@ export class AdapterRuntimeError extends Error {
     readonly kind: "unavailable" | "outcome-unknown",
     readonly dispatch: "not-dispatched" | "dispatched" =
       kind === "outcome-unknown" ? "dispatched" : "not-dispatched",
+    readonly operationId?: string,
   ) {
     super("The adapter runtime could not confirm the operation result.");
     this.name = "AdapterRuntimeError";
@@ -436,7 +441,7 @@ function snapshotAction(value: unknown, actionName: string): AdapterActionDefini
   ) {
     throw new TypeError(`Adapter action ${actionName} has invalid dry-run semantics.`);
   }
-  if (reconciliation !== "unsupported" && reconciliation !== "future") {
+  if (reconciliation !== "unsupported" && reconciliation !== "future" && reconciliation !== "supported") {
     throw new TypeError(`Adapter action ${actionName} has invalid reconciliation metadata.`);
   }
   if (typeof requiresExpectedRevision !== "boolean") {

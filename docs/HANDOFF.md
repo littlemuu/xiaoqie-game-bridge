@@ -1,5 +1,47 @@
 # Handoff
 
+## Minecraft 最小可玩候选实现 — 2026-09-16
+
+基线：`main@1f26891`；实现分支：`feat/minecraft-first-playable`。本次用户授权直接实现下一阶段并推进第一个可用版本。
+
+### 本轮完成
+
+- 固定 Java 1.20.4 展示台数据包与 RCON adapter：观察、版本、三种颜色预览及单块修改。
+- SQLite FULL intent/result、内部 UUID、单调序号、512 条容量、运行期间独占锁及真实子进程被 kill 后恢复。
+- 游戏函数记录版本和回执；保存确认及实际方块核验后才报告成功。未知结果保留 intent、带 operationId、禁止新写；本地 reconciliation 封住迟到请求，不重复方块动作。
+- 本地 init / 固定官方下载与校验 / server / play / status / reconcile / verify；独立 Minecraft MCP stdio 入口。
+- 默认 stopped；本地明确启用，每 session 16 次写动作；没有任意命令、主机或文件工具参数。
+- core 修复异步 revision 期间 stop/quiesce 的派发竞态。
+- 中文 README、试玩指南、路线、架构/威胁边界与历史 mock RC 说明。
+
+### 本轮实际验证
+
+环境：Linux x64，Node 22.18.0；TypeScript 5.9.2、Vitest 3.2.7。
+
+- `npm ci` / lock 同步 / type check / build：通过。
+- 完整 Vitest：**110 passed / 66 平台不适用 skips / 176 registered**；9 个文件通过、2 个文件全跳过。没有 Windows 新产品证据。
+- 新增 Minecraft 12 项测试通过：真实 loopback TCP 协议夹具、SQLite、强制 kill 子进程恢复，以及官方 MCP client 拉起 built Minecraft stdio 子进程。默认停写与本地启动参数启用均验证；恰好一个 tool，resume 不在模型面。
+- 数据包只做了结构约束核验；协议夹具不是 Minecraft 游戏，不能证明实际 mcfunction 解析与执行。
+- 真实 `minecraft init` 命令通过，生成全新测试目录；EULA 保持 false。
+- 真实官方下载尝试未成功：当前运行环境域名解析返回 `EAI_AGAIN`，未取得 jar，没有启动游戏。
+- `npm run demo` 被当前环境禁止的 tsx 临时 Unix socket 阻止（EPERM）；直接运行同一 built demo 正常报告 Windows-only skip，不算产品试玩通过。
+- `release:workflow-policy` 和 `git diff --check` 通过；未扩张 release/native/ledger 产品实现。
+- `npm audit` 仍因已有 Vitest / @vitest/mocker 的两项中危公告 GHSA-82fw-gwwq-j7x9 失败，未屏蔽。
+
+### 精确剩余门槛
+
+**尚未完成真实 Minecraft 验收，因此不能声称已交付“真机验收通过的第一个可用版本”。**
+
+在用户本机获取官方 server.jar，自行确认 Minecraft EULA，启动专用服务后运行：
+
+```bash
+npm run minecraft -- verify
+```
+
+再用用户实际 Minecraft 客户端和 MCP 客户端观察/控制展示台。`verify` 会真的执行两个颜色动作、模拟确认丢失、关闭重开 bridge 并对账；不会强制杀死 Minecraft 服务端或验证多文件断电原子性。Windows 新入口、服务端崩溃/磁盘故障、历史归档和云端连接继续后置。
+
+包版本/原 RC 支持矩阵保持原 mock 发布基线；本次是 Unreleased 源码增量，没有 tag、Release 或 npm publication。以下记录均为旧 mock 阶段历史。
+
 ## Maintenance simplification — 2026-09-16
 
 - Ordinary CI builds once per job; full release reproducibility is retained in
