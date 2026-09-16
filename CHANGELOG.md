@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Replace Zod-internal adapter schema introspection with bounded immutable
+  `defineAdapterSchema(json)` contracts. Adapter authors must migrate their
+  declarations; the MCP request surface and runtime safety rules are unchanged.
+- Build once in ordinary CI; retain full reproducibility for tags/manual checks.
+- Share test discovery with evidence, parse workflow YAML structurally, and
+  cover ledger truncation states without one disk fixture per payload byte.
+
 ## 0.1.0-rc.1
 
 - Establishes the mock-only, offline-first, default-deny bridge candidate.

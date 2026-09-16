@@ -233,16 +233,14 @@ reconciliation 能力。`bridge.describe` 只输出可序列化 JSON Schema 与�
 `ADAPTER_REJECTED` 下的 allowlisted code 出现，不能扩张 core error enum 或
 回显异常文本。
 
-注册按 Zod node/check/option 正向白名单只接受能无损转成 JSON Schema 的声明式
-子集。注册先以 descriptor 捕获有界、own-data-only 的不可变 AST；hole、accessor、
-symbol/extra key、Proxy 异常、自定义 `_zod.toJSONSchema` / `_zod.processJSONSchema`、
-非有限/有损 JSON number 与任何未识别定义均被拒绝。Zod 内建 object lazy-shape
-getter 按锁定实现身份读取恰好一次。可信 schema 从 AST 重建后才使用独有空
-metadata registry 发射；活动 validator 再从深冻结 JSON 快照的隔离副本重建并
-隐藏，因此源 definition graph、metadata、emitter 或后续修改不能改变验证逻辑。
-property name、string literal/enum 与 regex source 受 1 KiB UTF-8 标量上限约束，
-每份 schema snapshot、单 adapter catalog 与 registry 聚合 catalog 另有
-16 KiB / 24 KiB / 32 KiB 固定上限，registry 最多 64 个 adapter。
+`defineAdapterSchema(json)` 只接受受限 JSON Schema 数据。未知关键字、引用、可执行值、
+getter、稀疏数组、Proxy 捕获异常与非有限数字均拒绝；先复制并深冻结数据，再从隔离
+副本建立私有 validator。注册只接受该工厂创建的不可变实例，伪造 `safeParse` 或直接
+传入 Zod 对象不能进入注册表。固定 mock 的公开 Zod→JSON 转换属于受信编写步骤，
+不是对任意第三方 Zod 对象的安全检查或等价证明。
+标量仍受 1 KiB UTF-8 上限约束；snapshot、单 adapter catalog 与 registry catalog
+保持 16 KiB / 24 KiB / 32 KiB 上限，registry 最多 64 个 adapter。
+JSON 捕获最多 2,048 个节点、深度 32。
 
 Capability grant 虽来自受信 provider，仍作为运行时边界严格捕获、校验、复制：
 对象和 scope 无额外字段或 accessor，TTL 是受请求/全局上限约束的正 safe

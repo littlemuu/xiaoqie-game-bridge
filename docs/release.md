@@ -26,19 +26,27 @@ npm ci
 npm run check
 npm test
 npm run demo
-npm run build
 npm audit
 npm run release:workflow-policy
 npm run release:reproducible
-npm run release:build
 npm run release:verify
 git diff --check
 ```
 
+Ordinary PR/push CI stops after one build (the `npm test` pretest), tests, demo,
+audit and diff checks. It does not rebuild or upload release evidence. The
+release verifier's regression tests still run in that ordinary suite. Complete
+reproducibility is available in the tag build and the read-only manual
+`release-check` workflow; neither ordinary CI nor that manual check publishes.
+The workflow policy uses parsed YAML, so quoting, comments and indentation do
+not define security boundaries. `yaml` is a pinned development dependency only.
+
 The reproducibility command refuses a dirty source tree, creates two precisely
 owned temporary local clones, checks out the same commit in each, performs
 `npm ci --offline` from the already populated cache, builds twice and compares
-the canonical bundle bytes/digest. It deletes only those two temporary clones.
+the canonical bundle bytes/digest, then builds and verifies the release checkout
+against those digests. Its output is already the final release bundle; do not
+run another `release:build` afterward. It deletes only those temporary clones.
 The script contains no network client and does not access a game, account,
 launcher, save, desktop, host MCP configuration or user-selected file.
 
@@ -99,9 +107,9 @@ firewall, system policy or global environment.
 An elevated runner can only report `elevated-fail-closed-only`. Failed or
 unknown assertions remain unverified; skipped assertions are counted by safe
 category and prevent an unqualified `allRegisteredTestsPassed` claim. Full
-evidence additionally requires the exact version-1 nine-file inventory, every
-required core/audit/MCP/operator/process/release/containment category, nonzero
-assertions and a successful trusted containment probe. Empty, partial,
+evidence additionally requires every test file discovered by the same
+`scripts/test-suite.mjs` rule used by Vitest, nonzero assertions and a successful
+trusted containment probe. There is no second hard-coded filename/category list. Empty, partial,
 unexpected or duplicate reports remain unverified. The hosted targeted run uses
 the distinct `elevated-gate` suite kind and cannot become full evidence. Real
 non-elevated evidence requires an actual non-elevated Windows session.

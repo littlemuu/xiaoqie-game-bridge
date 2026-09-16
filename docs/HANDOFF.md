@@ -1,5 +1,28 @@
 # Handoff
 
+## Maintenance simplification — 2026-09-16
+
+- Ordinary CI builds once per job; full release reproducibility is retained in
+  protected-tag and read-only manual `release-check` runs.
+- Adapter schema registration now accepts immutable `defineAdapterSchema(json)`
+  contracts. The Zod internal graph/AST capture and function-source comparisons
+  have been removed. This is a source-level adapter authoring API change; MCP
+  requests, authorization, revision, budgets and safety behavior remain unchanged.
+- Vitest and evidence share test-file discovery. Workflow checks parse YAML and
+  accept equivalent formatting while retaining permission and tag boundaries.
+- Audit/containment product code is unchanged. The ledger truncation test covers
+  all partial header lengths, payload boundaries/interior and missing terminator,
+  rather than creating a disk ledger for every payload byte.
+- Local Node 22.23.1 validation: type check, native build, all 10 test files,
+  162 passed / 2 explicitly inapplicable skips (35.19 s), real MCP/operator/worker
+  paths, demo, workflow-policy and diff check passed.
+- Dependency audit is **not clean**: the existing Vitest 3.2.7 / @vitest/mocker
+  dependency is reported with 2 moderate findings (GHSA-82fw-gwwq-j7x9).
+  The added development-only YAML parser is not implicated. Audit remains a
+  failing CI gate; no suppression or unrelated major Vitest upgrade was made.
+- No hosted CI result or new release is claimed for this maintenance change.
+  Earlier acceptance records below are historical, not new verification.
+
 ## Completed
 
 - Adapter Contract v2 with strict input/output schemas, read/preview/write
@@ -9,9 +32,9 @@
 - Registration-time validation, snapshotting, and freezing of adapter identity,
   observation, actions, schemas, capabilities, limits, and metadata; runtime
   replacement of the source manifest cannot expand the registered surface
-- Positive allowlist for JSON-Schema-round-trippable Zod nodes/checks/options;
-  refinements/transforms/codecs, overwrite/trim, coerce, user `when`, and every
-  unknown definition are rejected; the rebuilt validator is hidden and frozen
+- Bounded pure JSON Schema factory with an immutable snapshot and private validator;
+  registration rejects arbitrary Zod objects and forged schema wrappers. No Zod
+  internal graph inspection or function-source matching remains.
 - Zero-action read-only adapters, optional revision providers unless demanded
   by an action, and parallel/serial/resource-serial observation scheduling
 - Pure-JSON `bridge.describe` catalog with input/output JSON Schema and no Zod
@@ -58,13 +81,14 @@
   failure, unknown and containment/cleanup status
 - Checkout-derived provenance identity with expected commit/ref used only as
   assertions, including annotated-tag peel and PR-ref resolution checks
-- Versioned exact full-suite inventory that prevents empty, partial, duplicate
-  or targeted Vitest output from becoming non-elevated Windows evidence
+- Shared test-file discovery for Vitest and evidence, preventing empty, partial,
+  duplicate or targeted reports from becoming non-elevated Windows evidence
 - Separate read-only tag build and minimal credential-bearing publish jobs;
   dependency installation and general project execution never receive release
   write/OIDC credentials
-- Closed parsing of every workflow `uses:` key, including rejection of quoted,
-  expression, Docker, floating and otherwise unrecognized forms
+- Parsed YAML checks for action pinning and release permissions/order; equivalent
+  indentation and quoting are accepted. Expressions, Docker and floating actions
+  remain rejected.
 
 - Node.js 22 + TypeScript project with strict compiler settings
 - Versioned strict request/response protocol and stable error codes
@@ -148,11 +172,11 @@
 - The effect/mode matrix rejects commit for read/preview actions before adapter
   dispatch. Non-write actions must declare `writeConcurrency: none`; only write
   actions can claim resource scheduling or enter commit safety and budgets.
-- Schema registration captures an immutable own-data declarative AST before
-  rebuilding a trusted emitter input. Custom Zod emitters, live graph accessors,
-  proxy failures, oversized scalar/snapshot/catalog data, and malformed manifest
-  string arrays fail closed. Grant capability length is captured once from its
-  own data descriptor rather than repeatedly reading live array state.
+- `defineAdapterSchema` captures bounded plain JSON data, freezes it and compiles
+  a private validator. The registry accepts only factory-created immutable
+  schemas. The fixed mock's public Zod-to-JSON conversion is trusted authoring;
+  arbitrary third-party Zod objects are no longer a registration input.
+  Manifest/grant string arrays retain their descriptor-based validation.
   Product shutdown separately bounds mutation settlement, closes the adapter,
   then always invokes the ledger's own bounded drain/abort even on adapter error.
 - Invalid output after a write is classified with a fixed output error and
@@ -212,16 +236,14 @@ npm ci
 npm run check
 npm test
 npm run demo
-npm run build
 npm audit
 npm run release:workflow-policy
 npm run release:reproducible
-npm run release:build
 npm run release:verify
 git diff --check
 ```
 
-Actual local results on 2026-09-02 with Node.js `v22.23.1` and npm `10.9.8`:
+Historical acceptance baseline (before maintenance simplification), on 2026-09-02 with Node.js `v22.23.1` and npm `10.9.8`:
 
 - `npm ci` — passed; 73 packages installed, 74 audited, 0 vulnerabilities
 - `npm audit` — passed; 0 vulnerabilities
@@ -316,7 +338,7 @@ root was path-checked and removed (`TEMP_EVIDENCE_CLEANED=True`). These inherite
 ACLs and Node mode requests are explicitly not claimed as a custom
 user-exclusive DACL or hostile same-user isolation.
 
-The checked-in workflow has two deliberately different jobs. Ubuntu currently
+At the 2026-09-02 baseline, the workflow had two deliberately different jobs. Ubuntu
 runs 54 platform-neutral passes with 61 explicit Windows-only skips; its demo
 returns a fixed skip result instead of using an unrestricted worker. Elevated
 `windows-latest` runs check, confirms its administrator role, verifies only the
@@ -389,8 +411,7 @@ configuration was accessed. GitHub-hosted CI status is recorded in the Draft PR.
 
 ## Next-ticket gate
 
-Review Issue #19's contract/grant/revision/scheduling/health semantics and its
-complete local evidence first. After merge, the next ticket must be the narrow
+Issue #19 was merged as PR #21. The next feature ticket remains the narrow
 operation journal, internal operation ID, `OUTCOME_UNKNOWN` persistence and
 reconciliation stage. It must not infer approval for a real game, remote
 transport, host configuration, durable session, deployment, or desktop

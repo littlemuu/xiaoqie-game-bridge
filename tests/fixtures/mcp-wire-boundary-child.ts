@@ -1,3 +1,4 @@
+import { defineAdapterSchema } from "../../src/core/adapter.js";
 import { Buffer } from "node:buffer";
 import { StdioServerTransport, serveStdio } from "@modelcontextprotocol/server/stdio";
 import { z } from "zod";
@@ -33,9 +34,9 @@ function adapter(index: number, displayNameLength: number): GameAdapter {
     displayName: "a".repeat(displayNameLength),
     observation: {
       description: "o",
-      outputSchema: maximum
+      outputSchema: defineAdapterSchema(JSON.parse(JSON.stringify(z.toJSONSchema(maximum
         ? z.object({ payload: z.string() }).strict()
-        : z.boolean(),
+        : z.boolean(), { metadata: z.registry() })))),
       effectKind: "read",
       concurrency: { kind: "parallel" },
       requiredCapabilities: ["game.observe"],

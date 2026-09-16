@@ -1,3 +1,4 @@
+import { defineAdapterSchema } from "../src/core/adapter.js";
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import {
@@ -470,7 +471,7 @@ class OwnerGatedAdapter implements GameAdapter {
   readonly displayName = "Owner binding gated adapter";
   readonly observation = {
     description: "Observe the owner-binding test entry count.",
-    outputSchema: ownerObservationSchema,
+    outputSchema: defineAdapterSchema(JSON.parse(JSON.stringify(z.toJSONSchema(ownerObservationSchema, { metadata: z.registry() })))),
     effectKind: "read" as const,
     concurrency: { kind: "parallel" as const },
     requiredCapabilities: ["game.observe"],
@@ -479,8 +480,8 @@ class OwnerGatedAdapter implements GameAdapter {
   readonly actions: Readonly<Record<string, AdapterActionDefinition>> = {
     move: {
       description: "Test-only owner binding gate.",
-      inputSchema: gatedSchema,
-      outputSchema: ownerResultSchema,
+      inputSchema: defineAdapterSchema(JSON.parse(JSON.stringify(z.toJSONSchema(gatedSchema, { metadata: z.registry() })))),
+      outputSchema: defineAdapterSchema(JSON.parse(JSON.stringify(z.toJSONSchema(ownerResultSchema, { metadata: z.registry() })))),
       effectKind: "write",
       dryRunSemantics: "exact",
       requiredCapabilities: ["game.act.move"],

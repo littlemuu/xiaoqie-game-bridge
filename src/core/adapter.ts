@@ -21,7 +21,7 @@ export type AdapterWriteConcurrency =
   | Readonly<{ kind: "resource-serial"; resourceKey: string }>;
 
 export interface AdapterSchema {
-  readonly jsonSchema?: unknown;
+  readonly jsonSchema: unknown;
   safeParse(value: unknown):
     | Readonly<{ success: true; data: unknown }>
     | Readonly<{ success: false }>;
@@ -29,7 +29,7 @@ export interface AdapterSchema {
 
 export interface AdapterObservationDefinition {
   description: string;
-  outputSchema: z.ZodType<unknown> | AdapterSchema;
+  outputSchema: AdapterSchema;
   effectKind: "read";
   concurrency: AdapterObservationConcurrency;
   requiredCapabilities: readonly string[];
@@ -38,8 +38,8 @@ export interface AdapterObservationDefinition {
 
 export interface AdapterActionDefinition {
   description: string;
-  inputSchema: z.ZodType<unknown> | AdapterSchema;
-  outputSchema: z.ZodType<unknown> | AdapterSchema;
+  inputSchema: AdapterSchema;
+  outputSchema: AdapterSchema;
   effectKind: AdapterEffectKind;
   dryRunSemantics: AdapterDryRunSemantics;
   requiredCapabilities: readonly string[];
@@ -227,540 +227,127 @@ function stringSet(value: unknown, label: string, pattern = MANIFEST_NAME_PATTER
   return Object.freeze([...values].sort());
 }
 
-const BUILTIN_LENGTH_WHEN = (
-  (
-    (z.string().min(1) as unknown as {
-      _zod: { def: { checks: Array<{ _zod: { def: { when: unknown } } }> } };
-    })._zod.def.checks[0]!
-  )._zod.def.when
-);
+// Schemas are constructed from data by the host, never inspected as executable
+// Zod objects during registration. The validator stays private to this module.
+const definedSchemas = new WeakSet<object>();
 
-function rejectsLosslessJsonNumber(value: unknown): boolean {
-  return typeof value === "number" && (!Number.isFinite(value) || Object.is(value, -0));
+function declarativeError(): never {
+  throw new TypeError("Adapter schema must use the bounded declarative JSON Schema subset.");
 }
 
-type DeclarativeLiteral = string | number | boolean | null;
-type DeclarativeCheck =
-  | Readonly<{ kind: "min-length"; value: number }>
-  | Readonly<{ kind: "max-length"; value: number }>
-  | Readonly<{ kind: "greater-than"; value: number; inclusive: boolean }>
-  | Readonly<{ kind: "less-than"; value: number; inclusive: boolean }>
-  | Readonly<{ kind: "safeint" }>
-  | Readonly<{ kind: "regex"; source: string }>;
-type DeclarativeSchema =
-  | Readonly<{ type: "string"; checks: readonly DeclarativeCheck[] }>
-  | Readonly<{ type: "number"; checks: readonly DeclarativeCheck[] }>
-  | Readonly<{ type: "boolean" }>
-  | Readonly<{ type: "never" }>
-  | Readonly<{ type: "literal"; values: readonly DeclarativeLiteral[] }>
-  | Readonly<{ type: "enum"; entries: readonly (readonly [string, string | number])[] }>
-  | Readonly<{ type: "optional"; innerType: DeclarativeSchema }>
-  | Readonly<{ type: "union"; options: readonly DeclarativeSchema[] }>
-  | Readonly<{ type: "array"; element: DeclarativeSchema; checks: readonly DeclarativeCheck[] }>
-  | Readonly<{
-      type: "object";
-      shape: readonly (readonly [string, DeclarativeSchema])[];
-    }>;
-
-function declarativeError(label: string): never {
-  throw new TypeError(`${label} must use the declarative schema subset.`);
-}
-
-function boundedSchemaString(value: string, label: string): string {
-  if (Buffer.byteLength(value, "utf8") > ADAPTER_MAX_SCHEMA_SCALAR_BYTES) {
-    throw new TypeError(`${label} exceeds bounded schema limits.`);
-  }
-  return value;
-}
-
-function hasExactKeys(record: ReadonlyMap<string, unknown>, expected: readonly string[]): boolean {
-  return record.size === expected.length && expected.every((key) => record.has(key));
-}
-
-function functionSource(value: unknown): string | undefined {
-  if (typeof value !== "function") return undefined;
-  try {
-    return Function.prototype.toString.call(value);
-  } catch {
-    return undefined;
-  }
-}
-
-function schemaProcessorSource(schema: z.ZodType<unknown>): string {
-  return Function.prototype.toString.call(
-    (schema as unknown as { _zod: { processJSONSchema: () => unknown } })._zod
-      .processJSONSchema,
-  );
-}
-
-const BUILTIN_SCHEMA_PROCESSOR_SOURCES = Object.freeze({
-  string: schemaProcessorSource(z.string()),
-  number: schemaProcessorSource(z.number()),
-  boolean: schemaProcessorSource(z.boolean()),
-  never: schemaProcessorSource(z.never()),
-  literal: schemaProcessorSource(z.literal("baseline")),
-  enum: schemaProcessorSource(z.enum(["baseline"])),
-  optional: schemaProcessorSource(z.string().optional()),
-  union: schemaProcessorSource(z.union([z.string(), z.number()])),
-  array: schemaProcessorSource(z.array(z.string())),
-  object: schemaProcessorSource(z.object({}).strict()),
-});
-
-const BUILTIN_SAFEINT_PROCESSOR_SOURCE = Function.prototype.toString.call(
-  (
-    (z.number().int() as unknown as {
-      _zod: { def: { checks: Array<{ _zod: { processJSONSchema: () => unknown } }> } };
-    })._zod.def.checks[0]!
-  )._zod.processJSONSchema,
-);
-
-const BUILTIN_OBJECT_SHAPE_GETTER_SOURCE = functionSource(
-  Object.getOwnPropertyDescriptor(
-    (z.object({}).strict() as unknown as { _zod: { def: object } })._zod.def,
-    "shape",
-  )?.get,
-)!;
-
-function captureSchemaDefinition(
-  value: unknown,
-  label: string,
-): ReadonlyMap<string, unknown> {
-  try {
-    if (value === null || typeof value !== "object" || Array.isArray(value)) {
-      return declarativeError(label);
+function captureSchemaJson(value: unknown): unknown {
+  let nodes = 0;
+  let bytes = 0;
+  const visit = (entry: unknown, depth: number): unknown => {
+    if (++nodes > 2_048 || depth > 32) return declarativeError();
+    if (typeof entry === "string") {
+      const size = Buffer.byteLength(entry, "utf8");
+      if (size > ADAPTER_MAX_SCHEMA_SCALAR_BYTES) return declarativeError();
+      bytes += size;
+      if (bytes > ADAPTER_MAX_SCHEMA_SNAPSHOT_BYTES) return declarativeError();
+      return entry;
     }
-    const prototype = Object.getPrototypeOf(value);
-    if (prototype !== Object.prototype && prototype !== null) return declarativeError(label);
-    const keys = Reflect.ownKeys(value);
-    if (keys.length > 16 || keys.some((key) => typeof key !== "string")) {
-      return declarativeError(label);
+    if (entry === null || typeof entry === "boolean") return entry;
+    if (typeof entry === "number" && Number.isFinite(entry) && !Object.is(entry, -0)) return entry;
+    if (Array.isArray(entry)) {
+      const captured = captureOwnDataArray(entry);
+      if (captured === undefined) return declarativeError();
+      return Object.freeze(captured.map((child) => visit(child, depth + 1)));
     }
-    const captured = new Map<string, unknown>();
-    for (const key of keys as string[]) {
-      const descriptor = Object.getOwnPropertyDescriptor(value, key);
-      if (descriptor === undefined) return declarativeError(label);
-      if ("value" in descriptor) {
-        captured.set(key, descriptor.value);
-        continue;
-      }
-      if (
-        key !== "shape" ||
-        descriptor.set !== undefined ||
-        functionSource(descriptor.get) !== BUILTIN_OBJECT_SHAPE_GETTER_SOURCE
-      ) {
-        return declarativeError(label);
-      }
-      captured.set(key, Reflect.apply(descriptor.get!, value, []));
-    }
-    return captured;
-  } catch {
-    return declarativeError(label);
-  }
-}
-
-function captureSchemaParts(
-  value: unknown,
-  label: string,
-): Readonly<{
-  internal: ReadonlyMap<string, unknown>;
-  definition: ReadonlyMap<string, unknown>;
-}> {
-  if (value === null || typeof value !== "object") declarativeError(label);
-  let internalValue: unknown;
-  try {
-    const internalDescriptor = Object.getOwnPropertyDescriptor(value, "_zod");
-    if (internalDescriptor === undefined || !("value" in internalDescriptor)) {
-      declarativeError(label);
-    }
-    internalValue = internalDescriptor.value;
-  } catch {
-    declarativeError(label);
-  }
-  const internal = captureOwnDataRecord(internalValue, 32, false);
-  if (internal === undefined) {
-    declarativeError(label);
-  }
-  const definition = captureSchemaDefinition(internal.get("def"), label);
-  return Object.freeze({ internal, definition });
-}
-
-function requireTrustedSchemaEmitterChain(
-  firstInternal: ReadonlyMap<string, unknown>,
-  expectedType: keyof typeof BUILTIN_SCHEMA_PROCESSOR_SOURCES,
-  label: string,
-): void {
-  const seen = new WeakSet<object>();
-  let internal = firstInternal;
-  while (true) {
-    if (
-      internal.has("toJSONSchema") ||
-      functionSource(internal.get("processJSONSchema")) !==
-        BUILTIN_SCHEMA_PROCESSOR_SOURCES[expectedType]
-    ) {
-      declarativeError(label);
-    }
-    if (!internal.has("parent")) return;
-    const parent = internal.get("parent");
-    if (parent === null || typeof parent !== "object" || seen.has(parent)) {
-      declarativeError(label);
-    }
-    seen.add(parent);
-    const captured = captureSchemaParts(parent, label);
-    if (captured.definition.get("type") !== expectedType) declarativeError(label);
-    internal = captured.internal;
-  }
-}
-
-function captureRegexSource(value: unknown, label: string): string {
-  if (!(value instanceof RegExp)) declarativeError(label);
-  try {
-    const source = Reflect.apply(
-      Object.getOwnPropertyDescriptor(RegExp.prototype, "source")!.get!,
-      value,
-      [],
-    ) as string;
-    const flags = Reflect.apply(
-      Object.getOwnPropertyDescriptor(RegExp.prototype, "flags")!.get!,
-      value,
-      [],
-    ) as string;
-    if (flags !== "") declarativeError(label);
-    return boundedSchemaString(source, label);
-  } catch {
-    return declarativeError(label);
-  }
-}
-
-function captureDeclarativeCheck(value: unknown, label: string): DeclarativeCheck {
-  const { internal, definition } = captureSchemaParts(value, label);
-  if (internal.has("toJSONSchema") || internal.has("parent")) declarativeError(label);
-  const check = definition.get("check");
-  if (check !== "number_format" && internal.has("processJSONSchema")) {
-    declarativeError(label);
-  }
-  switch (check) {
-    case "min_length": {
-      const minimum = definition.get("minimum");
-      if (
-        !hasExactKeys(definition, ["check", "minimum", "when"]) ||
-        !Number.isSafeInteger(minimum) ||
-        (minimum as number) < 0 ||
-        definition.get("when") !== BUILTIN_LENGTH_WHEN
-      ) {
-        declarativeError(label);
-      }
-      return Object.freeze({ kind: "min-length", value: minimum as number });
-    }
-    case "max_length": {
-      const maximum = definition.get("maximum");
-      if (
-        !hasExactKeys(definition, ["check", "maximum", "when"]) ||
-        !Number.isSafeInteger(maximum) ||
-        (maximum as number) < 0 ||
-        definition.get("when") !== BUILTIN_LENGTH_WHEN
-      ) {
-        declarativeError(label);
-      }
-      return Object.freeze({ kind: "max-length", value: maximum as number });
-    }
-    case "greater_than":
-    case "less_than": {
-      const numericValue = definition.get("value");
-      const inclusive = definition.get("inclusive");
-      if (
-        !hasExactKeys(definition, ["check", "value", "inclusive"]) ||
-        typeof numericValue !== "number" ||
-        rejectsLosslessJsonNumber(numericValue) ||
-        typeof inclusive !== "boolean"
-      ) {
-        declarativeError(label);
-      }
-      return Object.freeze({
-        kind: check === "greater_than" ? "greater-than" : "less-than",
-        value: numericValue,
-        inclusive,
-      });
-    }
-    case "number_format":
-      if (
-        !hasExactKeys(definition, ["type", "check", "abort", "format"]) ||
-        definition.get("type") !== "number" ||
-        definition.get("abort") !== false ||
-        definition.get("format") !== "safeint" ||
-        functionSource(internal.get("processJSONSchema")) !==
-          BUILTIN_SAFEINT_PROCESSOR_SOURCE
-      ) {
-        declarativeError(label);
-      }
-      return Object.freeze({ kind: "safeint" });
-    case "string_format":
-      if (
-        !hasExactKeys(definition, ["check", "format", "pattern"]) ||
-        definition.get("format") !== "regex"
-      ) {
-        declarativeError(label);
-      }
-      return Object.freeze({
-        kind: "regex",
-        source: captureRegexSource(definition.get("pattern"), label),
-      });
-    default:
-      return declarativeError(label);
-  }
-}
-
-function captureDeclarativeSchema(value: unknown, label: string): DeclarativeSchema {
-  const active = new WeakSet<object>();
-  let nodeCount = 0;
-  const visit = (schema: unknown): DeclarativeSchema => {
-    if (schema === null || typeof schema !== "object" || active.has(schema)) {
-      return declarativeError(label);
-    }
-    nodeCount += 1;
-    if (nodeCount > 256) return declarativeError(label);
-    active.add(schema);
-    try {
-      const { internal, definition } = captureSchemaParts(schema, label);
-      const type = definition.get("type");
-      if (typeof type !== "string" || !(type in BUILTIN_SCHEMA_PROCESSOR_SOURCES)) {
-        return declarativeError(label);
-      }
-      requireTrustedSchemaEmitterChain(
-        internal,
-        type as keyof typeof BUILTIN_SCHEMA_PROCESSOR_SOURCES,
-        label,
-      );
-      const checks = (allowed: readonly DeclarativeCheck["kind"][]): readonly DeclarativeCheck[] => {
-        if (!definition.has("checks")) return Object.freeze([]);
-        const captured = captureOwnDataArray(definition.get("checks"), 64);
-        if (captured === undefined) return declarativeError(label);
-        const result = captured.map((entry) => captureDeclarativeCheck(entry, label));
-        if (result.some((entry) => !allowed.includes(entry.kind))) {
-          return declarativeError(label);
-        }
-        return Object.freeze(result);
-      };
-      switch (type) {
-        case "string":
-          if (!hasExactKeys(definition, definition.has("checks") ? ["type", "checks"] : ["type"])) {
-            return declarativeError(label);
-          }
-          return Object.freeze({
-            type,
-            checks: checks(["min-length", "max-length", "regex"]),
-          });
-        case "number":
-          if (!hasExactKeys(definition, definition.has("checks") ? ["type", "checks"] : ["type"])) {
-            return declarativeError(label);
-          }
-          return Object.freeze({
-            type,
-            checks: checks(["greater-than", "less-than", "safeint"]),
-          });
-        case "boolean":
-        case "never":
-          if (!hasExactKeys(definition, ["type"])) return declarativeError(label);
-          return Object.freeze({ type });
-        case "literal": {
-          if (!hasExactKeys(definition, ["type", "values"])) return declarativeError(label);
-          const values = captureOwnDataArray(definition.get("values"), 64);
-          if (
-            values === undefined ||
-            values.length < 1 ||
-            values.some(
-              (entry) =>
-                (entry !== null &&
-                  typeof entry !== "string" &&
-                  typeof entry !== "number" &&
-                  typeof entry !== "boolean") ||
-                rejectsLosslessJsonNumber(entry),
-            )
-          ) {
-            return declarativeError(label);
-          }
-          return Object.freeze({
-            type,
-            values: Object.freeze(
-              values.map((entry) =>
-                typeof entry === "string" ? boundedSchemaString(entry, label) : entry,
-              ) as DeclarativeLiteral[],
-            ),
-          });
-        }
-        case "enum": {
-          if (!hasExactKeys(definition, ["type", "entries"])) return declarativeError(label);
-          const entries = captureOwnDataRecord(definition.get("entries"), 256);
-          if (entries === undefined || entries.size < 1) return declarativeError(label);
-          const capturedEntries: Array<readonly [string, string | number]> = [];
-          for (const [key, entry] of entries) {
-            if (
-              (typeof entry !== "string" && typeof entry !== "number") ||
-              rejectsLosslessJsonNumber(entry)
-            ) {
-              return declarativeError(label);
-            }
-            capturedEntries.push(
-              Object.freeze([
-                boundedSchemaString(key, label),
-                typeof entry === "string" ? boundedSchemaString(entry, label) : entry,
-              ] as const),
-            );
-          }
-          return Object.freeze({ type, entries: Object.freeze(capturedEntries) });
-        }
-        case "optional":
-          if (!hasExactKeys(definition, ["type", "innerType"])) return declarativeError(label);
-          return Object.freeze({ type, innerType: visit(definition.get("innerType")) });
-        case "union": {
-          if (!hasExactKeys(definition, ["type", "options"])) return declarativeError(label);
-          const options = captureOwnDataArray(definition.get("options"), 64);
-          if (options === undefined || options.length < 1) return declarativeError(label);
-          return Object.freeze({ type, options: Object.freeze(options.map(visit)) });
-        }
-        case "array":
-          if (!hasExactKeys(
-            definition,
-            definition.has("checks") ? ["type", "element", "checks"] : ["type", "element"],
-          )) {
-            return declarativeError(label);
-          }
-          return Object.freeze({
-            type,
-            element: visit(definition.get("element")),
-            checks: checks(["min-length", "max-length"]),
-          });
-        case "object": {
-          if (!hasExactKeys(definition, ["type", "shape", "catchall"])) {
-            return declarativeError(label);
-          }
-          const catchall = visit(definition.get("catchall"));
-          if (catchall.type !== "never") return declarativeError(label);
-          const shape = captureOwnDataRecord(definition.get("shape"), 256);
-          if (shape === undefined) return declarativeError(label);
-          const capturedShape = [...shape].map(([key, child]) =>
-            Object.freeze([boundedSchemaString(key, label), visit(child)] as const),
-          );
-          return Object.freeze({ type, shape: Object.freeze(capturedShape) });
-        }
-        default:
-          return declarativeError(label);
-      }
-    } finally {
-      active.delete(schema);
-    }
+    const captured = captureOwnDataRecord(entry);
+    if (captured === undefined) return declarativeError();
+    return Object.freeze(Object.fromEntries([...captured].map(([key, child]) => [
+      visit(key, depth + 1) as string, visit(child, depth + 1),
+    ])));
   };
-  return visit(value);
+  return visit(value, 0);
 }
 
-function buildDeclarativeSchema(schema: DeclarativeSchema): z.ZodType<unknown> {
-  switch (schema.type) {
-    case "string": {
-      let built = z.string();
-      for (const check of schema.checks) {
-        if (check.kind === "min-length") built = built.min(check.value);
-        else if (check.kind === "max-length") built = built.max(check.value);
-        else if (check.kind === "regex") built = built.regex(new RegExp(check.source));
-      }
-      return built;
+function validateSchemaJson(value: unknown): void {
+  if (value === false) return;
+  if (value === null || typeof value !== "object" || Array.isArray(value)) declarativeError();
+  const schema = value as Record<string, unknown>;
+  const common = ["$schema", "type", "const", "enum"];
+  const keywords: Record<string, readonly string[]> = {
+    string: ["minLength", "maxLength", "pattern"],
+    number: ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"],
+    integer: ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"],
+    boolean: [], null: [],
+    object: ["properties", "required", "additionalProperties"],
+    array: ["items", "minItems", "maxItems"],
+  };
+  if (Object.hasOwn(schema, "$schema") && schema.$schema !== "https://json-schema.org/draft/2020-12/schema") declarativeError();
+  if (Object.hasOwn(schema, "anyOf")) {
+    if (Object.keys(schema).some((key) => key !== "$schema" && key !== "anyOf")) declarativeError();
+    if (!Array.isArray(schema.anyOf) || schema.anyOf.length < 2 || schema.anyOf.length > 64) declarativeError();
+    schema.anyOf.forEach(validateSchemaJson);
+    return;
+  }
+  if (typeof schema.type !== "string" || !Object.hasOwn(keywords, schema.type)) declarativeError();
+  const allowed = [...common, ...keywords[schema.type]!];
+  if (Object.keys(schema).some((key) => !allowed.includes(key))) declarativeError();
+  // Zod's JSON importer treats literals as terminal nodes. Do not advertise
+  // sibling constraints that such a validator would silently ignore.
+  if (Object.hasOwn(schema, "const") || Object.hasOwn(schema, "enum")) {
+    const literalKey = Object.hasOwn(schema, "const") ? "const" : "enum";
+    if (Object.keys(schema).some((key) => !["$schema", "type", literalKey].includes(key))) declarativeError();
+  }
+  const literalMatches = (literal: unknown): boolean => {
+    if (schema.type === "null") return literal === null;
+    if (schema.type === "integer") return Number.isSafeInteger(literal);
+    return ["string", "number", "boolean"].includes(schema.type as string) && typeof literal === schema.type;
+  };
+  if (Object.hasOwn(schema, "const") && !literalMatches(schema.const)) declarativeError();
+  if (Object.hasOwn(schema, "enum") && (!Array.isArray(schema.enum) || schema.enum.length < 1 || schema.enum.length > 64 || !schema.enum.every(literalMatches))) declarativeError();
+  for (const key of ["minLength", "maxLength", "minItems", "maxItems"]) {
+    if (Object.hasOwn(schema, key) && (!Number.isSafeInteger(schema[key]) || (schema[key] as number) < 0)) declarativeError();
+  }
+  for (const key of ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"]) {
+    if (Object.hasOwn(schema, key) && typeof schema[key] !== "number") declarativeError();
+  }
+  if (Object.hasOwn(schema, "pattern")) {
+    if (typeof schema.pattern !== "string") declarativeError();
+    try { new RegExp(schema.pattern); } catch { declarativeError(); }
+  }
+  if (schema.type === "array") validateSchemaJson(schema.items);
+  if (schema.type === "object") {
+    if (schema.additionalProperties !== false || schema.properties === null || typeof schema.properties !== "object" || Array.isArray(schema.properties)) declarativeError();
+    const properties = schema.properties as Record<string, unknown>;
+    Object.values(properties).forEach(validateSchemaJson);
+    if (Object.hasOwn(schema, "required")) {
+      if (!Array.isArray(schema.required) || new Set(schema.required).size !== schema.required.length || schema.required.some((key) => typeof key !== "string" || !Object.hasOwn(properties, key))) declarativeError();
     }
-    case "number": {
-      let built = z.number();
-      for (const check of schema.checks) {
-        if (check.kind === "greater-than") {
-          built = check.inclusive ? built.gte(check.value) : built.gt(check.value);
-        } else if (check.kind === "less-than") {
-          built = check.inclusive ? built.lte(check.value) : built.lt(check.value);
-        } else if (check.kind === "safeint") {
-          built = built.int();
-        }
-      }
-      return built;
-    }
-    case "boolean":
-      return z.boolean();
-    case "never":
-      return z.never();
-    case "literal":
-      return z.literal(
-        schema.values as readonly [DeclarativeLiteral, ...DeclarativeLiteral[]],
-      );
-    case "enum":
-      return z.enum(Object.fromEntries(schema.entries) as never);
-    case "optional":
-      return buildDeclarativeSchema(schema.innerType).optional();
-    case "union":
-      return z.union(
-        schema.options.map(buildDeclarativeSchema) as [
-          z.ZodType<unknown>,
-          ...z.ZodType<unknown>[],
-        ],
-      );
-    case "array": {
-      let built = z.array(buildDeclarativeSchema(schema.element));
-      for (const check of schema.checks) {
-        if (check.kind === "min-length") built = built.min(check.value);
-        else if (check.kind === "max-length") built = built.max(check.value);
-      }
-      return built;
-    }
-    case "object":
-      return z.object(
-        Object.fromEntries(
-          schema.shape.map(([key, child]) => [key, buildDeclarativeSchema(child)]),
-        ),
-      ).strict();
   }
 }
 
-function deepFreezeJson(value: unknown): unknown {
-  if (value === null || typeof value !== "object") return value;
-  for (const child of Object.values(value as Record<string, unknown>)) deepFreezeJson(child);
-  return Object.freeze(value);
+/** Accept only bounded, closed JSON Schema data; no callbacks, references or coercion. */
+export function defineAdapterSchema(source: unknown): AdapterSchema {
+  const jsonSchema = captureSchemaJson(source);
+  validateSchemaJson(jsonSchema);
+  if (Buffer.byteLength(JSON.stringify(jsonSchema), "utf8") > ADAPTER_MAX_SCHEMA_SNAPSHOT_BYTES) declarativeError();
+  const validator = z.fromJSONSchema(structuredClone(jsonSchema) as Parameters<typeof z.fromJSONSchema>[0]);
+  const schema: AdapterSchema = Object.freeze({
+    jsonSchema,
+    safeParse: (candidate: unknown) => {
+      const result = validator.safeParse(candidate);
+      return result.success
+        ? Object.freeze({ success: true as const, data: result.data })
+        : Object.freeze({ success: false as const });
+    },
+  });
+  definedSchemas.add(schema);
+  return schema;
 }
 
 function schemaSnapshot(value: unknown, label: string): AdapterSchema {
-  if (!(value instanceof z.ZodType)) {
-    throw new TypeError(`${label} must be a Zod schema.`);
+  if (value === null || typeof value !== "object" || !definedSchemas.has(value)) {
+    throw new TypeError(`${label} must be created with defineAdapterSchema using declarative JSON data.`);
   }
-  try {
-    const captured = captureDeclarativeSchema(value, label);
-    const trustedSchema = buildDeclarativeSchema(captured);
-    const encoded = JSON.stringify(
-      z.toJSONSchema(trustedSchema, { metadata: z.registry() }),
-    );
-    if (Buffer.byteLength(encoded, "utf8") > ADAPTER_MAX_SCHEMA_SNAPSHOT_BYTES) {
-      throw new TypeError(`${label} exceeds bounded schema limits.`);
-    }
-    const jsonSchema = deepFreezeJson(JSON.parse(encoded) as unknown);
-    const validator = z.fromJSONSchema(
-      structuredClone(jsonSchema) as Parameters<typeof z.fromJSONSchema>[0],
-    );
-    return Object.freeze({
-      jsonSchema,
-      safeParse: (candidate: unknown) => {
-        const result = validator.safeParse(candidate);
-        return result.success
-          ? Object.freeze({ success: true as const, data: result.data })
-          : Object.freeze({ success: false as const });
-      },
-    });
-  } catch (error) {
-    if (
-      error instanceof TypeError &&
-      /declarative schema subset|bounded schema limits/u.test(error.message)
-    ) {
-      throw error;
-    }
-    throw new TypeError(`${label} cannot be represented as declarative JSON Schema.`);
-  }
+  return value as AdapterSchema;
 }
 
-function schemaJson(schema: z.ZodType<unknown> | AdapterSchema): unknown {
-  if (schema instanceof z.ZodType) return z.toJSONSchema(schema);
-  if (schema.jsonSchema === undefined) {
-    throw new TypeError("Registered adapter schema has no JSON representation.");
-  }
-  return schema.jsonSchema;
+function schemaJson(schema: AdapterSchema): unknown {
+  return schemaSnapshot(schema, "schema").jsonSchema;
 }
 
 function snapshotObservation(value: unknown): AdapterObservationDefinition {

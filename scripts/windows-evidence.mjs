@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 import { spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { arch, release } from "node:os";
@@ -6,31 +5,13 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { WINDOWS_EVIDENCE_SCHEMA, sha256 } from "./release-lib.mjs";
 
+import { TEST_FILES } from "./test-suite.mjs";
+
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const SAFE_OUTPUT_NAME = /^[A-Za-z0-9._-]+$/u;
 export const TEST_INVENTORY_SCHEMA = "xiaoqie.vitest-inventory/v1";
-export const FULL_SUITE_FILES = Object.freeze([
-  "adapter-contract-v2.test.ts",
-  "bridge.test.ts",
-  "durable-audit-ledger.test.ts",
-  "hardening.test.ts",
-  "mcp.test.ts",
-  "operator.test.ts",
-  "owner-binding.test.ts",
-  "process-adapter.test.ts",
-  "release.test.ts",
-  "windows-containment.test.ts",
-]);
+export const FULL_SUITE_FILES = Object.freeze(TEST_FILES.map((name) => name.slice("tests/".length)));
 const ELEVATED_GATE_FILES = Object.freeze(["windows-containment.test.ts"]);
-const REQUIRED_FULL_CATEGORIES = Object.freeze([
-  "bridge-core",
-  "durable-audit",
-  "mcp-product-boundary",
-  "operator",
-  "process-adapter",
-  "release-engineering",
-  "windows-containment",
-]);
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -55,21 +36,7 @@ function option(name) {
 function categoryForAssertion(assertion) {
   const title = [...(assertion.ancestorTitles ?? []), assertion.title ?? ""].join(" ");
   if (/elevated Windows host gate|platform containment gate/iu.test(title)) return "inapplicable-platform-gate";
-  if (/real Windows worker containment/iu.test(title)) return "windows-containment";
-  if (/operator/iu.test(title)) return "windows-operator";
-  if (/process|MCP|stdio/iu.test(title)) return "windows-product-boundary";
-  return "platform-neutral-or-unknown";
-}
-
-function fileCategory(name) {
-  if (name === "adapter-contract-v2.test.ts" || name === "bridge.test.ts" || name === "hardening.test.ts" || name === "owner-binding.test.ts") return "bridge-core";
-  if (name === "durable-audit-ledger.test.ts") return "durable-audit";
-  if (name === "mcp.test.ts") return "mcp-product-boundary";
-  if (name === "operator.test.ts") return "operator";
-  if (name === "process-adapter.test.ts") return "process-adapter";
-  if (name === "release.test.ts") return "release-engineering";
-  if (name === "windows-containment.test.ts") return "windows-containment";
-  return undefined;
+  return "unexplained-skip";
 }
 
 export function summarizeVitest(value, suiteKind = "full") {
@@ -80,7 +47,7 @@ export function summarizeVitest(value, suiteKind = "full") {
   const fileCounts = new Map();
   let unexpectedFileCount = 0;
   for (const result of value.testResults) {
-    const rawName = typeof result?.name === "string" ? result.name.replaceAll("\\", "/").split("/").at(-1) : undefined;
+    const rawName = typeof result?.name === "string" ? result.name.replaceAll("\\", "/").split(/(?:^|\/)tests\//u).at(-1) : undefined;
     if (rawName === undefined || !expectedSet.has(rawName)) {
       unexpectedFileCount += 1;
       continue;
@@ -90,10 +57,6 @@ export function summarizeVitest(value, suiteKind = "full") {
   const presentExpectedFiles = expectedFiles.filter((name) => fileCounts.has(name));
   const missingFiles = expectedFiles.filter((name) => !fileCounts.has(name));
   const duplicateFileCount = [...fileCounts.values()].reduce((sum, count) => sum + Math.max(0, count - 1), 0);
-  const presentCategories = [...new Set(presentExpectedFiles.map(fileCategory).filter(Boolean))].sort();
-  const missingRequiredCategories = suiteKind === "full"
-    ? REQUIRED_FULL_CATEGORIES.filter((category) => !presentCategories.includes(category))
-    : [];
   const inventoryComplete = missingFiles.length === 0 && unexpectedFileCount === 0 && duplicateFileCount === 0 && value.testResults.length === expectedFiles.length;
   const assertions = value.testResults.flatMap((result) => Array.isArray(result.assertionResults) ? result.assertionResults : []);
   const counts = { total: assertions.length, passed: 0, failed: 0, skipped: 0, unknown: 0 };
@@ -119,10 +82,7 @@ export function summarizeVitest(value, suiteKind = "full") {
       missingFiles,
       unexpectedFileCount,
       duplicateFileCount,
-      requiredCategories: suiteKind === "full" ? [...REQUIRED_FULL_CATEGORIES] : ["elevated-host-gate"],
-      presentCategories,
-      missingRequiredCategories,
-      complete: inventoryComplete && missingRequiredCategories.length === 0,
+      complete: inventoryComplete,
     },
     skippedCategories: [...skippedCategories.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([category, count]) => ({ category, count })),
   };

@@ -1,3 +1,4 @@
+import { parse, stringify } from "yaml";
 import { cpSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -192,73 +193,47 @@ describe("canonical release evidence", () => {
 });
 
 describe("workflow release boundary", () => {
-  it("pins actions and keeps release writes behind the tag-only workflow", () => {
-    expect(validateWorkflowPolicy(root)).toMatchObject({ verified: true, workflows: ["check.yml", "release.yml"] });
-  });
-
-  it("rejects floating actions and ordinary-workflow write permissions", () => {
+  function workflowFixture(name: string, mutate: (workflow: any) => void): string {
     const fixture = temporaryDirectory("xiaoqie-workflow-policy-");
     cpSync(join(root, ".github"), join(fixture, ".github"), { recursive: true });
-    const checkPath = join(fixture, ".github", "workflows", "check.yml");
-    const check = readFileSync(checkPath, "utf8")
-      .replace(/actions\/checkout@[0-9a-f]{40}/u, "actions/checkout@v7")
-      .replace("permissions:\n  contents: read", "permissions:\n  contents: write");
-    writeFileSync(checkPath, check);
-    expect(() => validateWorkflowPolicy(fixture)).toThrow(/closed pinned-action|ordinary workflow/u);
-  });
+    const path = join(fixture, ".github", "workflows", name);
+    const workflow = parse(readFileSync(path, "utf8"));
+    mutate(workflow);
+    // Different indentation and quoted scalars must not affect policy decisions.
+    writeFileSync(path, stringify(workflow, { indent: 4, defaultStringType: "QUOTE_DOUBLE" }));
+    return fixture;
+  }
 
-  it("rejects PR-triggered or incomplete release paths", () => {
-    const fixture = temporaryDirectory("xiaoqie-release-policy-");
-    cpSync(join(root, ".github"), join(fixture, ".github"), { recursive: true });
-    const releasePath = join(fixture, ".github", "workflows", "release.yml");
-    const release = readFileSync(releasePath, "utf8")
-      .replace("  push:\n    tags:", "  pull_request:\n  push:\n    tags:")
-      .replace("gh attestation verify", "gh verification-disabled");
-    writeFileSync(releasePath, release);
-    expect(() => validateWorkflowPolicy(fixture)).toThrow(/PR context|attestation verification/u);
-  });
-
-  it("rejects every quoted, floating, expression, Docker, or malformed uses entry", () => {
-    const replacements = [
-      '      - uses: "actions/checkout@v7"',
-      "      - uses: 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' # v7.0.1",
-      "      - uses: ${{ matrix.action }}",
-      "      - uses: docker://alpine:latest",
-      "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-      '      - "uses": actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1',
-    ];
-    for (const replacement of replacements) {
-      const fixture = temporaryDirectory("xiaoqie-uses-policy-");
-      cpSync(join(root, ".github"), join(fixture, ".github"), { recursive: true });
-      const checkPath = join(fixture, ".github", "workflows", "check.yml");
-      const check = readFileSync(checkPath, "utf8").replace(
-        /^\s*- uses: actions\/checkout@[0-9a-f]{40} # v7\.0\.1\s*$/mu,
-        replacement,
-      );
-      writeFileSync(checkPath, check);
-      expect(() => validateWorkflowPolicy(fixture), replacement).toThrow(/closed pinned-action/u);
+  it("accepts equivalent YAML formatting while retaining release boundaries", () => {
+    expect(validateWorkflowPolicy(root).verified).toBe(true);
+    for (const name of ["check.yml", "release.yml"]) {
+      expect(validateWorkflowPolicy(workflowFixture(name, () => {})).verified).toBe(true);
     }
   });
 
-  it("enforces read-only build and a dependent lifecycle-free publish job", () => {
-    const lifecycleFixture = temporaryDirectory("xiaoqie-publish-lifecycle-");
-    cpSync(join(root, ".github"), join(lifecycleFixture, ".github"), { recursive: true });
-    const lifecyclePath = join(lifecycleFixture, ".github", "workflows", "release.yml");
-    const lifecycle = readFileSync(lifecyclePath, "utf8")
-      .replace("    needs: build", "    needs: missing")
-      .replace(/(\n  publish:[\s\S]*?\n    steps:\n)/u, "$1      - run: npm ci\n");
-    writeFileSync(lifecyclePath, lifecycle);
-    expect(() => validateWorkflowPolicy(lifecycleFixture)).toThrow(/depend on build|must not execute/u);
+  it("rejects unpinned actions and ordinary workflow write permissions", () => {
+    for (const action of ["actions/checkout@v7", "${{ matrix.action }}", "docker://alpine:latest"]) {
+      const fixture = workflowFixture("check.yml", (workflow) => { workflow.jobs["platform-neutral"].steps[0].uses = action; });
+      expect(() => validateWorkflowPolicy(fixture)).toThrow(/pinned action/u);
+    }
+    const fixture = workflowFixture("check.yml", (workflow) => { workflow.permissions.contents = "write"; });
+    expect(() => validateWorkflowPolicy(fixture)).toThrow(/read only/u);
+  });
 
-    const writeFixture = temporaryDirectory("xiaoqie-build-write-");
-    cpSync(join(root, ".github"), join(writeFixture, ".github"), { recursive: true });
-    const writePath = join(writeFixture, ".github", "workflows", "release.yml");
-    const release = readFileSync(writePath, "utf8").replace(
-      "  build:\n    if: github.ref_type == 'tag'\n    runs-on: ubuntu-latest\n    timeout-minutes: 25\n    permissions:\n      contents: read",
-      "  build:\n    if: github.ref_type == 'tag'\n    runs-on: ubuntu-latest\n    timeout-minutes: 25\n    permissions:\n      contents: write",
-    );
-    writeFileSync(writePath, release);
-    expect(() => validateWorkflowPolicy(writeFixture)).toThrow(/build job must/u);
+  it("rejects independent release permission, identity and publication-order failures", () => {
+    const changes: Array<(workflow: any) => void> = [
+      (w) => { w.on.pull_request = {}; },
+      (w) => { w.jobs.build.permissions.contents = "write"; },
+      (w) => { w.jobs.publish.needs = "missing"; },
+      (w) => { w.jobs.publish.steps.push({ run: "npm ci" }); },
+      (w) => { w.jobs.publish.permissions.actions = "write"; },
+      (w) => { w.jobs.build.steps.find((step: any) => step.env?.REF_PROTECTED).env.REF_PROTECTED = "true"; },
+      (w) => { w.jobs.publish.steps = w.jobs.publish.steps.filter((step: any) => !step.uses?.startsWith("actions/attest-build-provenance@")); },
+      (w) => { const step = w.jobs.publish.steps.find((step: any) => step.run?.includes("gh attestation verify")); step.run = step.run.replace("gh attestation verify", "gh verification-disabled"); },
+    ];
+    for (const change of changes) {
+      expect(() => validateWorkflowPolicy(workflowFixture("release.yml", change))).toThrow();
+    }
   });
 });
 
@@ -291,12 +266,12 @@ describe("Windows evidence accounting", () => {
       .toBe("unverified");
   });
 
-  it("rejects missing categories and duplicate test-file results", () => {
+  it("rejects missing test files and duplicate test-file results", () => {
     const missing = summarizeVitest({
       testResults: [{ name: "bridge.test.ts", assertionResults: [{ title: "passes", status: "passed" }] }],
     }, "full");
     expect(missing.inventory.complete).toBe(false);
-    expect(missing.inventory.missingRequiredCategories).toContain("windows-containment");
+    expect(missing.inventory.missingFiles).toContain("windows-containment.test.ts");
 
     const duplicate = summarizeVitest({
       testResults: [
@@ -307,7 +282,7 @@ describe("Windows evidence accounting", () => {
     expect(duplicate.inventory).toMatchObject({ complete: false, duplicateFileCount: 1 });
   });
 
-  it("accepts only the exact versioned full-suite inventory for non-elevated evidence", () => {
+  it("uses the discovered suite inventory for non-elevated evidence", () => {
     const testResults = FULL_SUITE_FILES.map((name) => ({
       name,
       assertionResults: [{ ancestorTitles: [name], title: "required check", status: "passed" }],
@@ -318,7 +293,7 @@ describe("Windows evidence accounting", () => {
       status: "pending",
     });
     const full = summarizeVitest({ testResults }, "full");
-    expect(full.inventory).toMatchObject({ complete: true, missingFiles: [], missingRequiredCategories: [] });
+    expect(full.inventory).toMatchObject({ complete: true, missingFiles: [] });
     expect(evidenceStatusFor({ platform: "win32", elevated: false, clean: true, vitest: full, containmentVerified: true }))
       .toBe("verified-with-explicit-inapplicable-skips");
     expect(evidenceStatusFor({ platform: "win32", elevated: false, clean: true, vitest: full, containmentVerified: false }))

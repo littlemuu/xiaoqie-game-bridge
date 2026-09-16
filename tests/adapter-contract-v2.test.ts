@@ -1,3 +1,4 @@
+import { defineAdapterSchema } from "../src/core/adapter.js";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import {
@@ -112,7 +113,7 @@ class ContractTestAdapter implements GameAdapter {
   ) {
     this.observation = {
       description: "Observe the test revision without external state.",
-      outputSchema: contractObservationSchema,
+      outputSchema: defineAdapterSchema(JSON.parse(JSON.stringify(z.toJSONSchema(contractObservationSchema, { metadata: z.registry() })))),
       effectKind: "read",
       concurrency: { kind: "parallel" },
       requiredCapabilities: ["game.observe"],
@@ -121,8 +122,8 @@ class ContractTestAdapter implements GameAdapter {
     this.actions = {
       write: {
         description: "Execute one bounded test write.",
-        inputSchema: contractInputSchema,
-        outputSchema: contractOutputSchema,
+        inputSchema: defineAdapterSchema(JSON.parse(JSON.stringify(z.toJSONSchema(contractInputSchema, { metadata: z.registry() })))),
+        outputSchema: defineAdapterSchema(JSON.parse(JSON.stringify(z.toJSONSchema(contractOutputSchema, { metadata: z.registry() })))),
         effectKind: "write",
         dryRunSemantics: "exact",
         requiredCapabilities: ["game.act.write"],
@@ -183,8 +184,8 @@ class CommitSignalPreviewAdapter extends ContractTestAdapter {
     super(behavior);
     (this.actions as Record<string, AdapterActionDefinition>).preview = {
       description: "Preview without accepting a commit signal.",
-      inputSchema: contractInputSchema,
-      outputSchema: contractOutputSchema,
+      inputSchema: defineAdapterSchema(JSON.parse(JSON.stringify(z.toJSONSchema(contractInputSchema, { metadata: z.registry() })))),
+      outputSchema: defineAdapterSchema(JSON.parse(JSON.stringify(z.toJSONSchema(contractOutputSchema, { metadata: z.registry() })))),
       effectKind: "preview",
       dryRunSemantics: "exact",
       requiredCapabilities: ["game.act.preview"],
@@ -210,7 +211,7 @@ class ReadOnlySerialAdapter implements GameAdapter {
   readonly displayName = "Pure read-only serial adapter";
   readonly observation: AdapterObservationDefinition = {
     description: "Observe one read-only value.",
-    outputSchema: z.object({ value: z.number().int() }).strict(),
+    outputSchema: defineAdapterSchema(JSON.parse(JSON.stringify(z.toJSONSchema(z.object({ value: z.number().int() }).strict(), { metadata: z.registry() })))),
     effectKind: "read",
     concurrency: { kind: "serial" },
     requiredCapabilities: ["game.observe"],
@@ -410,7 +411,7 @@ describe("Adapter Contract v2", () => {
       .strict();
     (adapter.actions as Record<string, AdapterActionDefinition>).write = {
       ...adapter.actions.write!,
-      inputSchema: sourceInputSchema,
+      inputSchema: defineAdapterSchema(JSON.parse(JSON.stringify(z.toJSONSchema(sourceInputSchema, { metadata: z.registry() })))),
     };
     const registry = new AdapterRegistry();
     registry.register(adapter);
@@ -419,7 +420,7 @@ describe("Adapter Contract v2", () => {
     (mutableAction.requiredCapabilities as string[]).push("game.act.injected");
     (adapter.actions as Record<string, AdapterActionDefinition>).write = {
       ...mutableAction,
-      inputSchema: z.unknown(),
+      inputSchema: defineAdapterSchema({ type: "boolean" }),
       requiredCapabilities: ["game.act.injected"],
     };
     (sourceInputSchema._def.shape as unknown as Record<string, z.ZodType>).nested =
@@ -477,34 +478,14 @@ describe("Adapter Contract v2", () => {
         .actions.move!.inputSchema.safeParse({ dx: 0, dy: 0, dz: 0 }).success,
     ).toBe(false);
 
-    const invalid = new ContractTestAdapter();
-    (invalid.actions as Record<string, AdapterActionDefinition>).write = {
-      ...invalid.actions.write!,
-      inputSchema: z.string().transform((value) => value.length),
-    };
-    expect(() => new AdapterRegistry().register(invalid)).toThrow(/declarative/u);
-
-    let refinementAllows = false;
-    const closureBacked = new ContractTestAdapter();
-    (closureBacked.actions as Record<string, AdapterActionDefinition>).write = {
-      ...closureBacked.actions.write!,
-      inputSchema: z.object({ value: z.string() }).refine(() => refinementAllows),
-    };
-    expect(() => new AdapterRegistry().register(closureBacked)).toThrow(/declarative/u);
-    refinementAllows = true;
-
-    for (const codeBearingSchema of [
-      z.string().trim().min(1),
-      z.string().overwrite((value) => value.trim()),
-      z.coerce.number(),
-      z.string().min(1, { when: () => true } as never),
-    ]) {
-      const codeBearing = new ContractTestAdapter();
-      (codeBearing.actions as Record<string, AdapterActionDefinition>).write = {
-        ...codeBearing.actions.write!,
-        inputSchema: codeBearingSchema,
+    for (const invalidSchema of [z.string(), z.string().transform((value) => value.length), {
+      jsonSchema: { type: "boolean" }, safeParse: () => ({ success: true, data: true }),
+    }]) {
+      const invalid = new ContractTestAdapter();
+      (invalid.actions as Record<string, AdapterActionDefinition>).write = {
+        ...invalid.actions.write!, inputSchema: invalidSchema as never,
       };
-      expect(() => new AdapterRegistry().register(codeBearing)).toThrow(/declarative/u);
+      expect(() => new AdapterRegistry().register(invalid)).toThrow(/defineAdapterSchema/u);
     }
 
     const publicObservation = new ContractTestAdapter();
@@ -597,7 +578,7 @@ describe("Adapter Contract v2", () => {
       displayName: "a",
       observation: {
         description: "o",
-        outputSchema: z.boolean(),
+        outputSchema: defineAdapterSchema({ type: "boolean" }),
         effectKind: "read",
         concurrency: { kind: "parallel" },
         requiredCapabilities: ["game.observe"],
@@ -612,157 +593,61 @@ describe("Adapter Contract v2", () => {
     expect(registry.list()).toHaveLength(64);
   });
 
-  it("isolates JSON snapshots from metadata and rejects custom or lossy emitters", () => {
-    const defaultSchema = z.string().meta({ default: "injected" });
-    const defaultAdapter = new ContractTestAdapter();
-    (defaultAdapter.actions as Record<string, AdapterActionDefinition>).write = {
-      ...defaultAdapter.actions.write!,
-      inputSchema: defaultSchema,
-    };
-    const defaultRegistry = new AdapterRegistry();
-    defaultRegistry.register(defaultAdapter);
-    const defaultSnapshot = defaultRegistry.get(defaultAdapter.id)!.actions.write!.inputSchema;
-    expect(defaultSchema.safeParse(undefined).success).toBe(false);
-    expect(defaultSnapshot.safeParse(undefined).success).toBe(false);
-    expect((defaultSnapshot as { jsonSchema?: unknown }).jsonSchema).not.toHaveProperty("default");
+  it("captures immutable JSON data without executing accessors or accepting schema extensions", () => {
+    const source = { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false };
+    const schema = defineAdapterSchema(source);
+    source.properties.value.type = "number";
+    source.required.length = 0;
+    expect(schema.safeParse({ value: "x" }).success).toBe(true);
+    expect(schema.safeParse({ value: 1 }).success).toBe(false);
+    expect(schema.safeParse({}).success).toBe(false);
+    expect(schema.safeParse({ value: "x", extra: true }).success).toBe(false);
+    let reads = 0;
+    expect(() => defineAdapterSchema({ get type() { reads++; return "string"; } })).toThrow(/declarative/u);
+    expect(reads).toBe(0);
+    for (const source of [
+      { type: "string", default: "injected" }, { type: "string", const: "x", minLength: 2 }, { $ref: "https://example.invalid/schema" },
+      { type: "string", transform: () => "x" }, { type: "object", properties: {}, additionalProperties: true },
+      { type: "string", enum: new Array(1) }, { type: "integer", minimum: "0" },
+      { type: "string", pattern: "[" }, { type: "string", minLength: -1 },
+      { type: "object", properties: {}, required: ["missing"], additionalProperties: false },
+      ...[NaN, Infinity, -Infinity, -0].map((value) => ({ type: "number", const: value })),
+    ]) expect(() => defineAdapterSchema(source)).toThrow(/declarative/u);
+    const cycle: Record<string, unknown> = { type: "array" };
+    cycle.items = cycle;
+    expect(() => defineAdapterSchema(cycle)).toThrow(/declarative/u);
+    expect(() => defineAdapterSchema(new Proxy({}, { ownKeys() { throw new Error("private"); } }))).toThrow(/declarative/u);
+  });
 
-    const keywordSchema = z.string().meta({ type: "number", minLength: 100 });
-    const keywordAdapter = new ContractTestAdapter();
-    (keywordAdapter.actions as Record<string, AdapterActionDefinition>).write = {
-      ...keywordAdapter.actions.write!,
-      inputSchema: keywordSchema,
-    };
-    const keywordRegistry = new AdapterRegistry();
-    keywordRegistry.register(keywordAdapter);
-    const keywordSnapshot = keywordRegistry.get(keywordAdapter.id)!.actions.write!.inputSchema;
-    expect(keywordSchema.safeParse("x").success).toBe(true);
-    expect(keywordSnapshot.safeParse("x").success).toBe(true);
-    expect(keywordSnapshot.safeParse(1).success).toBe(false);
-    expect((keywordSnapshot as { jsonSchema?: unknown }).jsonSchema).toMatchObject({
-      type: "string",
+  it("enforces scalar, snapshot and depth limits before compiling schema data", () => {
+    for (const source of [
+      { type: "string", const: "x".repeat(1_025) },
+      { type: "string", pattern: "x".repeat(1_025) },
+      { type: "object", properties: { ["x".repeat(1_025)]: { type: "string" } }, additionalProperties: false },
+      { type: "string", enum: Array.from({ length: 32 }, (_, index) => `${index}${"x".repeat(1_000)}`) },
+    ]) expect(() => defineAdapterSchema(source)).toThrow(/bounded/u);
+    let deep: unknown = { type: "boolean" };
+    for (let i = 0; i < 33; i++) deep = { type: "array", items: deep };
+    expect(() => defineAdapterSchema(deep)).toThrow(/bounded/u);
+  });
+
+  it("keeps declared JSON constraints and validator decisions aligned", () => {
+    const schema = defineAdapterSchema({
+      type: "object", additionalProperties: false, required: ["count", "values"],
+      properties: {
+        count: { type: "integer", minimum: 0, maximum: 2 },
+        values: { type: "array", minItems: 1, maxItems: 2, items: { type: "string", minLength: 1, maxLength: 3, pattern: "^[a-z]+$" } },
+        optional: { anyOf: [{ type: "boolean", const: true }, { type: "null" }] },
+      },
     });
-
-    const emitterSchema = z.string();
-    (emitterSchema as unknown as {
-      _zod: { toJSONSchema?: () => unknown };
-    })._zod.toJSONSchema = () => ({ type: "number" });
-    const emitterAdapter = new ContractTestAdapter();
-    (emitterAdapter.actions as Record<string, AdapterActionDefinition>).write = {
-      ...emitterAdapter.actions.write!,
-      inputSchema: emitterSchema,
-    };
-    expect(() => new AdapterRegistry().register(emitterAdapter)).toThrow(/declarative/u);
-
-    const processEmitterSchema = z.string();
-    (processEmitterSchema as unknown as {
-      _zod: {
-        processJSONSchema: (_context: unknown, json: Record<string, unknown>) => void;
-      };
-    })._zod.processJSONSchema = (_context, json) => {
-      json.type = "number";
-    };
-    const processEmitterAdapter = new ContractTestAdapter();
-    (processEmitterAdapter.actions as Record<string, AdapterActionDefinition>).write = {
-      ...processEmitterAdapter.actions.write!,
-      inputSchema: processEmitterSchema,
-    };
-    expect(() => new AdapterRegistry().register(processEmitterAdapter)).toThrow(/declarative/u);
-
-    const parentSchema = z.string();
-    const childSchema = parentSchema.meta({ description: "child" });
-    (parentSchema as unknown as {
-      _zod: {
-        processJSONSchema: (_context: unknown, json: Record<string, unknown>) => void;
-      };
-    })._zod.processJSONSchema = (_context, json) => {
-      json.type = "number";
-    };
-    const parentEmitterAdapter = new ContractTestAdapter();
-    (parentEmitterAdapter.actions as Record<string, AdapterActionDefinition>).write = {
-      ...parentEmitterAdapter.actions.write!,
-      inputSchema: childSchema,
-    };
-    expect(() => new AdapterRegistry().register(parentEmitterAdapter)).toThrow(/declarative/u);
-
-    const statefulShapeSchema = z.object({ value: z.string() }).strict();
-    let shapeReads = 0;
-    Object.defineProperty(
-      (statefulShapeSchema as unknown as { _zod: { def: object } })._zod.def,
-      "shape",
-      {
-        enumerable: true,
-        configurable: true,
-        get: () => {
-          shapeReads += 1;
-          return shapeReads === 1 ? { value: z.string() } : { value: z.number() };
-        },
-      },
-    );
-    const statefulShapeAdapter = new ContractTestAdapter();
-    (statefulShapeAdapter.actions as Record<string, AdapterActionDefinition>).write = {
-      ...statefulShapeAdapter.actions.write!,
-      inputSchema: statefulShapeSchema,
-    };
-    expect(() => new AdapterRegistry().register(statefulShapeAdapter)).toThrow(/declarative/u);
-    expect(shapeReads).toBe(0);
-
-    for (const value of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, -0]) {
-      const literalAdapter = new ContractTestAdapter();
-      (literalAdapter.actions as Record<string, AdapterActionDefinition>).write = {
-        ...literalAdapter.actions.write!,
-        inputSchema: z.literal(value),
-      };
-      expect(() => new AdapterRegistry().register(literalAdapter)).toThrow(/declarative/u);
-
-      const enumAdapter = new ContractTestAdapter();
-      (enumAdapter.actions as Record<string, AdapterActionDefinition>).write = {
-        ...enumAdapter.actions.write!,
-        inputSchema: z.enum({ INVALID: value }),
-      };
-      expect(() => new AdapterRegistry().register(enumAdapter)).toThrow(/declarative/u);
-    }
-  });
-
-  it("bounds schema scalar payloads during registration", () => {
-    const oversized = "x".repeat(1_025);
-    for (const schema of [
-      z.literal(oversized),
-      z.object({ [oversized]: z.string() }).strict(),
-      z.string().regex(new RegExp(oversized)),
-    ]) {
-      const adapter = new ContractTestAdapter();
-      (adapter.actions as Record<string, AdapterActionDefinition>).write = {
-        ...adapter.actions.write!,
-        inputSchema: schema,
-      };
-      expect(() => new AdapterRegistry().register(adapter)).toThrow(/declarative|bounded/u);
-    }
-  });
-
-  it("fails closed when a declarative schema graph proxy cannot be captured", () => {
-    const proxiedShapeSchema = z.object({ value: z.string() }).strict();
-    Object.defineProperty(
-      (proxiedShapeSchema as unknown as { _zod: { def: object } })._zod.def,
-      "shape",
-      {
-        enumerable: true,
-        configurable: true,
-        value: new Proxy(
-          { value: z.string() },
-          {
-            ownKeys: () => {
-              throw new Error("stateful-shape-proxy");
-            },
-          },
-        ),
-      },
-    );
-    const adapter = new ContractTestAdapter();
-    (adapter.actions as Record<string, AdapterActionDefinition>).write = {
-      ...adapter.actions.write!,
-      inputSchema: proxiedShapeSchema,
-    };
-    expect(() => new AdapterRegistry().register(adapter)).toThrow(/declarative/u);
+    expect(schema.safeParse({ count: 2, values: ["abc"] }).success).toBe(true);
+    expect(schema.safeParse({ count: 0, values: ["a"], optional: null }).success).toBe(true);
+    for (const candidate of [
+      { count: 0.5, values: ["a"] }, { count: 3, values: ["a"] }, { count: -1, values: ["a"] },
+      { count: 1, values: [] }, { count: 1, values: ["a", "b", "c"] },
+      { count: 1, values: [""] }, { count: 1, values: ["abcd"] }, { count: 1, values: ["A"] },
+      { count: 1, values: ["a"], optional: false },
+    ]) expect(schema.safeParse(candidate).success).toBe(false);
   });
 
   it("rejects extra string-array keys in closed manifest collections", () => {

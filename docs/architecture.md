@@ -137,21 +137,20 @@ later replacement of actions, schemas, capability arrays, or metadata cannot
 change the active permission surface. A session binds to one adapter, so a
 granted capability cannot be redirected to another adapter.
 
-Schemas are restricted by a positive allowlist of Zod nodes, checks, and exact
-definition fields that round-trip through JSON Schema. Registration first
-captures a bounded, immutable, own-data-only declarative AST; accessors, holes,
-symbol/extra keys, proxy failures, custom `_zod.toJSONSchema` or
-`_zod.processJSONSchema` emitters, non-finite/lossy numbers, and unknown nodes,
-checks or options fail closed. The one Zod built-in lazy object-shape getter is
-identified by its locked implementation and read exactly once. A trusted schema
-is rebuilt from the captured AST and emitted with a fresh empty metadata registry,
-so neither a live definition graph nor global metadata can rewrite the contract.
-Registration deep-freezes the JSON snapshot, rebuilds the active validator from
-an isolated clone, and exposes only a frozen `safeParse` wrapper. Schema scalar
-values are limited to 1 KiB UTF-8, each JSON Schema snapshot to 16 KiB, each
-adapter catalog to 24 KiB, and the 64-adapter registry catalog to 32 KiB;
-oversized literals, property names, enum values, or regular expressions fail
-during registration. The optional health member is read once during snapshot;
+Adapter schemas are constructed with `defineAdapterSchema(json)`. Its input is
+bounded JSON Schema data: strict objects, arrays, primitives, scalar const/enum,
+ranges, patterns and anyOf. Unknown keywords, references, executable values,
+accessors, sparse arrays and non-finite/lossy numbers are rejected. The factory
+captures and freezes its own data snapshot and keeps the compiled validator in
+a private closure. Registration accepts only factory-created immutable schemas;
+it never introspects Zod internals or compares function source text.
+The fixed mock authors its schema with public Zod APIs and serializes the result
+to JSON before passing it to the factory. That authoring step is trusted code,
+not a generic guarantee that arbitrary Zod semantics survive JSON conversion.
+Schema scalars are limited to 1 KiB UTF-8, snapshots to 16 KiB, catalogs to
+24 KiB per adapter and 32 KiB per registry, with at most 64 adapters.
+Data capture also bounds traversal to 2,048 nodes and depth 32.
+The optional health member is read once during snapshot;
 only an actually absent member defaults to ready, while defined non-functions,
 promises/thenables, or throwing accessors reject registration.
 
