@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   AdapterExecutionError,
   AdapterRuntimeError,
@@ -1139,6 +1139,8 @@ export class GameBridge {
           decision.parsedInput,
           request.mode,
           {
+            requestKey: createHash("sha256").update(`${session.ownerKey}\u0000${request.requestId}`).digest("hex"),
+            canDispatch: () => !this.#safety.isStopped() && this.#runtimeHealth === "ready",
             ...(parsed.data.expectedRevision === undefined
               ? {}
               : { expectedRevision: parsed.data.expectedRevision }),
@@ -1198,7 +1200,11 @@ export class GameBridge {
             request,
             "OUTCOME_UNKNOWN",
             "The action was dispatched but its outcome could not be confirmed.",
-            { operationPhase: "outcome-unknown" },
+            {
+              operationPhase: "outcome-unknown",
+              ...(error instanceof AdapterRuntimeError && z.string().uuid().safeParse(error.operationId).success
+                ? { operationId: error.operationId! } : {}),
+            },
           );
         }
         return errorResponse(
@@ -1315,6 +1321,11 @@ export class GameBridge {
             { operationPhase: "pre-dispatch" },
           );
         }
+      }
+      // Revision lookup is asynchronous: stop/quiesce may have happened while it ran.
+      if (this.#safety.isStopped() || this.#runtimeHealth !== "ready") {
+        return errorResponse(request, this.#safety.isStopped() ? "SAFETY_STOPPED" : "RUNTIME_UNAVAILABLE",
+          "Writes were disabled during action preparation.", { operationPhase: "pre-dispatch" });
       }
       const budgetReservation = reserveSessionActionBudget(
         session,

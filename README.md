@@ -1,95 +1,92 @@
 # xiaoqie-game-bridge
 
-`xiaoqie-game-bridge` 是一套 **offline-first、default-deny、本地优先** 的游戏能力桥接基础设施。长期目标是让云端主脑通过范围明确、随时可停、可审计的本地 adapter 操作游戏，而不是获得通用电脑控制权。
+让 AI 通过范围明确、随时可停的本地能力操作游戏。核心负责权限、session、版本检查、动作预算和急停；模型拿不到任意命令或电脑控制权。
 
-**当前版本：** `0.1.0-rc.1`  
-**当前状态：** mock-only release candidate  
-**当前产品路径：** Windows 非提权本地进程  
-**当前真实游戏支持：** 无
+**目前已实现 Minecraft Java 的第一个最小玩法：观察展示台 → 预览颜色 → 确认改变一块方块 → 验证结果。真实 Minecraft 验收尚待运行，当前不能标记为已验收可用版。**
 
-> 当前 RC 只运行一个确定性的内存 mock world。它不会启动、检查或控制 Minecraft、Steam、Stardew Valley、SMAPI、launcher、账号、存档、桌面或其他真实应用。
+| 路径 | 当前能力 | 验证边界 |
+| --- | --- | --- |
+| Minecraft 展示台 | 真实 RCON adapter、游戏数据包、本地 CLI / stdio MCP、持久动作记录及恢复 | 工程回归已通过；真实游戏与 Windows 新入口待验收 |
+| 原 mock RC | Windows worker、本地 operator、持久安全审计、原模拟世界 | 保留既有平台与历史验收边界 |
 
-## 当前定位
+当前 npm 元数据仍为 `0.1.0-rc.1`，仅沿用原 mock RC 发布基线；本次是未发布的源码增量，没有创建新版本 tag、Release 或扩大原 RC 的支持声明。
 
-项目已经建立的安全基线包括：
+## 开始试玩 Minecraft
 
-- 严格、版本化、closed-world 的 bridge 请求与响应协议；
-- memory-only、adapter-bound、caller-owned 的 session；
-- capability、policy、dry-run、幂等缓存和有界并发写入；
-- Adapter Contract v2：严格输入/输出 schema、效果类型、dry-run 语义、结果上限、错误集合与 revision 要求；
-- 可信本地 grant profile、固定 tiny-world scope、session/action 预算与资源级单写调度；
-- runtime / adapter / audit / safety 的 closed-world 健康状态与显式 `OUTCOME_UNKNOWN`；
-- 模型可触发、但不能自行解除的全局 safety latch；
-- 独立于 MCP 的本地 Windows named-pipe operator；
-- 固定目录、追加式、有界、可恢复的本地安全审计账本；
-- 固定 mock worker、严格 IPC、Windows Restricted Token + Job Object；
-- client-spawned local stdio MCP，且只注册一个 `game_bridge_request` tool；
-- 可复现的 `v0.1.0-rc.1` bundle、checksum、SBOM、manifest 与发布来源证据。
+需要 Node.js **22.18+（22.x）**、Java **17**；游戏客户端和服务器均固定为 **Java Edition 1.20.4**。不适用于基岩版、Switch、Realms 或普通“对局域网开放”的单人世界。
 
-这些能力构成安全地基，但不代表项目已经适合真实游戏。当前路线已经调整：**冻结发布、审计和 Windows containment 的继续扩张，优先修正 adapter 领域契约、可信授权、状态一致性、动作结果对账和运行恢复。**
+在仓库根目录执行：
 
-完整路线见 [`docs/ROADMAP.md`](docs/ROADMAP.md)。[Issue #19：Adapter Contract v2、可信授权与运行健康基础](https://github.com/littlemuu/xiaoqie-game-bridge/issues/19) 已由 PR #21 合并。下一阶段是独立的 operation journal / reconciliation 工单。
-
-## 当前不提供的能力
-
-项目目前明确不提供：
-
-- 任意 shell、PowerShell、通用进程执行或动态 executable/argv；
-- 任意文件系统、整盘读取、通用网络、键盘、鼠标或桌面自动化；
-- HTTP、WebSocket、SSE、TCP、relay、tunnel 或公网 endpoint；
-- OAuth、pairing、远程认证、账号系统或持久 session；
-- 真实游戏 API、mod、存档读写、launcher 控制或购买内容访问；
-- hostile-code sandbox、完整文件/网络隔离或 hostile same-user 防护；
-- 已开始动作的强制取消、回滚或跨进程 exactly-once 保证。
-
-## 架构概览
-
-```text
-本地 MCP client（拥有并拉起一个 child process）
-                     |
-                     | stdin/stdout 上的本地 MCP
-                     v
-           stdio 边界：一个 tool
-         128 KiB frame / 32 KiB envelope
-                     |
-                     | 固定 local context
-                     v
-                GameBridge core
- protocol | session | owner | policy | capability
- idempotency | safety | audit
-                     |
-                     | 严格、有界、版本化 adapter IPC
-                     v
-          ProcessMockAdapter
-                     |
-                     v
-  固定 Win32 launcher -> Restricted Token + Job
-                     |
-                     v
-           确定性内存 mock worker
-
-独立的本地 operator CLI
-                     |
-                     | authenticated Windows named pipe
-                     v
-       同一个 bridge / safety latch / audit sink
+```bash
+npm ci
+npm run build
+npm run minecraft -- init
+npm run minecraft -- download-server
 ```
 
-核心仍然是唯一裁决点。transport 负责确立 caller context；core 负责 session owner、policy、capability、幂等、safety 和 audit；adapter 只执行已经被批准的窄动作。
+`init` 只创建新的 `.minecraft-playtest` 测试目录、随机连接凭据和数据包；目录已存在就拒绝覆盖。`download-server` 只下载并校验官方固定版本 jar。接着阅读 [Minecraft EULA](https://www.minecraft.net/en-us/eula)，自行在测试目录的 `eula.txt` 中确认接受。程序不会代为接受。
 
-## 五分钟验证
+第一个终端：
 
-### 环境要求
+```bash
+npm run minecraft -- server
+```
 
-- Node.js 22
-- npm 10 或更新版本
-- Windows 产品路径需要以下任一原生工具链：
-  - MSVC Build Tools + Windows SDK；或
-  - MinGW-w64 `g++`
+看到服务器启动完成后稍等展示台初始化。第二个终端：
 
-仓库只提交窄 Win32 helper 的源码。构建时从源码编译，不提交或运行时下载 EXE/DLL。
+```bash
+npm run minecraft -- play
+```
 
-### 验证命令
+进入交互终端后，依次输入：
+
+```text
+observe
+resume
+preview lime
+commit
+observe
+```
+
+在 Minecraft Java 1.20.4 客户端中连接 `127.0.0.1:25565`，可以看到 `(0,81,0)` 的展示台方块改变颜色。初次生成会建立一块 7×7 地台并设置测试出生点；后续 bridge 动作只修改中央的一块方块。颜色可选 `lime`、`gold`、`blue`。`stop` 关闭写入，`quit` 退出；等待动作时按 Ctrl+C 立即关闸并开始退出。
+
+完整设置、MCP 调用例子、对账、故障处理和权限说明见 [Minecraft 试玩指南](docs/minecraft-playtest.md)。
+
+## 真机验收
+
+在上述专用游戏服务运行时执行：
+
+```bash
+npm run minecraft -- verify
+```
+
+这条命令会修改测试展示台，并验证真实观察、预览、写入、重复请求、旧版本拒绝、响应丢失、bridge 重启对账及重启后的写入锁定。成功时输出各项验收结果，最终方块为蓝色。
+
+普通 `npm test` 使用协议夹具，不会下载或启动游戏；它的通过不能替代这条真机验收，也不能替代游戏服务器强制崩溃/磁盘故障测试。
+
+## 接给本地 MCP 客户端
+
+构建后使用固定入口：
+
+```text
+node /你的仓库/dist/src/mcp/minecraft-stdio.js
+```
+
+默认锁住写入，只能观察/预览。用户在本地客户端配置中显式增加 `--allow-writes` 才启用本次进程的写权限。不要把此参数作为工具输入。Windows 还可使用现有 `npm run operator -- status|stop` 和带 generation 的本地 resume；Linux 首版没有独立 operator IPC，stop 后需本地重启再启用。
+
+MCP 仍只有一个 `game_bridge_request` 工具，目录由 `bridge.describe` 返回。没有模型可调用的 resume、任意 RCON 命令、文件、shell 或地址参数。本次未配置云端 Tunnel/host 连接。
+
+## 当前边界
+
+- 一个专用本地世界、一个固定方块动作；每个 session 最多 16 次写动作，15 分钟有效。
+- 动作前先用 SQLite FULL 提交 intent；游戏端维护单调操作序号和版本，写后确认 `save-all flush`、回执及实际方块。
+- dispatch 后丢失确认返回 `OUTCOME_UNKNOWN` 与内部 `operationId`；新写入暂停，不会自动重做。
+- 本地 `reconcile` 只核对/封住旧操作，不重复它的方块效果。结果落盘后重启，再人工启用写入。
+- 每个测试世界最多保留 512 条操作，不静默删除。原始请求 ID、session 和凭据不进入操作库；库保留请求摘要、内部操作 ID、颜色、版本和状态。
+- RCON 本身拥有服务端管理权限。边界来自可信 adapter 的固定命令与 loopback 配置，**不是**受限权限的 RCON 账号或 OS sandbox。仅用于新建专用测试世界。
+- 不承诺断电时 Minecraft 多个保存文件的原子性，也不承诺 hostile same-user 防护、跨世界回档恢复或跨重启 exactly-once。历史/实际方块不一致时拒绝继续写。
+
+## 开发与验证
 
 ```bash
 npm ci
@@ -100,217 +97,15 @@ npm audit
 git diff --check
 ```
 
-`npm test` 会先构建一次。普通 PR 保留核心、真实 stdio/operator、发布校验器的回归；完整发布包复现只在受保护 tag 或手动 `release-check` 工作流执行。
+`npm test` 先构建一次。新增 SQLite 使用 Node 22 的内置实验性 API，没有新增运行时 npm 依赖。原 mock 产品的 Windows native 构建要求见 [历史 mock RC 说明](docs/mock-rc.md)。
 
-需要发布证据时，在干净 checkout 中单独执行：
+`npm audit` 目前仍报告既有 Vitest 3.2.7 / @vitest/mocker 的两项中危问题（GHSA-82fw-gwwq-j7x9）；没有屏蔽审计，也未在游戏功能 PR 中混入测试框架大版本升级。
 
-```bash
-npm run release:workflow-policy
-npm run release:reproducible
-npm run release:verify
-```
+## 文档
 
-最新的实际版本、测试总数、平台 skip、Windows 内核证据和本地验收结果见 [`docs/HANDOFF.md`](docs/HANDOFF.md)。
-
-## 当前 mock world
-
-mock adapter 只包含一个很小的内存世界：
-
-- 观察玩家位置与附近方块；
-- `move`；
-- `place_block`；
-- 方块仅允许 `stone`、`dirt`、`torch`；
-- 坐标范围很小且固定；
-- `dry-run` 返回预计变化但不修改状态；
-- `commit` 只在 session、owner、capability、policy 和 safety 全部允许时执行；
-- 相同 session 内重复使用相同 `requestId` 不会重复副作用。
-
-mock world、session、幂等缓存和 safety latch 都不会跨产品进程重启保留。只有有界、脱敏的安全审计账本会持久存在。
-
-## Session、owner 与 capability
-
-session：
-
-- 只保存在内存；
-- 默认 TTL 15 分钟，最大 60 分钟；
-- 默认最多保留 64 个 session；
-- 绑定一个 adapter、一个不可变 owner key 和明确 capability 集合；
-- terminal session 默认保留 5 分钟，由显式 `sweep()` 清理；
-- 每个 session 默认最多保留 256 个 request 幂等条目；
-- active session 和 in-flight request 不会被静默驱逐。
-
-owner 来自可信 transport context，不来自请求参数。当前 local stdio 注入精确的 `{ transport: "local" }`；未来 remote seam 只是一份严格接口，生产环境尚无 remote credential verification。
-
-capability 请求不等于授权。当前产品只使用可信代码中的 fixed mock profile，实际 grant 是“请求能力、可信 profile、注册时冻结的 adapter manifest 与 fixed tiny-world scope”的交集。session response 只返回实际批准能力、安全 scope 摘要和剩余有界预算，不返回 profile 内部结构或授权秘密。owner binding 回答“谁在使用 session”，grant 回答“该主体能做什么”，两者不互相替代。
-
-## 幂等与并发
-
-- 相同 session、相同 `requestId`、相同请求内容会复用原结果或等待同一个 in-flight promise；
-- 相同 ID、不同内容返回 `REQUEST_ID_REUSED`；
-- 幂等证据只存在于当前产品进程；
-- 全局默认最多同时有 4 个 commit write；
-- MCP 默认最多同时有 8 个 handler；
-- adapter IPC 默认最多有 8 个 pending call；
-- registry 最多注册 64 个 adapter，聚合 catalog 最多 32 KiB；
-- 达到容量时在 adapter 副作用前拒绝，不建立无界等待队列。
-
-这些限制只能证明资源有界，不能单独证明状态安全。Adapter Contract v2 另外要求同一 adapter/scope/resource 的写入默认单写；observation 必须显式声明 `parallel`、`serial` 或 `resource-serial`，纯只读 adapter 可以声明零个 action，也不需要 revision provider。`game.act` 的 effect × mode 矩阵是封闭的：write action 可按声明接受 commit 或 dry-run，read/preview action 只能使用 dry-run且必须声明 `writeConcurrency: none`，不能声称未执行的资源串行保证；任何 non-write commit 都在 adapter dispatch、写调度和预算预留前固定拒绝。mock observation 和 preview 返回 `stateRevision`，声明需要 revision 的 commit 必须携带 `expectedRevision`。core 在派发前发现的 stale/future revision、预算耗尽、stop 和并发占用均不扣预算；已派发到 worker 的明确拒绝（包括 worker 侧 revision conflict）扣一次，幂等重放不重复扣减。成功 commit 只递增一次。
-
-## Safety latch 与本地 operator
-
-普通 bridge/MCP action 可以执行 `safety.stop`，但协议中不存在 `safety.resume`。
-
-产品运行时启动后，可在另一个本地终端使用：
-
-```text
-npm run operator -- status
-npm run operator -- stop
-npm run operator -- resume --generation 1
-```
-
-operator：
-
-- 使用每次启动随机生成的 Windows named pipe 和 32 字节 token；
-- 与 MCP 共用同一个 bridge、safety latch 和 audit sink；
-- 不接受 host、port、URL、path、executable 或环境覆盖；
-- stop 独立于 session、request cache、MCP handler 和 adapter pending capacity；
-- resume 必须携带当前 stop generation；
-- 有 in-flight write、generation 不匹配、deadline、disconnect、后发 stop 或 audit 未确认时均拒绝恢复；
-- status 当前只暴露安全状态和非敏感计数，不读取审计内容。
-- status 同时返回并由 CLI 显示固定的 runtime / adapter / audit / safety 健康类别及非敏感计数。
-
-现有限制：safety latch 状态不持久化，产品重启后会创建新的 running latch。真实 adapter 启动前必须决定“启动默认 stopped”或持久安全状态的恢复语义。
-
-## 本地 MCP 契约
-
-构建后，本地 MCP client 可拉起：
-
-```text
-node dist/src/mcp/stdio-server.js
-```
-
-也可以运行：
-
-```bash
-npm run mcp:stdio
-```
-
-MCP surface：
-
-- 恰好一个 tool：`game_bridge_request`；
-- 不注册 resource、prompt、sampling、operator 或其他 tool；
-- tool 输入直接复用 bridge request envelope；
-- MCP JSON-RPC ID 与 bridge `requestId` 是两层不同标识；
-- wrapper 不替换 request ID、不自动重试；
-- stdout 只承载 MCP 协议，固定脱敏诊断写入 stderr；
-- bridge 输出会再次经过 envelope schema 与请求身份验证；审计用字段名脱敏不会改写协议响应；
-- 完整 tool result 最多 112 KiB，并为 128 KiB stdio frame 保留 16 KiB JSON-RPC 预算：request ID 的 JSON 编码最多 8 KiB，剩余 8 KiB 用于外层字段与转义。ID 仅接受 safe integer 或该上限内的字符串；超界 ID 返回不回显原 ID 的固定 `-32600`。出站完整 frame 还会再次测量，超限不会被动关闭连接；
-- client disconnect 不被描述成已经取消或回滚进入 core/worker 的动作。
-
-MCP 仍只使用一个通用 tool；`bridge.describe` 现在返回纯 JSON action catalog，包含输入/输出 JSON Schema、read/preview/write、dry-run 精确度、required capabilities、revision、结果上限、资源调度与 adapter error namespace，不返回 Zod 实例或函数。adapter 使用 `defineAdapterSchema(json)` 创建受限纯数据契约：严格对象、数组、基本类型、枚举/常量、范围和 `anyOf`；未知关键字、引用、回调、getter、稀疏数组与非有限数字均拒绝。数据复制并深冻结，validator 保存在私有闭包中；注册只接受该工厂创建的不可变 schema，不再读取 Zod 内部结构。固定 mock 可在受信编写侧通过公开 `z.toJSONSchema` API 序列化自己的 schema；JSON 数据是唯一契约，不承诺任意 Zod 行为等价。schema 标量、单份 snapshot、单 adapter catalog 与 registry 聚合 catalog 仍分别限制为 1 KiB、16 KiB、24 KiB 与 32 KiB，registry 最多 64 个 adapter。可选 `health` member 在注册时只读取一次；真正缺省才使用 ready 默认值，已定义的非函数、Promise/thenable 或 getter 异常均拒绝注册。required capabilities、adapter error codes 与 grant capabilities 都只接受 dense own-data string array，长度只从 own data descriptor 捕获一次。MCP 保持已验证 catalog/result 的结构与类型，不按 `path`、`token`、`password` 等普通领域字段名做静默替换。MCP server version 从 `package.json` 单一来源读取，协议版本只使用 `PROTOCOL_VERSION`。
-
-## 持久审计账本
-
-产品只在固定的当前用户应用目录中保存 bridge/operator 的有限安全事件。它不是游戏存档，也不保存：
-
-- game state、观察结果或 adapter 输入/输出；
-- chat、屏幕、账号、存档或凭据；
-- 原始 request/session ID、principal、owner key；
-- endpoint、named pipe、PID、用户名、路径、stack 或 raw payload。
-
-当前硬上限：
-
-- 单记录 4 KiB；
-- 最多 8 个 pending write；
-- 单 segment 64 KiB；
-- 最多 8 个 segment；
-- 最多 2,048 个 confirmation；
-- 最多 2,048 个 checkpoint；
-- shutdown drain deadline 500 ms。
-
-账本使用 canonical frame、单调 sequence、SHA-256 链、data sync、confirmation 和独立 checkpoint 检测普通撕裂写、截断、乱序和意外损坏。它没有受保护密钥或外部锚点，不能抵御 hostile same-user、管理员或离线磁盘重写。
-
-达到硬容量后不会静默删除历史。新的普通 commit 和 resume 会 fail closed；emergency stop 仍先同步关闸，再尝试写 audit。
-
-## Windows worker containment
-
-产品只启动固定的源码构建 Win32 launcher；launcher 再用固定 `process.execPath`、固定 built worker、固定 argv/cwd/minimal environment 启动 mock worker。
-
-已建立的 Windows 约束包括：
-
-- Restricted Token；
-- suspended create → Job assignment/query → attestation → resume；
-- kill-on-close；
-- active-process limit 1；
-- process memory 256 MiB；
-- job memory 192 MiB；
-- CPU hard cap 20%；
-- no breakaway；
-- 精确 handle allowlist；
-- 独立 parent-liveness pipe；
-- containment 失败时无 unrestricted `spawn()` fallback。
-
-这些约束限制权限、进程树、资源和生命周期，但不是文件系统、registry 或网络 sandbox。真实 adapter 仍需根据实际游戏 API 单独决定 AppContainer、ACL、broker、容器或其他权限边界。
-
-## 发布与支持矩阵
-
-`package.json` 保持 `private: true`，本项目不发布 npm package。
-
-`v0.1.0-rc.1` 的发布链可生成：
-
-- 规范化源码构建 bundle；
-- SHA-256 checksum；
-- CycloneDX SBOM；
-- release manifest；
-- unsigned local provenance；
-- 受保护 annotated tag 流程中的 GitHub artifact attestation。
-
-这些证据用于减少 source/artifact 歧义，不证明 runner、编译器、依赖或完整供应链可信，也不证明真实游戏安全。
-
-平台范围：
-
-- Ubuntu：运行平台中立套件；Windows 产品 child/operator 用例明确 skip；
-- GitHub-hosted Windows：runner 为 elevated，只验证产品正确拒绝 elevated host，并编译 MSVC/UCRT helper；
-- 完整 happy path：需要真实非提权 Windows 主机；当前证据来自本地验收，尚无合适的 dedicated hosted runner。
-
-详见：
-
-- [`docs/support-matrix.md`](docs/support-matrix.md)
-- [`docs/release.md`](docs/release.md)
-- [`docs/release-notes-v0.1.0-rc.1.md`](docs/release-notes-v0.1.0-rc.1.md)
-
-## 新路线
-
-阶段 A 已由 Issue #19 / PR #21 完成并合并。后续仍严格按以下顺序推进：
-
-1. **operation journal、durable `operationId` 与 reconciliation**；
-2. **首个真实 adapter 的只读 vertical slice**；
-3. **一个具备 revision、journal、对账和恢复证据的最小写动作**；
-4. **完成上述证据后，再评估远程传输和更强 OS 权限边界**。
-
-在只读真实 adapter 完成前，release、ledger、containment 和 remote transport 均保持冻结。
-
-完整阶段门禁、设计原则和当前阻塞见 [`docs/ROADMAP.md`](docs/ROADMAP.md)。
-
-## 当前关键限制
-
-- session/idempotency 只在活进程内成立；
-- dispatch 后 timeout/worker exit 现在会保守返回 `OUTCOME_UNKNOWN`，但尚无 durable operation journal、内部 `operationId` 或 reconciliation；
-- safety latch 不跨重启持久；
-- operator 能表达固定健康类别，但尚无 stale runtime、audit full/corrupt 或 adapter fault 的受支持恢复命令；
-- audit 与未来 operation journal 尚未分层；
-- stale descriptor、audit full/corrupt 尚缺受支持的 operator 恢复流程；
-- observation 尚缺真实游戏所需的分页、freshness、revision 和不可信文本标记；
-- Restricted Token + Job Object 尚未由任何真实 adapter 权限需求验证。
-
-## 文档索引
-
-- [`docs/ROADMAP.md`](docs/ROADMAP.md)：新的项目路线、阶段门禁与冻结边界
-- [`docs/architecture.md`](docs/architecture.md)：当前架构与责任边界
-- [`docs/threat-model.md`](docs/threat-model.md)：威胁、控制与残余风险
-- [`docs/HANDOFF.md`](docs/HANDOFF.md)：当前实现、实际验收证据与已知限制
-- [`docs/OPEN_QUESTIONS.md`](docs/OPEN_QUESTIONS.md)：仍需未来工单决定的问题
-- [`docs/release.md`](docs/release.md)：RC 构建、复现、发布与回滚
-- [`docs/support-matrix.md`](docs/support-matrix.md)：平台支持与证据范围
-
-任何真实游戏、远程 transport、主机配置、OS 权限扩大或持久动作状态，都必须通过独立工单和人工批准。
+- [试玩与恢复](docs/minecraft-playtest.md)
+- [当前路线](docs/ROADMAP.md)
+- [实现与验收交接](docs/HANDOFF.md)
+- [架构](docs/architecture.md)
+- [威胁模型](docs/threat-model.md)
+- [原 mock RC 发布与支持矩阵](docs/support-matrix.md)

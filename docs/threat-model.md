@@ -1,5 +1,12 @@
 # Threat model
 
+## Minecraft 入口的新增边界（2026-09-16）
+
+Minecraft 首版只面向新建的本地专用测试世界。模型参数只有固定颜色，世界标识和连接凭据来自本地可信配置；固定数据包函数同时检查版本和重复序号。新入口未使用 mock worker 的 Windows containment。RCON 在游戏端是管理员级连接，模型面窄命令不等于宿主进程拥有最小 OS 权限。默认 stopped、每 session 16 次写、512 条有界操作历史、结果未知停写并对账。操作库使用 SQLite FULL 和 OS lifetime lock；不保证 Minecraft 多文件保存的断电原子性，也不对敌对同用户提供保护。没有登录账号、触碰现有存档或增加公网 transport。
+
+真机证据尚待运行；TCP 协议夹具不能证明数据包在真实 Minecraft 上正确执行。完整剩余风险见 [试玩指南](minecraft-playtest.md)。以下是原 mock 路径的威胁模型。
+
+
 ## Release-chain claims and non-claims
 
 Pinned action commits, a clean double build, checksums, an SBOM and GitHub

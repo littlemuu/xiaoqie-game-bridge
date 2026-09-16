@@ -1,5 +1,12 @@
 # Architecture
 
+## Minecraft 最小闭环增量（2026-09-16）
+
+新增入口 `src/mcp/minecraft-stdio.ts` / `src/adapters/minecraft/cli.ts` → `createMinecraftRuntime` → 同一个 `GameBridge` → `MinecraftAdapter` → 只连 loopback 的 RCON → 固定数据包。独立 SQLite 操作库记录 intent/result，数据包提供序号、版本与回执。Minecraft 不运行在原 mock Windows worker 内，不能继承其 containment 声明。普通诊断是有界内存记录；操作证据独立持久化。具体行为与未完成的真机验收见 [试玩指南](minecraft-playtest.md)。
+
+下文描述保留的 mock RC 架构。
+
+
 ## Release evidence boundary
 
 Release engineering is downstream of the bridge and cannot authorize an
