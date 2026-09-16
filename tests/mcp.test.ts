@@ -1,3 +1,4 @@
+import { defineAdapterSchema } from "../src/core/adapter.js";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -233,7 +234,7 @@ class DomainFieldAdapter implements GameAdapter {
   readonly displayName = "Domain field contract adapter";
   readonly observation: AdapterObservationDefinition = {
     description: "Return one harmless domain token value.",
-    outputSchema: z.object({ token: z.number() }).strict(),
+    outputSchema: defineAdapterSchema(JSON.parse(JSON.stringify(z.toJSONSchema(z.object({ token: z.number() }).strict(), { metadata: z.registry() })))),
     effectKind: "read",
     concurrency: { kind: "parallel" },
     requiredCapabilities: ["game.observe"],
@@ -242,10 +243,10 @@ class DomainFieldAdapter implements GameAdapter {
   readonly actions: Readonly<Record<string, AdapterActionDefinition>> = {
     inspect: {
       description: "Validate ordinary domain field names.",
-      inputSchema: z
+      inputSchema: defineAdapterSchema(JSON.parse(JSON.stringify(z.toJSONSchema(z
         .object({ path: z.string(), token: z.number(), password: z.string() })
-        .strict(),
-      outputSchema: z.object({ token: z.number() }).strict(),
+        .strict(), { metadata: z.registry() })))),
+      outputSchema: defineAdapterSchema(JSON.parse(JSON.stringify(z.toJSONSchema(z.object({ token: z.number() }).strict(), { metadata: z.registry() })))),
       effectKind: "preview",
       dryRunSemantics: "exact",
       requiredCapabilities: ["game.act.inspect"],

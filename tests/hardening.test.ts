@@ -1,3 +1,4 @@
+import { defineAdapterSchema } from "../src/core/adapter.js";
 import { z } from "zod";
 import { describe, expect, it } from "vitest";
 import {
@@ -80,7 +81,7 @@ class GatedAdapter implements GameAdapter {
   readonly displayName = "Deterministic gated adapter";
   readonly observation = {
     description: "Observe deterministic gated test counters.",
-    outputSchema: gatedObservationSchema,
+    outputSchema: defineAdapterSchema(JSON.parse(JSON.stringify(z.toJSONSchema(gatedObservationSchema, { metadata: z.registry() })))),
     effectKind: "read" as const,
     concurrency: { kind: "parallel" as const },
     requiredCapabilities: ["game.observe"],
@@ -89,8 +90,8 @@ class GatedAdapter implements GameAdapter {
   readonly actions: Readonly<Record<string, AdapterActionDefinition>> = {
     gated_write: {
       description: "A test-only write controlled by a promise gate.",
-      inputSchema: gatedInputSchema,
-      outputSchema: gatedResultSchema,
+      inputSchema: defineAdapterSchema(JSON.parse(JSON.stringify(z.toJSONSchema(gatedInputSchema, { metadata: z.registry() })))),
+      outputSchema: defineAdapterSchema(JSON.parse(JSON.stringify(z.toJSONSchema(gatedResultSchema, { metadata: z.registry() })))),
       effectKind: "write",
       dryRunSemantics: "exact",
       requiredCapabilities: ["game.act.gated_write"],

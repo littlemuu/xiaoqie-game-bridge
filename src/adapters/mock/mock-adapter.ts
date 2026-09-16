@@ -1,3 +1,4 @@
+import { defineAdapterSchema } from "../../core/adapter.js";
 import { z } from "zod";
 import {
   AdapterExecutionError,
@@ -101,7 +102,7 @@ export class MockGameAdapter implements GameAdapter {
   readonly displayName = "Deterministic in-memory mock world";
   readonly observation: AdapterObservationDefinition = {
     description: "Observe the bounded mock player and nearby allowlisted blocks.",
-    outputSchema: mockObservationResultSchema,
+    outputSchema: defineAdapterSchema(JSON.parse(JSON.stringify(z.toJSONSchema(mockObservationResultSchema, { metadata: z.registry() })))),
     effectKind: "read",
     concurrency: { kind: "parallel" },
     requiredCapabilities: ["game.observe"],
@@ -110,8 +111,8 @@ export class MockGameAdapter implements GameAdapter {
   readonly actions: Readonly<Record<string, AdapterActionDefinition>> = {
     move: {
       description: "Move the mock player by at most one unit per axis.",
-      inputSchema: mockMoveInputSchema,
-      outputSchema: mockMoveResultSchema,
+      inputSchema: defineAdapterSchema(JSON.parse(JSON.stringify(z.toJSONSchema(mockMoveInputSchema, { metadata: z.registry() })))),
+      outputSchema: defineAdapterSchema(JSON.parse(JSON.stringify(z.toJSONSchema(mockMoveResultSchema, { metadata: z.registry() })))),
       effectKind: "write",
       dryRunSemantics: "exact",
       requiredCapabilities: ["game.act.move"],
@@ -123,8 +124,8 @@ export class MockGameAdapter implements GameAdapter {
     },
     place_block: {
       description: "Place one allowlisted block inside the mock-world bounds.",
-      inputSchema: mockPlaceBlockInputSchema,
-      outputSchema: mockPlaceBlockResultSchema,
+      inputSchema: defineAdapterSchema(JSON.parse(JSON.stringify(z.toJSONSchema(mockPlaceBlockInputSchema, { metadata: z.registry() })))),
+      outputSchema: defineAdapterSchema(JSON.parse(JSON.stringify(z.toJSONSchema(mockPlaceBlockResultSchema, { metadata: z.registry() })))),
       effectKind: "write",
       dryRunSemantics: "exact",
       requiredCapabilities: ["game.act.place_block"],

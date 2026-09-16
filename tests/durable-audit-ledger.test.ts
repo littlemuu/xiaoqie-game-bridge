@@ -302,7 +302,7 @@ describe("durable local audit ledger", () => {
     ]);
   });
 
-  it("never accepts prefixes of a final frame as a confirmed record", async () => {
+  it("never accepts truncated headers, payloads or terminators as a confirmed record", async () => {
     const source = await temporaryLedgerRoot("truncation-source");
     const ledger = await DurableAuditLedger.open({ testOnly: { rootDirectory: source.root } });
     await ledger.write(event(1));
@@ -310,11 +310,15 @@ describe("durable local audit ledger", () => {
     await ledger.close();
     const complete = await segmentBytes(source.root);
     const firstFrameBytes = 9 + Number.parseInt(complete.subarray(0, 8).toString("ascii"), 16) + 1;
-    const everyFinalFrameCut = Array.from(
-      { length: complete.byteLength - firstFrameBytes },
-      (_, index) => firstFrameBytes + index,
-    );
-    for (const cut of everyFinalFrameCut) {
+    const finalFrameBytes = complete.byteLength - firstFrameBytes;
+    // All partial header lengths, payload boundaries/interior, and the missing
+    // terminator exercise distinct parser states without one disk ledger per byte.
+    const cuts = new Set([
+      ...Array.from({ length: 10 }, (_, index) => index),
+      10, Math.floor(finalFrameBytes / 2), finalFrameBytes - 2, finalFrameBytes - 1,
+    ]);
+    for (const relativeCut of [...cuts].sort((left, right) => left - right)) {
+      const cut = firstFrameBytes + relativeCut;
       const fixture = await temporaryLedgerRoot(`cut-${cut}`);
       await mkdir(fixture.root);
       await writeFile(join(fixture.root, "segment-0001.audit"), complete.subarray(0, cut));
